@@ -1,0 +1,229 @@
+# Helldivers 2 — voice-orders profile
+#
+# Translated from a LinVAM profile. Stratagem inputs are the arrow keys; each
+# command speaks the stratagem's natural name. Unlike LinVAM, voice-orders
+# supports ambiguous prefixes, so the sentry call-ins use their natural order
+# ("auto cannon sentry", not "sentry auto cannon"): saying "auto cannon" alone
+# calls the support weapon after the completion timeout, and continuing with
+# "sentry" calls the sentry instead.
+#
+# Play with: voice-orders run profiles/helldivers2.yaml -- %command%
+name: Helldivers 2
+model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
+
+hotkey:
+  device: auto
+  key: leftctrl
+  mode: push-to-talk
+
+completion_timeout: 200ms
+
+defaults:
+  duration: 30ms
+  interval: 30ms
+
+commands:
+  # ── Mission stratagems ────────────────────────────────────────────────
+  - phrase: "{reinforce, reinforcements}"
+    keys: [up, down, right, left, up]
+
+  - phrase: "{resupply, supplies}"
+    keys: [down, down, up, right]
+
+  - phrase: "[eagle] rearm"
+    keys: [up, up, left, up, right]
+
+  - phrase: "super destroyer"
+    keys: [up, up, down, down, left, right, left, right]
+
+  - phrase: "cargo container"
+    keys: [up, up, down, down, right, down]
+
+  - phrase: "hell bomb"
+    keys: [down, up, left, down, up, right, down, up]
+
+  - phrase: "prospecting drill"
+    keys: [down, down, left, right, down, down]
+
+  - phrase: "artillery"
+    keys: [right, up, up, down]
+
+  - phrase: "seismic probe"
+    keys: [up, up, left, right, down, down]
+
+  - name: SSD
+    phrase: "{ssd, hard drive}"
+    keys: [down, down, down, down, down, down, up, up]
+
+  - phrase: "[raise] [super earth] flag"
+    keys: [down, up, down, up]
+
+  - phrase: "tectonic drill"
+    keys: [up, down, up, down, up, down]
+
+  - phrase: "{upload data, reinforcement pods}"
+    keys: [left, right, up, up, up]
+
+  - phrase: "hive breaker drill"
+    keys: [left, up, down, right, down, down]
+
+  - phrase: "dark fluid vessel"
+    keys: [up, left, right, down, up, up]
+
+  - phrase: "tactical video camera"
+    keys: [right, down, down, up, left, left, up]
+
+  - phrase: "aquifer drill"
+    keys: [left, left, left, up, down, right, down, down]
+
+  - phrase: "[portable] comms relay"
+    keys: [up, up, down, down, left, left, down]
+
+  # ── Support weapons ───────────────────────────────────────────────────
+  - name: Autocannon
+    phrase: "auto cannon"
+    keys: [down, left, down, up, up, right]
+
+  - phrase: "quasar cannon"
+    keys: [down, down, up, left, right]
+
+  - phrase: "{recoil less rifle, recoil rifle}"
+    keys: [down, left, right, right, left]
+
+  - phrase: "expendable anti tank"
+    keys: [down, down, left, up, right]
+
+  - phrase: "arc thrower"
+    keys: [down, right, down, up, left, left]
+
+  - phrase: "rail gun"
+    keys: [down, right, down, up, left, right]
+
+  - phrase: "wasp"
+    keys: [down, down, up, down, right]
+
+  - phrase: "heavy machine gun"
+    keys: [down, left, up, down, down]
+
+  - phrase: "stalwart"
+    keys: [down, left, down, up, up, left]
+
+  - phrase: "machine gun"
+    keys: [down, left, down, up, right]
+
+  - phrase: "flame thrower"
+    keys: [down, left, up, down, up]
+
+  - phrase: "grenade launcher"
+    keys: [down, left, up, left, down]
+
+  # ── Backpacks & mechs ─────────────────────────────────────────────────
+  - phrase: "jump pack"
+    keys: [down, up, up, down, up]
+
+  - phrase: "guard dog"
+    keys: [down, up, left, up, right, down]
+
+  - phrase: "[guard dog] rover"
+    keys: [down, up, left, up, right, right]
+
+  - phrase: "shield [generator] pack"
+    keys: [down, up, left, right, left, right]
+
+  - phrase: "portable hell bomb"
+    keys: [down, right, up, up, up]
+
+  - phrase: "emancipator [exo suit]"
+    keys: [left, down, right, up, left, down, up]
+
+  - phrase: "patriot [exo suit]"
+    keys: [left, down, right, up, left, down, down]
+
+  - phrase: "{tank, bastion}"
+    keys: [left, down, right, down, left, down, up, down, up]
+
+  # ── Orbitals ──────────────────────────────────────────────────────────
+  - phrase: "[orbital] precision strike"
+    keys: [right, right, up]
+
+  - phrase: "[orbital] gatling barrage"
+    keys: [right, down, left, up, up]
+
+  - phrase: "[orbital] gas strike"
+    keys: [right, right, down, right]
+
+  - phrase: "[orbital] {one twenty, one hundred twenty} [millimeter] barrage"
+    keys: [right, right, down, left, right, down]
+
+  - phrase: "[orbital] air burst [strike]"
+    keys: [right, right, right]
+
+  - phrase: "[orbital] {three eighty, three hundred eighty} [millimeter] barrage"
+    keys: [right, down, up, up, left, down, down]
+
+  - phrase: "orbital laser"
+    keys: [right, down, up, right, down]
+
+  - phrase: "[orbital] napalm barrage"
+    keys: [right, right, down, left, right, up]
+
+  - phrase: "[orbital] rail cannon [strike]"
+    keys: [right, up, down, down, right]
+
+  # ── Eagles ────────────────────────────────────────────────────────────
+  - phrase: "[eagle] airstrike"
+    keys: [up, right, down, right]
+
+  - phrase: "[eagle] cluster bomb"
+    keys: [up, right, down, down, right]
+
+  - phrase: "eagle napalm [strike]"
+    keys: [up, right, down, up]
+
+  - phrase: "[eagle] five hundred [kilo] [bomb]"
+    keys: [up, right, down, down, down]
+
+  # ── Sentries (natural order — ambiguous with the support weapons) ─────
+  - phrase: "machine gun sentry"
+    keys: [down, up, right, right, up]
+
+  - phrase: "gatling sentry"
+    keys: [down, up, right, left]
+
+  - name: Autocannon sentry
+    phrase: "auto cannon sentry"
+    keys: [down, up, right, up, left, up]
+
+  - phrase: "mortar sentry"
+    keys: [down, up, right, right, down]
+
+  - phrase: "ems mortar sentry"
+    keys: [down, up, right, down, right]
+
+  - phrase: "rocket sentry"
+    keys: [down, up, right, right, left]
+
+  - phrase: "tesla tower"
+    keys: [down, up, right, up, left, right]
+
+  - phrase: "laser sentry"
+    keys: [down, up, right, down, up, right]
+
+  - phrase: "flame sentry"
+    keys: [down, up, right, down, up, up]
+
+  # ── Emplacements & mines ──────────────────────────────────────────────
+  - phrase: "{anti tank mines, anti tank minefield}"
+    keys: [down, left, up, up]
+
+  - phrase: "{anti personnel mines, anti personnel minefield}"
+    keys: [down, left, up, right]
+
+  - phrase: "shield [generator] relay"
+    keys: [down, down, left, right, left, right]
+
+  - phrase: "[heavy] machine gun emplacement"
+    keys: [down, up, left, right, right, left]
+
+  - phrase: "anti tank emplacement"
+    keys: [down, up, left, right, right, right]
