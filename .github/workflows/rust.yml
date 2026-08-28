@@ -52,10 +52,10 @@ jobs:
           toolchain: stable
           components: clippy
 
-      # cpal's ALSA host needs the ALSA headers; evdev and uinput-tokio talk to
-      # the kernel directly and need nothing installed.
+      # cpal's ALSA host needs the ALSA headers, and uinput-tokio pulls in
+      # libudev-sys, whose build script shells out to pkg-config for libudev.
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       - name: Cache libvosk
         uses: actions/cache@v6
@@ -107,7 +107,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       - name: Cache libvosk
         uses: actions/cache@v6
@@ -231,7 +231,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       - name: Cache libvosk
         uses: actions/cache@v6
@@ -294,7 +294,7 @@ jobs:
           # $CROSS_DEB_ARCH is defined by cross inside the container, so it must
           # reach the config unexpanded.
           cat >> "$GITHUB_ENV" <<'CROSSENV'
-          CROSS_BUILD_PRE_BUILD=dpkg --add-architecture $CROSS_DEB_ARCH && apt-get update && apt-get install --assume-yes --no-install-recommends pkg-config libasound2-dev:$CROSS_DEB_ARCH
+          CROSS_BUILD_PRE_BUILD=dpkg --add-architecture $CROSS_DEB_ARCH && apt-get update && apt-get install --assume-yes --no-install-recommends pkg-config libasound2-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH
           CROSSENV
 
       - name: Setup Cache
