@@ -27,8 +27,20 @@ pub struct Args {
 
 #[tokio::main]
 async fn main() {
+    use std::io::IsTerminal;
+
     let args = Args::parse();
-    let session = telemetry::setup();
+
+    // `test` and `run` render a full-screen TUI when stdout is an interactive
+    // terminal, and a tracing stdout layer would draw straight over it — so
+    // the console layer is left out entirely in that configuration. This
+    // predicate must stay in step with the TUI-vs-plain selection inside those
+    // commands (both key off stdout being a TTY). Telemetry export itself is
+    // unaffected; failures still reach the user via eprintln! below, after
+    // the terminal has been restored.
+    let console = !(matches!(args.command, Command::Test(_) | Command::Run(_))
+        && std::io::stdout().is_terminal());
+    let session = telemetry::setup(console);
 
     match commands::dispatch(args).await {
         Ok(code) => {

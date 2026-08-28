@@ -15,12 +15,12 @@
 //! line with no `matched:` line under it — which is exactly the thing you want
 //! to see when a command refuses to trigger.
 //!
-//! Everything the rehearsal has to say travels as a single [`TestEvent`]
-//! (`event.rs`), produced by the pipeline's existing seams and consumed by
-//! exactly one of two renderers, chosen once by [`ReportMode`]:
+//! Everything the rehearsal has to say travels as a single [`UiEvent`], the
+//! same one `run` reports (`super::ui`), consumed by exactly one of two
+//! renderers, chosen once by [`ReportMode`]:
 //!
-//! - a **terminal UI** (`tui.rs`) when stdout is a TTY, which is what DESIGN.md
-//!   §"The `test` terminal UI (ratatui)" describes; and
+//! - the **terminal UI** when stdout is a TTY, which is what DESIGN.md §"The
+//!   session terminal UI (ratatui)" describes; and
 //! - the **plain line-printed report** otherwise, unchanged to the character,
 //!   because piped output is something scripts and CI already read.
 
@@ -35,17 +35,13 @@ use tracing_batteries::prelude::*;
 
 use crate::config::{Profile, ResolvedSettings, SystemConfig, loader, resolve_model};
 use crate::matcher::CommandAction;
-use crate::output::{CompiledOutput, Interrupt, KeyCode, KeyEvent};
+use crate::output::{CompiledOutput, Interrupt, KeyEvent};
 
 use super::run::{
-    Ending, Narration, Pipeline, PipelineOptions, build_pipeline_parts, interrupts, supervise,
-    terminations,
+    Ending, Narration, Pipeline, PipelineOptions, build_pipeline_parts, interrupts, stopped_by_ui,
+    supervise, terminations,
 };
-
-mod event;
-mod tui;
-
-pub(super) use event::{EventSink, TestEvent};
+use super::ui::{EventSink, ReportMode, UiEvent, render_plan, tui};
 
 #[derive(Args, Debug)]
 pub struct TestArgs {
@@ -60,43 +56,6 @@ pub struct TestArgs {
     /// Print partial recognition results as well as finalized ones.
     #[arg(long, hide = true)]
     pub debug_recognition: bool,
-}
-
-/// How a rehearsal reports itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReportMode {
-    /// The full-screen terminal UI.
-    Tui,
-    /// One line per event on stdout.
-    Plain,
-}
-
-impl ReportMode {
-    /// The UI is only ever taken out when stdout is a terminal we own: piped
-    /// output (a script, a CI job, `| head`) gets the plain report, because
-    /// escape sequences and an alternate screen are worse than useless there.
-    ///
-    /// Taken as an argument rather than read here so the choice — the one part
-    /// of the decision which could ever be wrong — is testable.
-    fn of(stdout_is_terminal: bool) -> Self {
-        if stdout_is_terminal {
-            ReportMode::Tui
-        } else {
-            ReportMode::Plain
-        }
-    }
-
-    /// Where events go under this mode, and the receiving end when there is a
-    /// UI to hand them to.
-    fn sink(self) -> (EventSink, Option<mpsc::UnboundedReceiver<TestEvent>>) {
-        match self {
-            ReportMode::Plain => (EventSink::Plain, None),
-            ReportMode::Tui => {
-                let (events_tx, events_rx) = mpsc::unbounded_channel();
-                (EventSink::Channel(events_tx), Some(events_rx))
-            }
-        }
-    }
 }
 
 /// Rehearses a profile, returning the exit code to leave with.
@@ -171,25 +130,20 @@ pub async fn run(args: TestArgs) -> Result<i32, crate::Error> {
 /// the ending is reported by the caller once the terminal has been handed back.
 async fn rehearse_on_screen(
     overview: tui::Overview,
-    events: mpsc::UnboundedReceiver<TestEvent>,
+    events: mpsc::UnboundedReceiver<UiEvent>,
 ) -> Result<(Ending, Option<crate::Error>), crate::Error> {
+    // Installed before the UI takes the terminal: a failure here has to be
+    // reportable, and nothing is reportable once the alternate screen is up.
+    let terminate = terminations()?;
+
     let quit = CancellationToken::new();
     let ui = tokio::spawn(tui::run(overview, events, quit.clone()));
 
     // Two ways out, and the supervisor has to watch for both: 'q' (and Ctrl-C,
     // which raw mode delivers as a key rather than a signal) cancels the token,
-    // while a signal sent to the process still arrives as a signal.
-    let stopped = {
-        let quit = quit.clone();
-        async move {
-            tokio::select! {
-                () = quit.cancelled() => {}
-                () = interrupts() => {}
-            }
-        }
-    };
-
-    let ending = supervise(None, stopped, terminations()?).await;
+    // while a signal sent to the process still arrives as a signal. A rehearsal
+    // wraps nothing, so neither has a child to tell about it.
+    let ending = supervise(None, stopped_by_ui(quit.clone(), false), terminate).await;
     quit.cancel();
 
     let failure = match ui.await {
@@ -278,7 +232,7 @@ async fn report_task(
             return Ok(());
         };
 
-        events.send(TestEvent::Matched {
+        events.send(UiEvent::Matched {
             name: action.command.clone(),
             plan: render_plan(&action.output),
         });
@@ -298,7 +252,7 @@ async fn report_task(
         };
 
         if interrupted {
-            events.send(TestEvent::Interrupted(action.command));
+            events.send(UiEvent::Interrupted(action.command));
             discard_queued(&mut queue, &events);
         }
     }
@@ -310,7 +264,7 @@ async fn report_task(
 /// unplayed, so a rehearsal must not pretend they still fire.
 fn discard_queued(queue: &mut mpsc::Receiver<CommandAction>, events: &EventSink) {
     while let Ok(action) = queue.try_recv() {
-        events.send(TestEvent::Discarded(action.command));
+        events.send(UiEvent::Discarded(action.command));
     }
 }
 
@@ -327,112 +281,12 @@ fn plan_duration(output: &CompiledOutput) -> Duration {
         .sum()
 }
 
-/// Renders a compiled output plan the way a person reads a macro.
-///
-/// Keys pressed together come back as a `+`-joined chord, waits are elided (the
-/// hold and interval timings are a `run` concern, not a "did I say the right
-/// thing?" one), and the two unbalanced cases a profile is allowed to contain
-/// are called out rather than silently dropped: a key which is never released
-/// (a hold-style macro) and a release with no press before it.
-fn render_plan(output: &CompiledOutput) -> String {
-    let CompiledOutput::Keyboard(plan) = output;
-
-    let mut steps: Vec<String> = Vec::new();
-    // The keys of the chord being assembled, in the order they were pressed,
-    // and how many of them are still held down.
-    let mut chord: Vec<KeyCode> = Vec::new();
-    let mut holding = 0usize;
-
-    for event in plan {
-        match *event {
-            KeyEvent::Down(key) => {
-                if !chord.contains(&key) {
-                    chord.push(key);
-                    holding += 1;
-                }
-            }
-            KeyEvent::Up(key) => {
-                if !chord.contains(&key) {
-                    steps.push(format!("(release {key})"));
-                    continue;
-                }
-
-                holding -= 1;
-                // The chord is only finished once every key in it is back up.
-                if holding == 0 {
-                    steps.push(render_chord(&chord));
-                    chord.clear();
-                }
-            }
-            KeyEvent::Wait(_) => {}
-        }
-    }
-
-    if !chord.is_empty() {
-        steps.push(format!("{} (held)", render_chord(&chord)));
-    }
-
-    if steps.is_empty() {
-        return "(nothing)".to_string();
-    }
-
-    steps.join(" ")
-}
-
-/// One chord: its key names joined by `+`, in the order they go down.
-fn render_chord(keys: &[KeyCode]) -> String {
-    keys.iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("+")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LoadedProfile, OutputDefaults};
-    use crate::output::keys;
+    use crate::config::LoadedProfile;
     use rstest::rstest;
     use std::time::Duration;
-
-    // --- Choosing how to report -------------------------------------------
-
-    #[rstest]
-    // A terminal we own: the full-screen UI DESIGN.md describes.
-    #[case(true, ReportMode::Tui)]
-    // Piped, redirected, or running under CI: the plain report, because that
-    // is what scripts (and the tests above) read.
-    #[case(false, ReportMode::Plain)]
-    fn test_the_report_mode_follows_stdout(
-        #[case] is_terminal: bool,
-        #[case] expected: ReportMode,
-    ) {
-        assert_eq!(ReportMode::of(is_terminal), expected);
-    }
-
-    #[test]
-    fn test_only_the_terminal_ui_gets_an_event_channel() {
-        // Plain mode prints from wherever the event was reported, so there is
-        // nothing to receive and no UI task to start.
-        let (sink, ui) = ReportMode::Plain.sink();
-        assert!(matches!(sink, EventSink::Plain));
-        assert!(ui.is_none(), "plain mode has no UI to hand events to");
-
-        let (sink, ui) = ReportMode::Tui.sink();
-        assert!(matches!(sink, EventSink::Channel(_)));
-        let mut ui = ui.expect("the UI needs the receiving end");
-
-        sink.send(TestEvent::Heard("salute".to_string()));
-        assert_eq!(
-            ui.try_recv(),
-            Ok(TestEvent::Heard("salute".to_string())),
-            "everything reported should reach the UI"
-        );
-    }
-
-    fn key(name: &str) -> KeyCode {
-        keys::from_name(name).expect("a known key")
-    }
 
     /// Compiles one command's `keys:`/`events:` YAML the way the pipeline does,
     /// so the rendering is asserted against real compiled plans rather than
@@ -447,62 +301,6 @@ mod tests {
         profile.commands[0]
             .compile(&profile.defaults)
             .expect("the command should compile")
-    }
-
-    #[rstest]
-    // A single key: the hold wait is elided.
-    #[case("    keys: [\"4\"]\n", "4")]
-    // A chord: pressed in order, released in reverse, reported as one step.
-    #[case("    keys: [\"leftctrl+leftalt+t\"]\n", "leftctrl+leftalt+t")]
-    // A sequence: the inter-chord interval is elided too.
-    #[case("    keys: [\"a\", \"b\"]\n", "a b")]
-    #[case("    keys: [\"leftshift+a\", \"b\"]\n", "leftshift+a b")]
-    // The explicit form, including its long hold.
-    #[case(
-        "    events:\n      - down: x\n      - wait: 750ms\n      - up: x\n",
-        "x"
-    )]
-    // A hold-style macro: legal, and worth saying out loud.
-    #[case("    events:\n      - down: w\n", "w (held)")]
-    // A release with no press before it: also legal, also worth saying.
-    #[case(
-        "    events:\n      - up: w\n      - down: x\n      - up: x\n",
-        "(release w) x"
-    )]
-    fn test_render_plan(#[case] command: &str, #[case] expected: &str) {
-        assert_eq!(render_plan(&plan(command)), expected);
-    }
-
-    #[test]
-    fn test_an_empty_plan_says_so() {
-        assert_eq!(
-            render_plan(&CompiledOutput::Keyboard(Vec::new())),
-            "(nothing)"
-        );
-    }
-
-    #[test]
-    fn test_waits_alone_are_elided_entirely() {
-        assert_eq!(
-            render_plan(&CompiledOutput::Keyboard(vec![KeyEvent::Wait(
-                Duration::from_secs(1)
-            )])),
-            "(nothing)"
-        );
-    }
-
-    #[test]
-    fn test_a_repeated_press_does_not_break_the_chord() {
-        // Nothing in the schema produces this, but the renderer must not
-        // underflow its hold count if something ever does.
-        assert_eq!(
-            render_plan(&CompiledOutput::Keyboard(vec![
-                KeyEvent::Down(key("x")),
-                KeyEvent::Down(key("x")),
-                KeyEvent::Up(key("x")),
-            ])),
-            "x"
-        );
     }
 
     #[tokio::test]
@@ -619,16 +417,5 @@ mod tests {
             .expect("the reporter should stop when the queue closes")
             .expect("the reporter should not panic")
             .expect("the reporter should stop cleanly");
-    }
-
-    #[test]
-    fn test_the_defaults_do_not_leak_into_the_rendering() {
-        // The timings a `keys:` list compiles to are a `run` concern; a
-        // rehearsal is about which keys, in which order.
-        assert_eq!(
-            OutputDefaults::default().duration,
-            Duration::from_millis(30)
-        );
-        assert_eq!(render_plan(&plan("    keys: [\"a\"]\n")), "a");
     }
 }

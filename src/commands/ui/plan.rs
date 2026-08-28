@@ -1,0 +1,164 @@
+//! Rendering a compiled output plan the way a person reads a macro.
+//!
+//! Shared by both commands because it says the same thing in both: `test`
+//! reports the plan it *would* have played, `run` reports the one it *is*
+//! playing, and a plan reads the same either way — which is what lets one
+//! wording (`"deploy the autocannon" -> Autocannon (leftctrl+4)`) be true of
+//! both.
+
+use crate::output::{CompiledOutput, KeyCode, KeyEvent};
+
+/// Renders a compiled output plan the way a person reads a macro.
+///
+/// Keys pressed together come back as a `+`-joined chord, waits are elided (the
+/// hold and interval timings are a `run` concern, not a "did I say the right
+/// thing?" one), and the two unbalanced cases a profile is allowed to contain
+/// are called out rather than silently dropped: a key which is never released
+/// (a hold-style macro) and a release with no press before it.
+pub(crate) fn render_plan(output: &CompiledOutput) -> String {
+    let CompiledOutput::Keyboard(plan) = output;
+
+    let mut steps: Vec<String> = Vec::new();
+    // The keys of the chord being assembled, in the order they were pressed,
+    // and how many of them are still held down.
+    let mut chord: Vec<KeyCode> = Vec::new();
+    let mut holding = 0usize;
+
+    for event in plan {
+        match *event {
+            KeyEvent::Down(key) => {
+                if !chord.contains(&key) {
+                    chord.push(key);
+                    holding += 1;
+                }
+            }
+            KeyEvent::Up(key) => {
+                if !chord.contains(&key) {
+                    steps.push(format!("(release {key})"));
+                    continue;
+                }
+
+                holding -= 1;
+                // The chord is only finished once every key in it is back up.
+                if holding == 0 {
+                    steps.push(render_chord(&chord));
+                    chord.clear();
+                }
+            }
+            KeyEvent::Wait(_) => {}
+        }
+    }
+
+    if !chord.is_empty() {
+        steps.push(format!("{} (held)", render_chord(&chord)));
+    }
+
+    if steps.is_empty() {
+        return "(nothing)".to_string();
+    }
+
+    steps.join(" ")
+}
+
+/// One chord: its key names joined by `+`, in the order they go down.
+fn render_chord(keys: &[KeyCode]) -> String {
+    keys.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{LoadedProfile, OutputDefaults, Profile};
+    use crate::output::keys;
+    use rstest::rstest;
+    use std::time::Duration;
+
+    fn key(name: &str) -> KeyCode {
+        keys::from_name(name).expect("a known key")
+    }
+
+    /// Compiles one command's `keys:`/`events:` YAML the way the pipeline does,
+    /// so the rendering is asserted against real compiled plans rather than
+    /// hand-built ones.
+    fn plan(command: &str) -> CompiledOutput {
+        let profile = Profile::parse(&LoadedProfile {
+            source: "test-profile.yaml".to_string(),
+            content: format!("model: /models/en\ncommands:\n  - phrase: salute\n{command}"),
+        })
+        .expect("the profile should load");
+
+        profile.commands[0]
+            .compile(&profile.defaults)
+            .expect("the command should compile")
+    }
+
+    #[rstest]
+    // A single key: the hold wait is elided.
+    #[case("    keys: [\"4\"]\n", "4")]
+    // A chord: pressed in order, released in reverse, reported as one step.
+    #[case("    keys: [\"leftctrl+leftalt+t\"]\n", "leftctrl+leftalt+t")]
+    // A sequence: the inter-chord interval is elided too.
+    #[case("    keys: [\"a\", \"b\"]\n", "a b")]
+    #[case("    keys: [\"leftshift+a\", \"b\"]\n", "leftshift+a b")]
+    // The explicit form, including its long hold.
+    #[case(
+        "    events:\n      - down: x\n      - wait: 750ms\n      - up: x\n",
+        "x"
+    )]
+    // A hold-style macro: legal, and worth saying out loud.
+    #[case("    events:\n      - down: w\n", "w (held)")]
+    // A release with no press before it: also legal, also worth saying.
+    #[case(
+        "    events:\n      - up: w\n      - down: x\n      - up: x\n",
+        "(release w) x"
+    )]
+    fn test_render_plan(#[case] command: &str, #[case] expected: &str) {
+        assert_eq!(render_plan(&plan(command)), expected);
+    }
+
+    #[test]
+    fn test_an_empty_plan_says_so() {
+        assert_eq!(
+            render_plan(&CompiledOutput::Keyboard(Vec::new())),
+            "(nothing)"
+        );
+    }
+
+    #[test]
+    fn test_waits_alone_are_elided_entirely() {
+        assert_eq!(
+            render_plan(&CompiledOutput::Keyboard(vec![KeyEvent::Wait(
+                Duration::from_secs(1)
+            )])),
+            "(nothing)"
+        );
+    }
+
+    #[test]
+    fn test_a_repeated_press_does_not_break_the_chord() {
+        // Nothing in the schema produces this, but the renderer must not
+        // underflow its hold count if something ever does.
+        assert_eq!(
+            render_plan(&CompiledOutput::Keyboard(vec![
+                KeyEvent::Down(key("x")),
+                KeyEvent::Down(key("x")),
+                KeyEvent::Up(key("x")),
+            ])),
+            "x"
+        );
+    }
+
+    #[test]
+    fn test_the_defaults_do_not_leak_into_the_rendering() {
+        // The timings a `keys:` list compiles to are a `run` concern; a
+        // rehearsal is about which keys, in which order.
+        assert_eq!(
+            OutputDefaults::default().duration,
+            Duration::from_millis(30)
+        );
+        assert_eq!(render_plan(&plan("    keys: [\"a\"]\n")), "a");
+    }
+}

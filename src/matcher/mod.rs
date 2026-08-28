@@ -146,6 +146,13 @@ pub async fn matcher_task(
                         }
                     }
                 }
+                Some(RecognitionEvent::Failed) => {
+                    // A frame the recognizer could not decode says nothing
+                    // about what was said, so it must not disturb a pending
+                    // command: the words either side of it still add up to the
+                    // phrase the speaker is part-way through. The session's UI
+                    // is where this is reported.
+                }
                 Some(RecognitionEvent::Muted) => {
                     // A half-confirmed command must not fire when listening
                     // resumes.
@@ -389,6 +396,14 @@ mod tests {
             settle().await;
         }
 
+        async fn fail(&self) {
+            self.events
+                .send(RecognitionEvent::Failed)
+                .await
+                .expect("the matcher should still be listening");
+            settle().await;
+        }
+
         async fn advance(&self, duration: Duration) {
             tokio::time::advance(duration).await;
             settle().await;
@@ -423,6 +438,28 @@ mod tests {
         h.hear_final("deploy sentry").await;
 
         // No time has been advanced: the fire must not wait for any timeout.
+        assert_eq!(h.fired(), vec!["deploy sentry"]);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_decode_failure_leaves_the_matcher_exactly_where_it_was() {
+        let mut h = Harness::start(arsenal());
+
+        // A failure in the middle of an ambiguous phrase must not fire the
+        // pending command early (as a mute would) nor drop it: it carries no
+        // words, so there is nothing for the matcher to change its mind about.
+        h.hear_final("autocannon").await;
+        h.fail().await;
+        h.nothing_fired();
+
+        h.advance(TIMEOUT).await;
+        assert_eq!(h.fired(), vec!["autocannon"]);
+
+        // And it is not a phrase boundary either: the next utterance matches
+        // exactly as it would have without it.
+        h.fail().await;
+        h.hear_final("deploy sentry").await;
         assert_eq!(h.fired(), vec!["deploy sentry"]);
         h.shutdown().await;
     }

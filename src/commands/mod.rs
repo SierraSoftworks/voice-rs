@@ -6,6 +6,7 @@ mod new;
 mod run;
 mod setup;
 mod test;
+mod ui;
 mod validate;
 
 #[derive(Subcommand, Debug)]
