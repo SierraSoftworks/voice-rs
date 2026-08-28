@@ -1,0 +1,31 @@
+# The canonical voice-orders profile, exercised by a unit test in
+# src/config/mod.rs so that this file and the schema cannot drift apart.
+name: Deep Rock Galactic
+model: ~/.local/share/vosk/vosk-model-small-en-us-0.15   # ~ expanded at load
+
+audio:
+  device: default          # or a substring of the cpal device name, e.g. "USB Microphone"
+
+hotkey:
+  device: auto             # auto | /dev/input/event3 | device-name substring
+  key: rightctrl           # friendly key name (see key reference)
+  mode: toggle             # toggle | push-to-talk | push-to-mute
+
+completion_timeout: 350ms  # ambiguous-prefix settle time (default: 300ms)
+
+defaults:                  # applies to the `keys:` shorthand form
+  duration: 30ms           # how long each chord is held down
+  interval: 25ms           # gap between chords
+
+commands:
+  - phrase: deploy [the] {autocannon, auto cannon} [sentry]
+    keys: ["4"]                        # shorthand: press sequence
+
+  - phrase: open [the] terminal
+    keys: ["leftctrl+leftalt+t"]       # chord: all down in listed order, all up in reverse
+
+  - phrase: salute
+    events:                            # explicit form: full control
+      - down: x
+      - wait: 750ms
+      - up: x
