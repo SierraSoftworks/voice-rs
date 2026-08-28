@@ -1,0 +1,43 @@
+[package]
+name = "voice-orders"
+version = "0.1.0"
+edition = "2024"
+description = "A Linux-native voice macro tool: speak a phrase, press the keys."
+license = "MIT"
+repository = "https://github.com/SierraSoftworks/voice-rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+cpal = "0.16"
+evdev = { version = "0.13", features = ["tokio"] }
+human-errors = { version = "0.2.3", features = ["pretty"] }
+humantime = "2.1"
+libc = "0.2"
+ratatui = "0.30.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9.34"
+shellexpand = "3.1"
+strsim = "0.11"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal", "fs"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", features = ["opentelemetry"] }
+uinput-tokio = "0.1.36"
+vosk = "0.3.1"
+
+[dev-dependencies]
+rstest = "0.26.1"
+tokio = { version = "1.50", features = ["test-util"] }
+tempfile = "3"
+wiremock = "0.6.2"
+
+[features]
+default = []
+# Gates tests which require external resources (a Vosk model, audio hardware,
+# or real /dev/uinput access): `cargo test --features pure_tests` skips them.
+pure_tests = []
+
+[profile.release]
+debug = false
+strip = "debuginfo"
