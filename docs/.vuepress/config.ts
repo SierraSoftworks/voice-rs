@@ -16,10 +16,6 @@ export default defineUserConfig({
   title: 'voice-orders',
   description: 'Speak a phrase, press the keys: a Linux-native voice macro tool.',
 
-  // This site is published to GitHub Pages as a project page (no custom
-  // domain, and therefore no CNAME), so every asset lives under /voice-rs/.
-  base: '/voice-rs/',
-
   head: [
     ['meta', { name: "description", content: "Documentation for voice-orders, a Linux-native voice macro tool which turns spoken phrases into keystrokes in your games." }],
   ],
