@@ -58,7 +58,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
       - name: Cache libvosk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/vosk/lib
           key: libvosk-x86_64-${{ env.VOSK_VERSION }}
@@ -110,7 +110,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
       - name: Cache libvosk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/vosk/lib
           key: libvosk-x86_64-${{ env.VOSK_VERSION }}
@@ -138,7 +138,7 @@ jobs:
       # need one read VOSK_MODEL_PATH and skip themselves when it is unset, so
       # this is the single place the model has to exist.
       - name: Cache Vosk model
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/vosk/models
           key: vosk-model-${{ env.VOSK_MODEL }}
@@ -234,7 +234,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
       - name: Cache libvosk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/vosk/lib
           key: libvosk-${{ matrix.vosk_arch }}-${{ env.VOSK_VERSION }}
