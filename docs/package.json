@@ -1,0 +1,32 @@
+{
+  "name": "voice-orders-docs",
+  "version": "1.0.0",
+  "description": "The documentation website for voice-orders, generated with VuePress",
+  "main": "index.js",
+  "scripts": {
+    "build": "vuepress build --clean-cache --clean-temp",
+    "dev": "vuepress dev"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SierraSoftworks/voice-rs.git"
+  },
+  "keywords": [
+    "documentation",
+    "vuepress",
+    "website",
+    "docs"
+  ],
+  "author": "Benjamin Pannell <benjamin@pannell.dev>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/SierraSoftworks/voice-rs/issues"
+  },
+  "homepage": "https://github.com/SierraSoftworks/voice-rs#readme",
+  "devDependencies": {
+    "@vuepress/bundler-vite": "2.0.0-rc.31",
+    "@vuepress/theme-default": "2.0.0-rc.132",
+    "sass-embedded": "^1.103.1",
+    "vuepress": "2.0.0-rc.31"
+  }
+}
