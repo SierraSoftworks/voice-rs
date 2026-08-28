@@ -30,17 +30,26 @@ rather than through the display server, and it gets out of the way when your gam
 
 ## Installation
 
-Download the latest tarball from the [releases page][releases] and unpack it. The tarballs bundle `libvosk.so`
-alongside the binary, so there is nothing else to install:
+From the [Homebrew tap][tap]:
 
 ```sh
-tar -xzf voice-orders-linux-amd64.tar.gz
-./voice-orders --version
+brew install sierrasoftworks/tap/voice-orders
 ```
 
-> **Note:** voice-orders links `libvosk.so` dynamically, and there is no crates.io fallback. The release tarballs
-> handle that for you; if you build from source, or install the binary on its own, you will need libvosk on your
-> library path. See the [installation guide](https://sierrasoftworks.github.io/voice-rs/guide/installation.html).
+Or download the binary and its `libvosk.so` from the [releases page][releases] — both are published as plain files:
+
+```sh
+curl -fsSLO https://github.com/SierraSoftworks/voice-rs/releases/latest/download/voice-orders-linux-amd64
+curl -fsSLO https://github.com/SierraSoftworks/voice-rs/releases/latest/download/libvosk-linux-amd64.so
+sudo install -m 0755 voice-orders-linux-amd64 /usr/local/bin/voice-orders
+sudo install -m 0644 libvosk-linux-amd64.so /usr/local/lib/libvosk.so
+sudo ldconfig
+```
+
+> **Note:** voice-orders needs `libvosk.so`, and there is no crates.io fallback — Homebrew users should drop
+> `libvosk-linux-<arch>.so` into `$(brew --prefix)/lib/libvosk.so`, which the binary's rpath covers. The library is
+> loaded on demand rather than linked, so voice-orders still starts without it and `voice-orders doctor` will tell you
+> exactly what to install. See the [installation guide](https://sierrasoftworks.github.io/voice-rs/guide/installation.html).
 
 You will also need a **dynamic-graph** speech model — `vosk-model-en-us-0.22-lgraph` (~128 MB) is the recommended one:
 
@@ -141,6 +150,7 @@ MIT.
 
 [vosk]: https://alphacephei.com/vosk/
 [releases]: https://github.com/SierraSoftworks/voice-rs/releases
+[tap]: https://github.com/SierraSoftworks/homebrew-tap
 [installation]: https://sierrasoftworks.github.io/voice-rs/guide/installation.html
 [permissions]: https://sierrasoftworks.github.io/voice-rs/guide/permissions.html
 [steam]: https://sierrasoftworks.github.io/voice-rs/guide/steam.html

@@ -134,7 +134,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 human-errors = { version = "0.2", features = ["pretty"] }
 humantime = "2"
-vosk = "0.3"                          # links libvosk.so dynamically via vosk-sys
+serde_json = "1"                      # libvosk's result envelopes
 cpal = "0.16"
 evdev = { version = "0.13", features = ["tokio"] }
 uinput-tokio = "0.1"
@@ -764,9 +764,10 @@ with human-errors advice on failure; exit 1 iff any check fails:
 3. The user is in the `input` group, and at least one `/dev/input/event*` keyboard device is
    readable (reusing the hotkey discovery path).
 4. An audio input device is present (cpal enumeration).
-5. A speech model resolves (CLI → profile → `$VOSK_MODEL_PATH`) and has a dynamic graph
+5. `libvosk.so` loads, reporting where it was found (see below).
+6. A speech model resolves (CLI → profile → `$VOSK_MODEL_PATH`) and has a dynamic graph
    (`graph/Gr.fst`), i.e. supports grammar mode.
-6. With a profile argument: the profile loads, and its hotkey device resolves.
+7. With a profile argument: the profile loads, and its hotkey device resolves.
 
 Group membership changes need a re-login; `doctor` distinguishes "not in the group" from "in the
 group but this session predates the change" (effective vs. configured groups) and says which.
@@ -879,7 +880,27 @@ misses, suggest in order:
 
 ## libvosk & model distribution
 
-`vosk-sys` links `libvosk.so` dynamically; there is no pure-crates.io path.
+There is no pure-crates.io path to Vosk: `libvosk.so` has to be on the machine.
+
+### Loading it
+
+`vosk-sys` binds the C API in an `extern` block carrying `#[link(name = "vosk")]`, which puts a
+`DT_NEEDED` entry in the executable — so the dynamic loader resolves libvosk *before* `main`, and a
+machine without it cannot run voice-orders at all. Not `--version`, not `setup`, and not `doctor`,
+whose whole job is to explain what is missing; the user gets
+`error while loading shared libraries: libvosk.so` and nothing else.
+
+`recognition/libvosk.rs` therefore owns the FFI itself: the fifteen entry points we use are declared
+as function-pointer fields, and the library is `dlopen`ed on first use (`RTLD_NOW | RTLD_LOCAL`) into
+a process-lifetime `OnceLock`. A missing library becomes an ordinary `human_errors` **user** error
+carrying install instructions, raised where recognition is set up — every other command keeps
+working, and `doctor` gets to report it as one more `✗` line. `recognition/vosk.rs` sits on top of
+that with the safe `Model`/`Recognizer` wrappers and the decoder thread, unchanged in shape.
+
+Search order: `$VOSK_LIB_PATH` (the library, or the directory holding it), then the bare `libvosk.so`
+so that `dlopen` searches the binary's `RUNPATH` — `$ORIGIN`, `$ORIGIN/../lib` and
+`$HOMEBREW_PREFIX/lib` — followed by `$LD_LIBRARY_PATH`, the `ldconfig` cache and the system
+directories.
 
 ### Model selection
 
@@ -905,19 +926,27 @@ Model resolution order (so shared profiles need not hard-code paths):
 
 If none is set, the error advises downloading a model and lists the three mechanisms.
 
-- **Docs:** a dedicated installation page covers downloading the `vosk-linux-x86_64-<ver>.zip` from
-  the alphacephei releases, installing `libvosk.so` (`/usr/local/lib` + `ldconfig`, or
-  `LD_LIBRARY_PATH`), and downloading/unpacking a model (small-en-us is ~40 MB).
-- **CI:** every compiling job (check, test, build) downloads and caches the libvosk zip and exports
-  `LIBRARY_PATH`/`LD_LIBRARY_PATH` — the link dependency is unconditional and cannot be
-  feature-gated away. The model itself is cached and downloaded only in the test job.
+- **Docs:** a dedicated installation page covers the Homebrew tap, the raw release assets, installing
+  `libvosk.so` (`/usr/local/lib` + `ldconfig`, `$(brew --prefix)/lib`, or beside the binary), and
+  downloading/unpacking a model (small-en-us is ~40 MB).
+- **CI:** only the jobs which need the library at *runtime* fetch it. `test` downloads and caches the
+  libvosk zip and exports `VOSK_LIB_PATH`/`LD_LIBRARY_PATH`; `build` fetches it purely to publish it
+  as a release asset; `check` needs it not at all, because nothing links against it. The model itself
+  is cached and downloaded only in the test job.
 - **Feature gate:** following the github-backup `pure_tests` pattern, tests that need a real model
   (vocabulary integration, end-to-end `validate examples/profile.yaml`) are marked
   `#[cfg_attr(feature = "pure_tests", ignore)]`; everything else runs against the trait fakes and
-  needs only the `.so` to link.
-- **Releases:** tarballs bundle `libvosk.so` next to the binary, built with
-  `-C link-args=-Wl,-rpath,$ORIGIN`, so the Steam-wrapper story is a single download. Vosk is
+  needs no `.so` at all.
+- **Releases:** the binary and `libvosk.so` are published as raw, unarchived assets
+  (`voice-orders-linux-<arch>` and `libvosk-linux-<arch>.so`) following the Sierra Softworks
+  `{app}-{os}-{arch}` convention, which is also what the Homebrew tap consumes. The binary is built
+  with `-C link-args=-Wl,-rpath,$ORIGIN,-rpath,$ORIGIN/../lib,-rpath,$ORIGIN/../../../../lib` so the
+  two find each other side by side, under a `bin`/`lib` prefix, or in a Homebrew Cellar. Vosk is
   Apache-2.0; redistribution is fine.
+- **Tap:** a release-only fan-in job (`SierraSoftworks/actions-tap`, `name: voice-orders` because the
+  repository is `voice-rs`) rewrites the formula in `SierraSoftworks/homebrew-tap` with `major minor`
+  aliases. The formula installs the binary alone — libvosk goes into `$(brew --prefix)/lib`, which
+  the rpath above covers.
 
 ## Testing strategy
 

@@ -23,6 +23,7 @@ use crate::config::{
 };
 use crate::hotkey::discover_device;
 use crate::output::{UinputSink, keys};
+use crate::recognition::libvosk;
 
 /// The device node the virtual keyboard is created on.
 pub(crate) const UINPUT_PATH: &str = "/dev/uinput";
@@ -155,8 +156,8 @@ pub async fn run(args: DoctorArgs) -> Result<i32, crate::Error> {
     // would make the whole report a lie rather than one more failing line.
     let system = SystemConfig::load()?;
 
-    // The profile is loaded before anything else because check 5 needs its
-    // `model:` field — but a profile which does not load is check 6's problem,
+    // The profile is loaded before anything else because check 6 needs its
+    // `model:` field — but a profile which does not load is check 7's problem,
     // not a reason to stop, so the failure travels into the report.
     let loaded = match args.profile.as_deref() {
         Some(source) => Some(load_profile(source).await),
@@ -175,6 +176,7 @@ pub async fn run(args: DoctorArgs) -> Result<i32, crate::Error> {
         check_virtual_keyboard().await,
         check_input_access(),
         check_audio_input(audio_device(settings.as_ref(), &system)),
+        check_libvosk(),
         check_model(resolve(args.model.as_deref(), profile, &system)),
     ];
 
@@ -564,7 +566,25 @@ fn check_audio_input(hint: &str) -> CheckResult {
     }
 }
 
-// ── Check 5: a grammar-capable model ────────────────────────────────────────
+// ── Check 5: the Vosk library ───────────────────────────────────────────────
+
+/// Whether `libvosk.so` can be loaded.
+///
+/// This is the one check which used to be impossible to run: while the library
+/// was a link-time dependency, a machine without it could not start
+/// voice-orders at all, so there was nobody to report it. It is loaded on
+/// demand now (`recognition/libvosk.rs`), which makes a missing library an
+/// ordinary failing line with the install instructions attached.
+fn check_libvosk() -> CheckResult {
+    match libvosk::library_source() {
+        Ok(source) => CheckResult::ok(format!(
+            "The Vosk speech recognition library loaded from {source}."
+        )),
+        Err(e) => CheckResult::from_error(&e),
+    }
+}
+
+// ── Check 6: a grammar-capable model ────────────────────────────────────────
 
 /// Whether a model resolves, and whether it is one grammar mode can use.
 ///
@@ -603,7 +623,7 @@ fn check_model(resolved: Result<PathBuf, crate::Error>) -> CheckResult {
     )
 }
 
-// ── Check 6: the profile ────────────────────────────────────────────────────
+// ── Check 7: the profile ────────────────────────────────────────────────────
 
 /// Whether the profile named on the command line loads, whether its settings
 /// resolve against this machine's configuration, and whether the device the
@@ -1149,6 +1169,19 @@ mod tests {
         assert!(
             !name.is_empty(),
             "the discovered keyboard should have a name"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "pure_tests", ignore)]
+    fn real_machine_has_libvosk() {
+        let result = check_libvosk();
+
+        assert!(
+            result.ok,
+            "the gated tests need libvosk, so this machine should have it: {}\n{}",
+            result.headline,
+            result.advice.join("\n")
         );
     }
 

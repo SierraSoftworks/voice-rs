@@ -108,7 +108,9 @@ in the [grammar reference](./grammar/README.md), and every key name you may writ
 
 ## Releases
 
-Pre-built Linux tarballs — with `libvosk.so` bundled alongside the binary — are published on the
+`brew install sierrasoftworks/tap/voice-orders` installs the latest release from the
+[Homebrew tap](https://github.com/SierraSoftworks/homebrew-tap). Pre-built Linux binaries and the matching
+`libvosk.so` are also published as plain files on the
 [GitHub releases page](https://github.com/SierraSoftworks/voice-rs/releases).
 
 [libvosk]: https://alphacephei.com/vosk/

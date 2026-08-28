@@ -12,9 +12,9 @@ on:
 env:
   VERSION: "0.0.0-dev"
 
-  # vosk-sys links libvosk.so dynamically and there is no crates.io fallback,
-  # so every job which compiles this crate has to fetch the prebuilt library
-  # first. Bump these two together with the `vosk` crate.
+  # libvosk is loaded with dlopen at runtime rather than linked, so only the
+  # jobs which *run* recognition (test) or *ship* the library (build) need it.
+  # Bump these two together.
   VOSK_VERSION: "0.3.45"
   VOSK_MODEL: "vosk-model-small-en-us-0.15"
 
@@ -54,37 +54,10 @@ jobs:
 
       # cpal's ALSA host needs the ALSA headers, and uinput-tokio pulls in
       # libudev-sys, whose build script shells out to pkg-config for libudev.
+      # libvosk is deliberately absent: it is dlopen'd at runtime rather than
+      # linked, so nothing here needs it to compile.
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
-
-      - name: Cache libvosk
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/vosk/lib
-          key: libvosk-x86_64-${{ env.VOSK_VERSION }}
-
-      - name: Install libvosk
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$HOME/.cache/vosk/lib"
-          # The zip holds a single directory, vosk-linux-<arch>-<version>/,
-          # containing libvosk.so and vosk_api.h. Unzipping into `root` yields
-          # `$root/vosk-linux-x86_64-<version>` and *that* is the directory the
-          # linker and loader need on their search paths.
-          dir="$root/vosk-linux-x86_64-${VOSK_VERSION}"
-          if [ ! -f "$dir/libvosk.so" ]; then
-            mkdir -p "$root"
-            curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/libvosk.zip \
-              "https://github.com/alphacep/vosk-api/releases/download/v${VOSK_VERSION}/vosk-linux-x86_64-${VOSK_VERSION}.zip"
-            unzip -q -o /tmp/libvosk.zip -d "$root"
-          fi
-          test -f "$dir/libvosk.so"
-          {
-            echo "VOSK_LIB_DIR=$dir"
-            echo "LIBRARY_PATH=$dir"
-            echo "LD_LIBRARY_PATH=$dir"
-          } >> "$GITHUB_ENV"
 
       - name: cargo fmt
         run: cargo fmt --all --check
@@ -128,9 +101,10 @@ jobs:
             unzip -q -o /tmp/libvosk.zip -d "$root"
           fi
           test -f "$dir/libvosk.so"
+          # VOSK_LIB_PATH is what voice-orders itself consults first;
+          # LD_LIBRARY_PATH covers anything else which dlopen's the bare SONAME.
           {
-            echo "VOSK_LIB_DIR=$dir"
-            echo "LIBRARY_PATH=$dir"
+            echo "VOSK_LIB_PATH=$dir/libvosk.so"
             echo "LD_LIBRARY_PATH=$dir"
           } >> "$GITHUB_ENV"
 
@@ -249,8 +223,8 @@ jobs:
           set -euo pipefail
           root="$HOME/.cache/vosk/lib"
           # vosk-linux-<arch>-<version>.zip unpacks to a directory of the same
-          # name holding libvosk.so - point the linker at that directory, and
-          # keep its path around so the release tarball can bundle the .so.
+          # name holding libvosk.so. Nothing links against it any more; the
+          # build job fetches it purely so the release can publish it.
           dir="$root/vosk-linux-${{ matrix.vosk_arch }}-${VOSK_VERSION}"
           if [ ! -f "$dir/libvosk.so" ]; then
             mkdir -p "$root"
@@ -259,11 +233,7 @@ jobs:
             unzip -q -o /tmp/libvosk.zip -d "$root"
           fi
           test -f "$dir/libvosk.so"
-          {
-            echo "VOSK_LIB_DIR=$dir"
-            echo "LIBRARY_PATH=$dir"
-            echo "LD_LIBRARY_PATH=$dir"
-          } >> "$GITHUB_ENV"
+          echo "VOSK_LIB_DIR=$dir" >> "$GITHUB_ENV"
 
       # Install cross *before* Setup Cache. rust-cache restores cargo's
       # install metadata (.crates2.json) but not the cargo bin directory,
@@ -311,33 +281,67 @@ jobs:
         with:
           name: cargofile
 
-      # -rpath,$ORIGIN makes the binary look for libvosk.so beside itself, which
-      # is what lets the release tarball ship the two side by side.
+      # libvosk.so is dlopen'd by name, and dlopen searches the calling
+      # binary's RUNPATH — so the rpath is what lets an installed voice-orders
+      # find the library in each layout the release assets end up in:
+      #   $ORIGIN                    - the two files unpacked side by side
+      #   $ORIGIN/../lib             - a `bin`/`lib` prefix such as /usr/local
+      #   $ORIGIN/../../../../lib    - $HOMEBREW_PREFIX/lib, four levels up from
+      #                                Cellar/voice-orders/<version>/bin
+      # A single -Wl argument carries all three because RUSTFLAGS is split on
+      # spaces, so each entry has to be comma-separated rather than a flag of
+      # its own.
       - name: cargo build
         run: ${{ matrix.builder }} build --release --target ${{ matrix.target }}
         env:
-          RUSTFLAGS: "-C link-args=-Wl,-rpath,$ORIGIN"
+          RUSTFLAGS: "-C link-args=-Wl,-rpath,$ORIGIN,-rpath,$ORIGIN/../lib,-rpath,$ORIGIN/../../../../lib"
 
-      - name: Package release tarball
+      # Release assets are published raw rather than as a tarball so they can be
+      # dropped straight onto a PATH, and so the Homebrew tap (which downloads
+      # and hashes a single binary named {app}-{os}-{arch}) can consume them.
+      # libvosk.so travels as its own asset for the same reason.
+      - name: Stage release artifacts
         shell: bash
         run: |
           set -euo pipefail
-          staging="$(mktemp -d)"
-          cp "target/${{ matrix.target }}/release/voice-orders" "$staging/"
-          cp "${VOSK_LIB_DIR}/libvosk.so" "$staging/"
-          chmod +x "$staging/voice-orders"
-          tar -czf "voice-orders-${{ matrix.target }}.tar.gz" -C "$staging" voice-orders libvosk.so
+          cp "target/${{ matrix.target }}/release/voice-orders" "voice-orders-${{ matrix.os }}-${{ matrix.arch }}"
+          cp "${VOSK_LIB_DIR}/libvosk.so" "libvosk-${{ matrix.os }}-${{ matrix.arch }}.so"
+          chmod +x "voice-orders-${{ matrix.os }}-${{ matrix.arch }}"
 
       - name: Upload GitHub Release Artifacts
         uses: SierraSoftworks/gh-releases@v1.0.10
         if: github.event_name == 'release'
         with:
-          files: "voice-orders-${{ matrix.target }}.tar.gz | voice-orders-${{ matrix.target }}.tar.gz"
+          files: |
+            voice-orders-${{ matrix.os }}-${{ matrix.arch }}
+            libvosk-${{ matrix.os }}-${{ matrix.arch }}.so
           token: ${{ secrets.GITHUB_TOKEN }}
           overwrite: "true"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: voice-orders-${{ matrix.target }}
-          path: voice-orders-${{ matrix.target }}.tar.gz
+          name: voice-orders-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            voice-orders-${{ matrix.os }}-${{ matrix.arch }}
+            libvosk-${{ matrix.os }}-${{ matrix.arch }}.so
+
+  # Fan in once every target's assets are published, so the tap never holds a
+  # formula which only covers half the platforms. The repository is `voice-rs`
+  # but the binary (and therefore the formula and asset prefix) is
+  # `voice-orders`, hence the explicit name.
+  tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    needs:
+      - build
+    steps:
+      - name: Update Homebrew Tap
+        uses: SierraSoftworks/actions-tap@v1
+        with:
+          name: voice-orders
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          aliases: major minor

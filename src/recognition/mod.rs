@@ -4,9 +4,14 @@
 //! owns the model and grammar-constrained recognizer); everything downstream
 //! depends only on the contract types in this module so it can be tested
 //! without libvosk. See DESIGN.md §"Recognition (dedicated thread)".
+//!
+//! `libvosk.rs` sits underneath it and holds the FFI itself: the library is
+//! `dlopen`ed on first use rather than linked, so a machine without it can
+//! still start voice-orders and be told what to install.
 
 #![allow(dead_code)] // consumed as the wave-1 modules land
 
+pub mod libvosk;
 pub mod vosk;
 
 /// An event emitted by the recognizer towards the matcher.

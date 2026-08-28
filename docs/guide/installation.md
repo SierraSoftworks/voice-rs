@@ -2,35 +2,60 @@
 
 voice-orders has two moving parts you need on disk before it will start: the **libvosk** shared library, which does the
 speech recognition, and a **speech model**, which is the vocabulary and acoustic data it recognizes against. This page
-covers both, plus the two ways of getting the binary itself.
+covers both, plus the three ways of getting the binary itself.
 
 ## The binary
 
-### From a release tarball <Badge text="recommended" type="tip"/>
-
-The [release tarballs][releases] bundle `libvosk.so` next to the `voice-orders` binary and are linked with
-`-Wl,-rpath,$ORIGIN`, which means the binary looks for the library **in its own directory first**. Keep the two files
-together and there is nothing to install and no library path to configure:
+### From the Homebrew tap <Badge text="recommended" type="tip"/>
 
 ```sh
-tar -xzf voice-orders-linux-amd64.tar.gz
-cd voice-orders-linux-amd64
-./voice-orders --version
+brew install sierrasoftworks/tap/voice-orders
 ```
 
-::: warning
-That rpath is why the two files travel together. If you copy `voice-orders` to `/usr/local/bin` on its own, it will no
-longer find the bundled `libvosk.so` and will fail to start — copy the library alongside it, or install libvosk
-system-wide as described below.
-:::
+The formula installs the `voice-orders` binary only, so you still need `libvosk.so` — put it in the Homebrew prefix's
+`lib` directory, which the binary's rpath covers:
+
+```sh
+curl -fsSL -o "$(brew --prefix)/lib/libvosk.so" \
+  https://github.com/SierraSoftworks/voice-rs/releases/latest/download/libvosk-linux-amd64.so
+voice-orders --version
+```
+
+### From the release binaries
+
+The [releases page][releases] publishes plain, unarchived files — `voice-orders-linux-<arch>` and the matching
+`libvosk-linux-<arch>.so` — so you can download exactly the one you want and drop it where you like:
+
+```sh
+curl -fsSLO https://github.com/SierraSoftworks/voice-rs/releases/latest/download/voice-orders-linux-amd64
+curl -fsSLO https://github.com/SierraSoftworks/voice-rs/releases/latest/download/libvosk-linux-amd64.so
+chmod +x voice-orders-linux-amd64
+```
+
+The binary carries an rpath of `$ORIGIN`, `$ORIGIN/../lib` and `$ORIGIN/../../../../lib`, which means it will find
+`libvosk.so` **beside itself**, in the `lib` directory of a `bin`/`lib` prefix such as `/usr/local`, or in a Homebrew
+prefix — and failing all of those, wherever `ldconfig` and `$LD_LIBRARY_PATH` say. Renaming the library to
+`libvosk.so` is what matters; the architecture suffix is only there to keep the release assets distinct.
 
 To install both properly:
 
 ```sh
-sudo install -m 0755 voice-orders /usr/local/bin/
-sudo install -m 0644 libvosk.so /usr/local/lib/
+sudo install -m 0755 voice-orders-linux-amd64 /usr/local/bin/voice-orders
+sudo install -m 0644 libvosk-linux-amd64.so /usr/local/lib/libvosk.so
 sudo ldconfig
 ```
+
+::: tip
+voice-orders loads `libvosk.so` on demand rather than linking it, so a machine without it still starts — `--version`,
+`setup` and `doctor` all work, and the commands which actually recognize speech (`run`, `test`, `validate`) tell you
+what to install instead of failing to launch. `voice-orders doctor` reports the library as one of its checks.
+
+If it is installed somewhere none of those paths reach, point at it directly:
+
+```sh
+export VOSK_LIB_PATH=/opt/vosk/libvosk.so   # the library, or the directory holding it
+```
+:::
 
 ### From source
 

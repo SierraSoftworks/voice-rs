@@ -17,11 +17,13 @@ use std::{
 };
 
 use tracing_batteries::prelude::*;
-use vosk::{AcceptWaveformError, DecodingState, LogLevel, Model, Recognizer};
 
 use crate::{
     errors::HumanizableError,
-    recognition::{AudioMsg, RecognitionEvent, Vocabulary},
+    recognition::{
+        AudioMsg, RecognitionEvent, Vocabulary,
+        libvosk::{self, BufferTooLong, DecodingState, LogLevel, Model, Recognizer},
+    },
 };
 
 /// The out-of-grammar catch-all phrase. Without it Vosk force-aligns *any*
@@ -171,7 +173,7 @@ fn recognition_loop(
                     Ok(DecodingState::Finalized) => {
                         last_partial.clear();
 
-                        let text = final_text(&mut session.recognizer);
+                        let text = session.recognizer.result();
                         if text.is_empty() {
                             continue;
                         }
@@ -182,7 +184,7 @@ fn recognition_loop(
                         }
                     }
                     Ok(DecodingState::Running) => {
-                        let partial = session.recognizer.partial_result().partial.to_owned();
+                        let partial = session.recognizer.partial_result();
                         if let Some(text) = partial_update(&mut last_partial, partial)
                             && events
                                 .blocking_send(RecognitionEvent::Partial(text))
@@ -229,19 +231,6 @@ fn discard_utterance(recognizer: &mut Recognizer, last_partial: &mut String) {
     last_partial.clear();
 }
 
-/// Reads the finalized transcript, tolerating the multi-alternative shape even
-/// though we keep `max_alternatives` at its single-result default.
-fn final_text(recognizer: &mut Recognizer) -> String {
-    match recognizer.result() {
-        vosk::CompleteResult::Single(single) => single.text.to_owned(),
-        vosk::CompleteResult::Multiple(multiple) => multiple
-            .alternatives
-            .first()
-            .map(|alt| alt.text.to_owned())
-            .unwrap_or_default(),
-    }
-}
-
 /// Decides whether a partial hypothesis is worth forwarding.
 ///
 /// Vosk repeats the same partial for every frame while the speaker holds a
@@ -264,10 +253,9 @@ fn partial_update(last: &mut String, partial: String) -> Option<String> {
 /// Returns the grammar to compile: the caller's phrases plus [`UNKNOWN_PHRASE`]
 /// if it is not already present.
 ///
-/// Phrases are embedded into a JSON array by `vosk` without escaping, so a
-/// phrase carrying a quote or backslash would silently corrupt the grammar;
-/// the phrase DSL cannot produce one, but we refuse it loudly rather than
-/// hand libvosk something malformed.
+/// A phrase carrying a quote or backslash cannot appear in a grammar libvosk
+/// will accept; the phrase DSL cannot produce one, but we refuse it loudly
+/// rather than hand the recognizer something it will mangle.
 fn prepare_grammar(grammar: &[String]) -> Result<Vec<String>, crate::Error> {
     if let Some(bad) = grammar.iter().find(|p| p.contains('"') || p.contains('\\')) {
         return Err(human_errors::user(
@@ -326,7 +314,7 @@ fn load_model(model_path: &Path) -> Result<Model, crate::Error> {
         )
     })?;
 
-    Model::new(path).ok_or_else(|| {
+    Model::open(path)?.ok_or_else(|| {
         human_errors::user(
             format!(
                 "We were unable to load the Vosk speech model at '{}'.",
@@ -355,7 +343,7 @@ fn build_recognizer(
     sample_rate: u32,
     phrases: &[String],
 ) -> Result<Recognizer, crate::Error> {
-    let mut recognizer = Recognizer::new_with_grammar(model, sample_rate as f32, phrases)
+    let mut recognizer = Recognizer::with_grammar(model, sample_rate as f32, phrases)
         .ok_or_else(|| {
             human_errors::user(
                 "We could not build a grammar-constrained recognizer from this speech model.",
@@ -380,7 +368,7 @@ fn build_recognizer(
 /// launch doesn't spray the terminal.
 fn quiet_vosk_logging() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| vosk::set_log_level(LogLevel::Warn));
+    ONCE.call_once(|| libvosk::set_log_level(LogLevel::Warn));
 }
 
 /// Periodically reports frames the audio callback had to drop because the
@@ -469,7 +457,7 @@ fn read_word_list(model_path: &Path) -> Option<Vec<String>> {
     )
 }
 
-impl HumanizableError for AcceptWaveformError {
+impl HumanizableError for BufferTooLong {
     fn to_human_error(self) -> crate::Error {
         human_errors::wrap_system(
             self,
