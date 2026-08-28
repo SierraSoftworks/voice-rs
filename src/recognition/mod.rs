@@ -24,6 +24,15 @@ pub enum RecognitionEvent {
     Final(String),
     /// Listening was turned off; the matcher must clear all pending state.
     Muted,
+    /// The recognizer could not decode the audio it was given.
+    ///
+    /// Emitted once per run of failures rather than once per frame (see
+    /// [`vosk::FailureGate`]): a decoder which cannot decode fails on *every*
+    /// frame, and a report per frame would bury everything else. The matcher
+    /// ignores it — it says nothing about what was said — but a session's UI
+    /// shows it, because "the recognizer is failing" is the difference between
+    /// a profile which does not match and a machine which cannot listen.
+    Failed,
 }
 
 /// A message on the audio channel into the recognizer thread.

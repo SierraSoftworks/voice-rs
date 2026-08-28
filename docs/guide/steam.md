@@ -46,6 +46,17 @@ Signals are handled the way you would expect. `SIGINT` (Ctrl-C in a terminal) re
 the process group. `SIGTERM` — which is what Steam's "Stop" button sends — is forwarded to the child, followed by a
 short grace period before voice-orders exits regardless.
 
+### Steam launches are never a terminal session
+
+Run from an interactive terminal, `voice-orders run` draws a full-screen view of what it is hearing (the same one
+[`test`](../profiles/README.md#rehearsing-a-profile) uses), and pipes the wrapped application's output into its log so
+nothing scribbles over the display.
+
+**Steam launches get none of that.** Steam gives the launch option no terminal, so `run` takes exactly the path
+described above: line-oriented logs, the game's stdio inherited straight through to Steam's console, and the same
+signal and exit-code behavior. Nothing in the wrapper contract changes because the feature exists — if you want to
+*see* the view, launch the same command from a terminal.
+
 ## Per-game profiles
 
 Each game gets its own profile file, and each launch option names the profile it wants:

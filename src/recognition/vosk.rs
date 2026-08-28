@@ -163,6 +163,7 @@ fn recognition_loop(
     drops: &mut DropReporter,
 ) {
     let mut last_partial = String::new();
+    let mut failures = FailureGate::default();
 
     while let Ok(msg) = audio.recv() {
         match msg {
@@ -171,6 +172,7 @@ fn recognition_loop(
 
                 match session.recognizer.accept_waveform(&samples) {
                     Ok(DecodingState::Finalized) => {
+                        failures.decoded();
                         last_partial.clear();
 
                         let text = session.recognizer.result();
@@ -184,6 +186,8 @@ fn recognition_loop(
                         }
                     }
                     Ok(DecodingState::Running) => {
+                        failures.decoded();
+
                         let partial = session.recognizer.partial_result();
                         if let Some(text) = partial_update(&mut last_partial, partial)
                             && events
@@ -194,7 +198,15 @@ fn recognition_loop(
                         }
                     }
                     Ok(DecodingState::Failed) => {
-                        warn!("The speech recognizer failed to decode a frame of audio.");
+                        // Once per run of failures: a decoder which cannot
+                        // decode fails on every frame, which is 50 reports a
+                        // second if each one is reported.
+                        if failures.failed() {
+                            warn!("The speech recognizer failed to decode a frame of audio.");
+                            if events.blocking_send(RecognitionEvent::Failed).is_err() {
+                                break;
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!("{}", human_errors::pretty(&e.to_human_error()));
@@ -212,6 +224,36 @@ fn recognition_loop(
                 discard_utterance(&mut session.recognizer, &mut last_partial);
             }
         }
+    }
+}
+
+/// Rate-limits [`RecognitionEvent::Failed`] down to one report per run of
+/// failures.
+///
+/// A decoder which cannot decode the audio it is being given fails on *every*
+/// frame — roughly fifty times a second — so reporting each one would fill the
+/// log with the same line and bury everything the session is actually for. The
+/// first failure is reported and the rest are suppressed until a successful
+/// decode intervenes, which is exactly when the condition has changed enough to
+/// be worth reporting again.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FailureGate {
+    /// Whether the current run of failures has already been reported.
+    reported: bool,
+}
+
+impl FailureGate {
+    /// Notes a failed decode, returning whether it is worth reporting.
+    fn failed(&mut self) -> bool {
+        let first = !self.reported;
+        self.reported = true;
+        first
+    }
+
+    /// Notes a successful decode: whatever was wrong is no longer wrong, so the
+    /// next failure is news again.
+    fn decoded(&mut self) {
+        self.reported = false;
     }
 }
 
@@ -470,6 +512,27 @@ impl HumanizableError for BufferTooLong {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failures_are_reported_once_until_a_decode_succeeds() {
+        let mut gate = FailureGate::default();
+
+        // The first failure of a run is news; the rest of the run is not.
+        assert!(gate.failed(), "the first failure should be reported");
+        assert!(!gate.failed(), "a repeat failure should be suppressed");
+        assert!(!gate.failed());
+
+        // A successful decode means whatever was wrong is no longer wrong, so
+        // the next failure is a new problem worth saying out loud.
+        gate.decoded();
+        assert!(gate.failed(), "a failure after a good decode is news again");
+        assert!(!gate.failed());
+
+        // Successes on their own report nothing at all.
+        gate.decoded();
+        gate.decoded();
+        assert_eq!(gate, FailureGate { reported: false });
+    }
 
     #[test]
     fn prepare_grammar_appends_unknown_phrase() {

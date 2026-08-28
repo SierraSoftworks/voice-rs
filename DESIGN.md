@@ -733,22 +733,66 @@ problems get the same human advice discovery gives — and the exit code is 1 on
 section shown failed. `--audio` and `--hotkey` narrow it to one section. The rendering is a pure
 function of a device list plus ranks, which is what makes it unit-testable without hardware.
 
-### The `test` terminal UI (ratatui)
+### The session terminal UI (ratatui)
 
-`voice-orders test` renders as a full-screen terminal UI (ratatui + crossterm) rather than a line
-printer, keeping the rehearsal loop glanceable mid-game-setup. Layout, kept deliberately simple:
+**Both** `voice-orders test` and `voice-orders run` render as a full-screen terminal UI (ratatui +
+crossterm) rather than a line printer when stdout is an interactive terminal, keeping the loop
+glanceable mid-game-setup — and, under `run`, mid-game. The machinery is shared (`commands/ui/`:
+the event stream, the bounded log, the widget tree, the plan rendering); the two commands differ
+only in what they put into the stream. Layout, kept deliberately simple:
 
 - **Header** — the active profile name (left-aligned) with its stats (command count, phrase count,
-  hotkey mode) and the profile source (the resolved file path or https URL).
-- **Body** — a scrolling event log where each line leads with a colored severity dot: green `●` for
-  a matched command (with the key plan it would have played), grey `●` for a heard-but-unmatched
-  utterance, yellow `●` for an interrupted/discarded command, red `●` for pipeline errors, blue `●`
-  for listening-state changes.
+  hotkey mode) and the profile source (the resolved file path or https URL). Under `run` with a
+  wrapped application, the source line also carries `wrapping: <app> (pid …)` on the right.
+- **Body** — a scrolling event log where each line leads with a colored severity dot.
 - **Footer** — the live listening state, and the loaded model name right-aligned.
 
-`q`/`Ctrl-C` exits. When stdout is not a TTY (piped output, CI), `test` falls back to the plain
-line-printed report so scripts keep working. The TUI is `test`-only for now; extending it to `run`
-is future work.
+`q`/`Ctrl-C` exits. When stdout is not a TTY — piped output, CI, and (crucially) a Steam launch —
+both commands fall back to their existing line-oriented behavior, so the wrapper contract and every
+script reading `test`'s output are untouched.
+
+**One entry per recognition.** The log is not a transcript of the event stream. A finalized
+utterance is appended as one grey entry (`"auto cannon sentry"`), and the match which resolves it
+**upgrades that same entry in place** to green with the command and its key plan
+(`"auto cannon sentry" → Autocannon sentry (4)`); a greedy multi-match appends its extra commands to
+the same line. An entry which never upgrades stays grey — that, rather than an absent line, is the
+"it heard me but nothing fired" signal. Interrupted and discarded commands keep their own yellow
+entries, because they say something about a command which already fired rather than about the
+utterance. Listening-state changes are **not** logged at all: the footer shows the live state, which
+is both fewer lines and more current.
+
+Matches are correlated to utterances by order alone: a match belongs to the **oldest** recognition
+nothing has matched yet, because the completion timeout means a later utterance can be logged before
+an earlier one's match fires. The cost is pinned by a test — an utterance which matches nothing,
+followed by one which matches, resolves the wrong way round. Telling those two sequences apart would
+need the matcher to say which utterance a command came from, which the event stream does not carry.
+
+**Failures are visible.** A `DecodingState::Failed` from the recognizer becomes
+`RecognitionEvent::Failed`, coalesced to one event per run of failures (a decoder which cannot decode
+fails on every frame, ~50/s) and re-armed by the next successful decode. The matcher ignores it — it
+carries no words, so it must not disturb a pending command — while the UI logs it as a yellow
+`warning:` entry and plain `test` prints the same line. Without it, a session where nothing works
+looks exactly like one where nobody spoke.
+
+**Child processes under a UI.** Two things change for a wrapped application when a TUI owns the
+screen, and both are consequences of the terminal, not of preference:
+
+- **stdio is piped, not inherited.** An inherited child writes straight over the alternate screen.
+  Under the UI, stdout and stderr are read line by line and logged as dim white entries prefixed with
+  the program name; in plain mode stdio is inherited exactly as before.
+- **Ctrl-C is a keystroke, not a signal.** Raw mode is precisely the state in which the terminal
+  stops turning Ctrl-C into a SIGINT, so the child never receives one. `q`/`Ctrl-C` therefore takes
+  the graceful path by hand: the key handler cancels the UI token, the supervisor turns that into a
+  `Shutdown::ForwardSigint` intent (a pure function of "how were we stopped" and "is there a child",
+  so it is testable without signalling the test runner), forwards SIGINT with `libc::kill`, and waits
+  out the same grace period a SIGTERM gets before shutting the pipeline down. A real SIGINT still
+  forwards nothing — the kernel already delivered it to the process group — and a real SIGTERM
+  (Steam) behaves exactly as it always has.
+
+Exit codes are unchanged either way: the child's code propagates, and a session the user ended is a
+successful one. The terminal is restored *before* anything is printed, so a final human error is
+never swallowed by the alternate screen — and `main.rs` leaves the tracing console layer out
+entirely when a TUI is going to own stdout.
 
 ### `setup` and `doctor`: system configuration & diagnostics
 
@@ -803,18 +847,32 @@ Assembly order in `commands/run.rs` — each step fails early with a human error
    the listening state (`Interrupt::WhenListeningStops`), so a mute cancels the command in flight
    and drains the queue instead of only silencing the microphone; every other profile gets
    `Interrupt::Never`, which costs one never-ready `select!` arm and nothing else.
-6. If `app` is non-empty, spawn it with `tokio::process::Command` (stdio inherited).
+6. If `app` is non-empty, spawn it with `tokio::process::Command`: **stdio inherited** in plain mode
+   (the wrapper contract, and what a Steam launch always gets), **piped** under the terminal UI,
+   whose log the child's output is read into — see §"The session terminal UI (ratatui)".
 7. Supervise:
 
 ```rust
 tokio::select! {
     status = child.wait(), if child.is_some() => { cancel.cancel(); exit_code = status.code().unwrap_or(1); }
-    _ = tokio::signal::ctrl_c() => cancel.cancel(),           // child shares our process group;
-                                                              // the kernel already delivered SIGINT to it
-    _ = sigterm.recv() => { cancel.cancel(); forward_sigterm(&child); }  // Steam shutdown: libc::kill,
-                                                              // then a 5s grace before exiting anyway
+    shutdown = interrupt => {                                 // a real SIGINT: the child shares our
+        cancel.cancel();                                      // process group, so the kernel already
+        if shutdown == Shutdown::ForwardSigint {              // delivered it — but a Ctrl-C read as a
+            forward_signal(&child, SIGINT);                   // *keystroke* under the UI reached
+        }                                                     // nobody, and has to be sent by hand
+    }
+    _ = sigterm.recv() => { cancel.cancel(); forward_signal(&child, SIGTERM); }  // Steam shutdown:
+                                                              // libc::kill, then a 5s grace before
+                                                              // exiting anyway
 }
 ```
+
+Under the terminal UI a **command reporter** sits between the matcher and the executor, reporting
+each match to the log on its way through. The executor is deliberately left knowing nothing about
+any UI: it is the one part of the pipeline which must never be slowed down or complicated by
+reporting, and being *in* the path rather than tapping it means what the log says fired is exactly
+what was played, in order — the same arrangement (and the same reasoning) as the recognition
+narrator in front of the matcher.
 
 **Shutdown order matters:** cancel token → cpal stream dropped → audio channel closes → recognizer
 loop ends and joins → matcher and executor drain → **the executor releases every key it still holds

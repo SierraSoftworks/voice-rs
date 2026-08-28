@@ -1,29 +1,33 @@
-//! The full-screen rehearsal UI. See DESIGN.md §"The `test` terminal UI
-//! (ratatui)".
+//! The full-screen session UI, shared by `test` and `run`. See DESIGN.md
+//! §"The session terminal UI (ratatui)".
 //!
 //! Three regions, and nothing which scrolls sideways:
 //!
 //! ```text
 //! Helldivers 2                 12 command(s) · 48 phrase(s) · rightctrl (push-to-talk)
-//! profiles/helldivers2.yaml
+//! profiles/helldivers2.yaml                                 wrapping: helldivers2 (pid 4212)
 //! ──────────────────────────────────────────────────────────────────────────────────
-//! 19:04:11 ● listening: on
-//! 19:04:13 ● heard: "deploy the autocannon"
-//! 19:04:13 ● matched: "Autocannon" → leftctrl+4
+//! 19:04:13 ● "deploy the autocannon" → Autocannon (leftctrl+4)
+//! 19:04:19 ● "reload the thing"
+//! 19:04:21 ● helldivers2: Steam initialised
 //! ──────────────────────────────────────────────────────────────────────────────────
 //! ● listening: on  —  q to quit                            vosk-model-small-en-us-0.15
 //! ```
 //!
+//! A recognition is one entry which upgrades in place (see
+//! [`super::event::EventLog::push_at`]): grey while nothing has matched it,
+//! green with the command and its key plan once something has. The listening
+//! state is not logged at all — the footer shows it live, which is both fewer
+//! lines and more current.
+//!
 //! **On tracing and the alternate screen:** this process logs to stdout (see
 //! `telemetry.rs` — for a CLI, `info!`/`warn!` are user-facing output), and
-//! stdout is the same handle the alternate screen is drawn on. Rather than
-//! reach into the subscriber, the split is by *seam*: everything the rehearsal
-//! itself reports travels as a [`TestEvent`] and is drawn in the log below,
-//! failures included, while the pipeline's own tracing happens before this UI
-//! starts and after it has been restored. A `warn!` from deep inside the audio
-//! stack mid-session would still scribble on the screen; it is rare, the next
-//! tick redraws over it, and the alternative — swallowing logs which *are* the
-//! interface in plain mode — is worse.
+//! stdout is the same handle the alternate screen is drawn on, so `main.rs`
+//! leaves the console layer out entirely when a TUI is going to own the
+//! terminal. The split is by *seam*: everything the session itself reports
+//! travels as a [`UiEvent`] and is drawn in the log below, failures included,
+//! while the pipeline's own tracing happens before this UI starts and after it
+//! has been restored.
 
 use std::time::Duration;
 
@@ -42,7 +46,7 @@ use crate::commands::run::PipelineSummary;
 use crate::config::{Profile, ResolvedSettings};
 use crate::hotkey::ListenMode;
 
-use super::event::{DOT, EventLog, SCROLLBACK, TestEvent};
+use super::event::{DOT, EventLog, SCROLLBACK, UiEvent};
 
 /// How long the UI waits for something to happen before redrawing anyway.
 ///
@@ -65,7 +69,7 @@ type KeyResult = Result<KeyEvent, String>;
 /// What the header and footer say about the session: the parts which do not
 /// change while it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Overview {
+pub(crate) struct Overview {
     /// The profile's display name.
     pub profile: String,
     /// Where the profile came from: the resolved path, or the URL.
@@ -81,6 +85,10 @@ pub(super) struct Overview {
     pub has_hotkey: bool,
     /// The listening state the pipeline started in.
     pub listening: bool,
+    /// The wrapped application `run` started, if any: its name and pid, as the
+    /// header says it. `test` never wraps anything, so this is always [`None`]
+    /// there and the header line is the profile's source alone.
+    pub wrapping: Option<String>,
 }
 
 impl Overview {
@@ -105,7 +113,17 @@ impl Overview {
             ),
             has_hotkey: summary.mode.is_some(),
             listening: summary.listening,
+            wrapping: None,
         }
+    }
+
+    /// Notes the application `run` is wrapping, for the header.
+    pub fn wrapping(mut self, program: &str, pid: Option<u32>) -> Self {
+        self.wrapping = Some(match pid {
+            Some(pid) => format!("wrapping: {program} (pid {pid})"),
+            None => format!("wrapping: {program}"),
+        });
+        self
     }
 
     /// The right-hand side of the header: what this profile adds up to.
@@ -128,7 +146,7 @@ fn hotkey_summary(settings: &ResolvedSettings, mode: Option<ListenMode>) -> Stri
 
 /// The UI's whole state: what it was told at startup, and everything reported
 /// since.
-pub(super) struct App {
+pub(crate) struct App {
     overview: Overview,
     log: EventLog,
     listening: bool,
@@ -144,20 +162,20 @@ impl App {
     }
 
     /// Folds one reported event into the state.
-    pub fn record(&mut self, event: TestEvent) {
-        if let TestEvent::Listening(now) = event {
-            self.listening = now;
-        }
-
-        self.log.push(event);
+    pub fn record(&mut self, event: UiEvent) {
+        self.record_at(std::time::SystemTime::now(), event);
     }
 
-    /// Records an event at a fixed time, so a rendering test has a stable
+    /// Records an event at a given time, so a rendering test has a stable
     /// screen to assert against.
-    #[cfg(test)]
-    pub fn record_at(&mut self, at: std::time::SystemTime, event: TestEvent) {
-        if let TestEvent::Listening(now) = event {
+    ///
+    /// A listening change moves the footer and is *not* logged: the footer
+    /// already shows the live state, and a hotkey held down through a session
+    /// would otherwise fill the log with lines nobody reads.
+    pub fn record_at(&mut self, at: std::time::SystemTime, event: UiEvent) {
+        if let UiEvent::Listening(now) = event {
             self.listening = now;
+            return;
         }
 
         self.log.push_at(at, event);
@@ -171,9 +189,9 @@ impl App {
 /// the user asks to leave (so the supervisor stops waiting for a signal), and
 /// returns when anybody else cancels it (so a Ctrl-C or a SIGTERM takes the
 /// screen down before anything is printed over it).
-pub(super) async fn run(
+pub(crate) async fn run(
     overview: Overview,
-    events: mpsc::UnboundedReceiver<TestEvent>,
+    events: mpsc::UnboundedReceiver<UiEvent>,
     quit: CancellationToken,
 ) -> Result<(), crate::Error> {
     // However we leave — a draw failure, a panic further up — the token is
@@ -216,7 +234,7 @@ pub(super) async fn run(
 async fn drive<B>(
     terminal: &mut Terminal<B>,
     mut app: App,
-    mut events: mpsc::UnboundedReceiver<TestEvent>,
+    mut events: mpsc::UnboundedReceiver<UiEvent>,
     mut keys: mpsc::UnboundedReceiver<KeyResult>,
     quit: &CancellationToken,
 ) -> Result<(), crate::Error>
@@ -253,7 +271,7 @@ where
                     Ok(_) => {}
                     // The one failure this task can see for itself; it goes
                     // into the log like any other, red dot and all.
-                    Err(message) => app.record(TestEvent::Error(message)),
+                    Err(message) => app.record(UiEvent::Error(message)),
                 }
             }
             () = tokio::time::sleep(TICK) => {}
@@ -346,7 +364,7 @@ where
 }
 
 /// The whole screen: a two-line header, the log, and a one-line footer.
-pub(super) fn render(frame: &mut Frame, app: &App) {
+pub(crate) fn render(frame: &mut Frame, app: &App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
@@ -369,13 +387,16 @@ fn split_row(row: Rect, right: &str) -> [Rect; 2] {
 }
 
 /// The profile's name and stats on the first line, where it came from on the
-/// second.
+/// second — with the wrapped application, when `run` has one, on the right of
+/// that second line.
 fn render_header(frame: &mut Frame, area: Rect, overview: &Overview) {
     let [title, source] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
     let stats = overview.stats();
     let [name_area, stats_area] = split_row(title, &stats);
+    let wrapping = overview.wrapping.clone().unwrap_or_default();
+    let [source, wrapping_area] = split_row(source, &wrapping);
 
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -394,6 +415,10 @@ fn render_header(frame: &mut Frame, area: Rect, overview: &Overview) {
             Style::new().fg(Color::DarkGray),
         )),
         source,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(wrapping, Style::new().fg(Color::DarkGray))).right_aligned(),
+        wrapping_area,
     );
 }
 
@@ -473,6 +498,7 @@ mod tests {
             model: "vosk-model-small-en-us-0.15".to_string(),
             has_hotkey: true,
             listening: false,
+            wrapping: None,
         }
     }
 
@@ -585,6 +611,33 @@ mod tests {
     }
 
     #[test]
+    fn test_the_header_names_the_wrapped_application() {
+        // `run`'s one addition to the header: which application this session is
+        // wrapping, next to where the profile came from.
+        let buffer = screen(
+            &App::new(overview().wrapping("helldivers2", Some(4212))),
+            90,
+            12,
+        );
+
+        let source = row(&buffer, 1);
+        assert!(
+            source.starts_with("profiles/helldivers2.yaml"),
+            "the source keeps the left: {source:?}"
+        );
+        assert!(
+            source
+                .trim_end()
+                .ends_with("wrapping: helldivers2 (pid 4212)"),
+            "the wrapped application is right-aligned: {source:?}"
+        );
+
+        // `test` wraps nothing, so nothing is added.
+        let source = row(&screen(&App::new(overview()), 90, 12), 1);
+        assert_eq!(source.trim_end(), "profiles/helldivers2.yaml");
+    }
+
+    #[test]
     fn test_the_footer_carries_the_state_on_the_left_and_the_model_on_the_right() {
         let mut app = App::new(overview());
         let footer = row(&screen(&app, 90, 12), 11);
@@ -599,7 +652,7 @@ mod tests {
         );
 
         // And it is *live*: the hotkey's own event moves it.
-        app.record_at(at(), TestEvent::Listening(true));
+        app.record_at(at(), UiEvent::Listening(true));
         let footer = row(&screen(&app, 90, 12), 11);
         assert!(
             footer.starts_with(&format!("{DOT} listening: on")),
@@ -615,7 +668,7 @@ mod tests {
             hotkey: "always listening".to_string(),
             ..overview()
         });
-        app.record_at(at(), TestEvent::Heard("salute".to_string()));
+        app.record_at(at(), UiEvent::Heard("salute".to_string()));
 
         let footer = row(&screen(&app, 90, 12), 11);
         assert!(
@@ -627,13 +680,21 @@ mod tests {
     #[test]
     fn test_the_body_logs_events_newest_at_the_bottom() {
         let mut app = App::new(overview());
-        app.record_at(at(), TestEvent::Listening(true));
-        app.record_at(at(), TestEvent::Heard("deploy the autocannon".to_string()));
+        // The listening change belongs to the footer, not the log.
+        app.record_at(at(), UiEvent::Listening(true));
+        app.record_at(at(), UiEvent::Heard("deploy the autocannon".to_string()));
         app.record_at(
             at(),
-            TestEvent::Matched {
+            UiEvent::Matched {
                 name: "Autocannon".to_string(),
                 plan: "leftctrl+4".to_string(),
+            },
+        );
+        app.record_at(
+            at(),
+            UiEvent::Child {
+                program: "helldivers2".to_string(),
+                line: "Steam initialised".to_string(),
             },
         );
 
@@ -642,16 +703,37 @@ mod tests {
         // Row 2 is the rule under the header, so the log starts at row 3.
         let lines: Vec<String> = (3..6).map(|y| row(&buffer, y)).collect();
         assert!(
-            lines[0].contains(&format!("{DOT} listening: on")),
-            "unexpected: {lines:?}"
+            lines[0].contains(&format!(
+                "{DOT} \"deploy the autocannon\" → Autocannon (leftctrl+4)"
+            )),
+            "the utterance and its match share one upgraded entry: {lines:?}"
         );
         assert!(
-            lines[1].contains(&format!("{DOT} heard: \"deploy the autocannon\"")),
-            "unexpected: {lines:?}"
-        );
-        assert!(
-            lines[2].contains(&format!("{DOT} matched: \"Autocannon\" → leftctrl+4")),
+            lines[1].contains(&format!("{DOT} helldivers2: Steam initialised")),
             "the newest event is the last line: {lines:?}"
+        );
+        assert!(
+            lines[2].trim().is_empty(),
+            "the listening change should not have been logged: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_the_footer_follows_listening_without_logging_it() {
+        let mut app = App::new(overview());
+        for on in [true, false, true] {
+            app.record_at(at(), UiEvent::Listening(on));
+        }
+
+        let buffer = screen(&app, 90, 12);
+        assert_eq!(
+            row(&buffer, 3).trim_end(),
+            "Speak a command; press q to stop.",
+            "a session which has only toggled the hotkey has logged nothing"
+        );
+        assert!(
+            row(&buffer, 11).starts_with(&format!("{DOT} listening: on")),
+            "the footer should still carry the live state"
         );
     }
 
@@ -659,7 +741,7 @@ mod tests {
     fn test_the_body_shows_only_the_newest_events_it_has_room_for() {
         let mut app = App::new(overview());
         for i in 0..50 {
-            app.record_at(at(), TestEvent::Heard(format!("utterance {i}")));
+            app.record_at(at(), UiEvent::Heard(format!("utterance {i}")));
         }
 
         // 12 rows: 2 of header, 2 rules and a footer leave 7 lines of log.
@@ -691,7 +773,7 @@ mod tests {
         let mut app = App::new(overview());
         app.record_at(
             at(),
-            TestEvent::Matched {
+            UiEvent::Matched {
                 name: "Autocannon".to_string(),
                 plan: "4".to_string(),
             },
@@ -710,7 +792,7 @@ mod tests {
     fn test_a_tiny_terminal_still_renders() {
         // Nothing here may panic on an area the layout cannot honour.
         let mut app = App::new(overview());
-        app.record_at(at(), TestEvent::Heard("salute".to_string()));
+        app.record_at(at(), UiEvent::Heard("salute".to_string()));
 
         for (width, height) in [(1, 1), (4, 3), (20, 4), (200, 2)] {
             screen(&app, width, height);
@@ -771,7 +853,7 @@ mod tests {
     /// Drives the real loop over synthetic channels, returning the last frame
     /// it drew.
     async fn loop_with(
-        events: mpsc::UnboundedReceiver<TestEvent>,
+        events: mpsc::UnboundedReceiver<UiEvent>,
         keys: mpsc::UnboundedReceiver<KeyResult>,
         quit: CancellationToken,
     ) -> Result<Buffer, crate::Error> {
@@ -789,7 +871,7 @@ mod tests {
         let quit = CancellationToken::new();
 
         events_tx
-            .send(TestEvent::Heard("salute".to_string()))
+            .send(UiEvent::Heard("salute".to_string()))
             .expect("the UI should be listening");
 
         let ui = tokio::spawn(loop_with(events, keys, quit.clone()));
@@ -805,7 +887,7 @@ mod tests {
             .expect("the UI should stop cleanly");
 
         assert!(
-            (3..8).any(|y| row(&buffer, y).contains("heard: \"salute\"")),
+            (3..8).any(|y| row(&buffer, y).contains("\"salute\"")),
             "the event should have been drawn"
         );
     }
@@ -867,7 +949,7 @@ mod tests {
     async fn test_the_loop_keeps_running_when_the_pipeline_stops_reporting() {
         // A closed event channel must leave the UI up (so the log can still be
         // read and quit out of), not spin on a permanently-ready receiver.
-        let (events_tx, events) = mpsc::unbounded_channel::<TestEvent>();
+        let (events_tx, events) = mpsc::unbounded_channel::<UiEvent>();
         let (keys_tx, keys) = mpsc::unbounded_channel::<KeyResult>();
         let quit = CancellationToken::new();
         drop(events_tx);

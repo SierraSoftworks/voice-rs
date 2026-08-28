@@ -16,16 +16,28 @@
 //! trie + grammar out — is [`build_pipeline_parts`], so it can be tested with no
 //! hardware at all, and the supervisor's signal handling is [`supervise`], which
 //! takes its triggers as futures for the same reason.
+//!
+//! **Two faces.** On an interactive terminal `run` renders the same full-screen
+//! UI as `test` (`super::ui`); with stdout piped — a Steam launch, a CI job,
+//! `| tee` — it stays the line-printed wrapper it has always been, down to the
+//! child inheriting our stdio. That split is [`super::ui::ReportMode`], and it
+//! is what the child-process semantics below hang off: under a UI the child's
+//! output is piped into the log (an inherited child would draw straight over
+//! the alternate screen) and raw mode turns Ctrl-C into a keystroke we have to
+//! forward as a signal ourselves ([`Shutdown`]).
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
 use clap::Args;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -40,7 +52,7 @@ use crate::matcher::{CommandAction, CompiledCommand, PhraseTrie, matcher_task};
 use crate::output::{Interrupt, UinputSink, executor};
 use crate::recognition::{AudioMsg, RecognitionEvent, vosk};
 
-use super::test::{EventSink, TestEvent};
+use super::ui::{EventSink, ReportMode, UiEvent, tui};
 
 /// The sample rate we ask the microphone for and hand to the recognizer.
 ///
@@ -103,37 +115,72 @@ pub async fn run(args: RunArgs) -> Result<i32, crate::Error> {
 
     // 4. The model, the recognizer, the microphone and the tasks.
     let model = resolve_model(args.model.as_deref(), &profile, &system)?;
+
+    // How this session reports itself: the full-screen UI on a terminal we
+    // own, the line-printed report everywhere else. A Steam launch has no TTY,
+    // so the wrapper contract is untouched by any of this.
+    let mode = ReportMode::of(std::io::stdout().is_terminal());
+    let (events, ui) = mode.sink();
+
     let options = PipelineOptions {
-        narration: if args.debug_recognition {
-            Narration::Everything
-        } else {
-            Narration::Silent
-        },
-        announce_listening: false,
-        // `run` has no terminal UI: whatever it narrates goes straight to
-        // stdout, exactly as it always has.
-        events: EventSink::Plain,
+        narration: narration_for(mode, args.debug_recognition),
+        // The UI's footer shows the listening state live, so the bridge has to
+        // report it; plain `run` only logs it, exactly as before.
+        announce_listening: mode == ReportMode::Tui,
+        events: events.clone(),
     };
     let (mut pipeline, queue) = Pipeline::start(&profile, &settings, model, parts, options)?;
 
-    // 5. The consumer of the command queue: for `run`, the virtual keyboard.
+    // 5. The consumer of the command queue: for `run`, the virtual keyboard —
+    //    with a reporter in front of it under the UI, so the log says what
+    //    fired without the executor having to know a UI exists.
     let cancel = pipeline.cancel();
     let interrupt = pipeline.interrupt();
+    let queue = match mode {
+        ReportMode::Tui => {
+            let (reported_tx, reported_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+            pipeline.watch(
+                "command reporter",
+                tokio::spawn(narrate_commands(queue, reported_tx, events.clone())),
+            );
+            reported_rx
+        }
+        ReportMode::Plain => queue,
+    };
     pipeline.watch(
         "output executor",
         tokio::spawn(executor(queue, sink, cancel, interrupt)),
     );
 
-    // 6. The child, if we were given one to wrap.
-    let child = spawn_child(&args.app)?;
+    // 6. The child, if we were given one to wrap. Its stdio is inherited in
+    //    plain mode (the wrapper contract) and piped under the UI, which draws
+    //    its output into the log instead.
+    let child = spawn_child(&args.app, mode)?;
+    let program = program_name(&args.app);
 
-    // 7. Supervision: whichever of the child, SIGINT or SIGTERM arrives first
-    //    ends the session.
-    let ending = supervise(child, interrupts(), terminations()?).await;
+    // 7. Supervision: whichever of the child, the keyboard, SIGINT or SIGTERM
+    //    arrives first ends the session.
+    let (ending, ui_failure) = match ui {
+        Some(ui) => {
+            let overview =
+                tui::Overview::describe(&profile, &settings, &loaded.source, pipeline.summary());
+            let overview = match &program {
+                Some(program) => overview.wrapping(program, child.as_ref().and_then(Child::id)),
+                None => overview,
+            };
+
+            run_on_screen(overview, ui, child, program, events).await?
+        }
+        None => (supervise(child, interrupts(), terminations()?).await, None),
+    };
     debug!("{ending}; shutting the pipeline down.");
 
-    // 8. Shutdown, in the order DESIGN.md lays down.
-    let failure = pipeline.shutdown().await;
+    // 8. Shutdown, in the order DESIGN.md lays down. The terminal has already
+    //    been handed back by now, so anything reported from here is visible.
+    //    The pipeline's own failure wins: the UI's is almost always a
+    //    consequence of the terminal going away, which is not the interesting
+    //    half.
+    let failure = pipeline.shutdown().await.or(ui_failure);
 
     // The Steam wrapper contract is that we exit with the child's code, so a
     // failure on the way out is only allowed to change the exit code when the
@@ -145,6 +192,123 @@ pub async fn run(args: RunArgs) -> Result<i32, crate::Error> {
             Ok(ending.exit_code())
         }
         None => Ok(ending.exit_code()),
+    }
+}
+
+/// Runs the session behind the terminal UI, returning how it ended and
+/// whatever the UI itself failed with.
+///
+/// The UI owns the screen for as long as it is up, so nothing here may print:
+/// the ending is reported by the caller once the terminal has been handed back.
+async fn run_on_screen(
+    overview: tui::Overview,
+    ui_events: mpsc::UnboundedReceiver<UiEvent>,
+    mut child: Option<Child>,
+    program: Option<String>,
+    events: EventSink,
+) -> Result<(Ending, Option<crate::Error>), crate::Error> {
+    // Installed before the UI takes the terminal: a failure here has to be
+    // reportable, and nothing is reportable once the alternate screen is up.
+    let terminate = terminations()?;
+
+    let quit = CancellationToken::new();
+    let ui = tokio::spawn(tui::run(overview, ui_events, quit.clone()));
+
+    // The child's stdio is piped under the UI, so somebody has to read it: each
+    // line becomes a log entry rather than a scribble over the alternate
+    // screen.
+    let forwarders = match (child.as_mut(), program.as_deref()) {
+        (Some(child), Some(program)) => forward_child_output(child, program, &events),
+        _ => Vec::new(),
+    };
+
+    let has_child = child.is_some();
+    let stopped = stopped_by_ui(quit.clone(), has_child);
+
+    let ending = supervise(child, stopped, terminate).await;
+
+    // Worth a line in the log even though the UI is about to come down: a
+    // session which ended because the game exited says so.
+    if let (Ending::Child(code), Some(program)) = (ending, program) {
+        events.send(UiEvent::ChildExited { program, code });
+    }
+
+    quit.cancel();
+    for forwarder in forwarders {
+        forwarder.abort();
+    }
+
+    // Awaiting the UI is what restores the terminal, so it must happen before
+    // the caller reports anything at all.
+    let failure = match ui.await {
+        Ok(result) => result.err(),
+        Err(e) => Some(human_errors::wrap_system(
+            e,
+            "The session display stopped unexpectedly.",
+            &["Please report this issue on GitHub so that we can investigate."],
+        )),
+    };
+
+    Ok((ending, failure))
+}
+
+/// Waits for whichever comes first: the user asking the UI to stop, or a real
+/// SIGINT — and says what the child needs from us as a result.
+pub(super) async fn stopped_by_ui(quit: CancellationToken, has_child: bool) -> Shutdown {
+    let stop = tokio::select! {
+        () = quit.cancelled() => Stop::Keyboard,
+        _ = interrupts() => Stop::Signal,
+    };
+
+    shutdown_for(stop, has_child)
+}
+
+/// How a session under the terminal UI was asked to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The user pressed `q` or Ctrl-C. Raw mode means both arrive as
+    /// *keystrokes*: the terminal is not turning Ctrl-C into a SIGINT for
+    /// anybody, ourselves or the child.
+    Keyboard,
+    /// A signal reached the process the ordinary way.
+    Signal,
+}
+
+/// What a shutdown owes the wrapped application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Shutdown {
+    /// Nothing beyond ending the session: either there is no child, or a real
+    /// SIGINT has already reached it through the process group.
+    Quiet,
+    /// The child never saw the interrupt, so we have to send it one: raw mode
+    /// delivered the Ctrl-C to us as a key press instead of to the group as a
+    /// signal, and a wrapped game which is never told to stop would be left
+    /// running with no wrapper.
+    ForwardSigint,
+}
+
+/// The one decision the raw-mode Ctrl-C hinges on, as a function so it can be
+/// tested without signalling the test runner.
+fn shutdown_for(stop: Stop, has_child: bool) -> Shutdown {
+    match (stop, has_child) {
+        (Stop::Keyboard, true) => Shutdown::ForwardSigint,
+        // A real SIGINT was delivered to our whole process group, the child
+        // included; forwarding it would double the signal.
+        (Stop::Signal, _) | (Stop::Keyboard, false) => Shutdown::Quiet,
+    }
+}
+
+/// How much of what it hears a session says out loud.
+///
+/// Plain `run` stays silent unless asked: its stdout is the wrapped
+/// application's, and a Steam launch must not be narrated at it. Under the UI
+/// there is a log to fill, so utterances are reported exactly as `test` reports
+/// them — the log *is* the reason the UI exists.
+fn narration_for(mode: ReportMode, debug_recognition: bool) -> Narration {
+    match (mode, debug_recognition) {
+        (_, true) => Narration::Everything,
+        (ReportMode::Tui, false) => Narration::Utterances,
+        (ReportMode::Plain, false) => Narration::Silent,
     }
 }
 
@@ -552,7 +716,7 @@ async fn listening_bridge(
 
                 debug!(listening = now, "Listening is now {}.", if now { "on" } else { "off" });
                 if let Some(events) = &announce {
-                    events.send(TestEvent::Listening(now));
+                    events.send(UiEvent::Listening(now));
                 }
 
                 // Muting resets the recognizer (and tells the matcher via
@@ -597,19 +761,57 @@ async fn narrate_recognition(
 
 /// The report one recognition event deserves, or [`None`] when it is noise the
 /// user has not asked to see.
-fn narration_event(event: &RecognitionEvent, narration: Narration) -> Option<TestEvent> {
+fn narration_event(event: &RecognitionEvent, narration: Narration) -> Option<UiEvent> {
     match (event, narration) {
         (_, Narration::Silent) => None,
         // A finalized utterance is the whole point: it is what the matcher gets
         // to work with, so it is reported whenever anything is reported at all.
-        (RecognitionEvent::Final(text), _) => Some(TestEvent::Heard(text.clone())),
+        (RecognitionEvent::Final(text), _) => Some(UiEvent::Heard(text.clone())),
+        // A recognizer which cannot decode is reported as loudly as an
+        // utterance: without it, a session where nothing works looks exactly
+        // like one where nobody spoke. The recognizer thread has already
+        // coalesced these down to one per run of failures.
+        (RecognitionEvent::Failed, _) => Some(UiEvent::Warning(
+            "the speech recognizer could not decode the audio".to_string(),
+        )),
         // Partials and mutes are noise unless they were asked for.
         (RecognitionEvent::Partial(text), Narration::Everything) => {
-            Some(TestEvent::Hearing(text.clone()))
+            Some(UiEvent::Hearing(text.clone()))
         }
-        (RecognitionEvent::Muted, Narration::Everything) => Some(TestEvent::Muted),
+        (RecognitionEvent::Muted, Narration::Everything) => Some(UiEvent::Muted),
         _ => None,
     }
+}
+
+/// Reports every matched command on its way to the virtual keyboard.
+///
+/// The executor knows nothing about any of this, and should not: it is the one
+/// part of the pipeline which must never be slowed down or complicated by
+/// reporting. So under the terminal UI a forwarder sits in front of it, with
+/// the same shape (and the same guarantee) as [`narrate_recognition`] — what
+/// the log says fired is exactly what the executor was handed, in order.
+///
+/// The wording is deliberately the same one `test` uses: `test` reports the
+/// plan it *would* have played and `run` the one it *is* playing, and
+/// `"deploy the autocannon" → Autocannon (leftctrl+4)` is true of both.
+async fn narrate_commands(
+    mut queue: mpsc::Receiver<CommandAction>,
+    executor: mpsc::Sender<CommandAction>,
+    events: EventSink,
+) -> Result<(), crate::Error> {
+    while let Some(action) = queue.recv().await {
+        events.send(UiEvent::Matched {
+            name: action.command.clone(),
+            plan: super::ui::render_plan(&action.output),
+        });
+
+        if executor.send(action).await.is_err() {
+            debug!("The output executor has gone, stopping the command reporter.");
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 // --- Signals and the child process ---------------------------------------
@@ -619,11 +821,16 @@ fn narration_event(event: &RecognitionEvent, narration: Narration) -> Option<Tes
 /// If the handler cannot be installed we say so and then wait forever, so that
 /// a machine which will not give us SIGINT still leaves SIGTERM working rather
 /// than shutting the pipeline down the instant it starts.
-pub(super) async fn interrupts() {
+///
+/// A signal delivered this way reached the child too — it shares our process
+/// group — so there is nothing left to forward: [`Shutdown::Quiet`].
+pub(super) async fn interrupts() -> Shutdown {
     if let Err(e) = tokio::signal::ctrl_c().await {
         warn!("We could not watch for Ctrl+C ({e}); use SIGTERM to stop voice-orders.");
         std::future::pending::<()>().await;
     }
+
+    Shutdown::Quiet
 }
 
 /// A future which resolves when we are asked to terminate (SIGTERM — which is
@@ -645,17 +852,26 @@ pub(super) fn terminations() -> Result<impl Future<Output = ()>, crate::Error> {
 
 /// Starts the wrapped application, if we were given one.
 ///
-/// stdio is inherited, so the child's output is the terminal's (or Steam's)
-/// exactly as though voice-orders were not in the way at all.
-fn spawn_child(app: &[String]) -> Result<Option<Child>, crate::Error> {
+/// In plain mode stdio is **inherited**, so the child's output is the
+/// terminal's (or Steam's) exactly as though voice-orders were not in the way
+/// at all — that is the wrapper contract, and nothing about a TTY-only UI may
+/// change it. Under the terminal UI it is **piped** instead: an inherited child
+/// would write straight over the alternate screen, so its output is read and
+/// logged ([`forward_child_output`]).
+fn spawn_child(app: &[String], mode: ReportMode) -> Result<Option<Child>, crate::Error> {
     let Some((executable, arguments)) = app.split_first() else {
         return Ok(None);
     };
 
     debug!(executable, "Starting the wrapped application.");
 
-    tokio::process::Command::new(executable)
-        .args(arguments)
+    let mut command = tokio::process::Command::new(executable);
+    command.args(arguments);
+    if mode == ReportMode::Tui {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
+
+    command
         .spawn()
         .map(Some)
         .map_err(|e| {
@@ -670,13 +886,87 @@ fn spawn_child(app: &[String]) -> Result<Option<Child>, crate::Error> {
         })
 }
 
+/// What to call the wrapped application in the UI: the executable's file name,
+/// not the whole path a Steam launch command runs to hundreds of characters.
+fn program_name(app: &[String]) -> Option<String> {
+    let executable = app.first()?;
+
+    Some(
+        Path::new(executable)
+            .file_name()
+            .map_or_else(|| executable.clone(), |name| name.to_string_lossy().into()),
+    )
+}
+
+/// Reads a piped child's stdout and stderr, turning each line into a log entry.
+///
+/// Both streams are read concurrently and reported identically: which of the
+/// two a game wrote to says nothing useful, and interleaving them is what makes
+/// the log read like the terminal the child thinks it has. The tasks end on
+/// their own when the child closes its pipes.
+fn forward_child_output(
+    child: &mut Child,
+    program: &str,
+    events: &EventSink,
+) -> Vec<JoinHandle<()>> {
+    let mut forwarders = Vec::new();
+
+    if let Some(stdout) = child.stdout.take() {
+        forwarders.push(tokio::spawn(forward_lines(
+            stdout,
+            program.to_string(),
+            events.clone(),
+        )));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forwarders.push(tokio::spawn(forward_lines(
+            stderr,
+            program.to_string(),
+            events.clone(),
+        )));
+    }
+
+    forwarders
+}
+
+/// Reports every line of one of the child's streams, until it closes.
+///
+/// Generic over the reader so the forwarding can be tested against bytes
+/// instead of a process.
+async fn forward_lines<R>(reader: R, program: String, events: EventSink)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => events.send(UiEvent::Child {
+                program: program.clone(),
+                line,
+            }),
+            Ok(None) => {
+                debug!("The application closed one of its output streams.");
+                return;
+            }
+            Err(e) => {
+                // Losing the child's output is not worth ending the session
+                // over: the session is about the microphone, not the pipe.
+                debug!("We stopped reading the application's output ({e}).");
+                return;
+            }
+        }
+    }
+}
+
 /// Why the session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Ending {
     /// The wrapped application exited with this code, which becomes ours.
     Child(i32),
-    /// SIGINT (Ctrl+C): the child shares our process group, so the kernel has
-    /// already delivered the same signal to it — forwarding would double it.
+    /// The session was interrupted: a real SIGINT (which the kernel had already
+    /// delivered to the child, since it shares our process group) or a Ctrl-C
+    /// keystroke under the terminal UI, which we forward ourselves.
     Interrupted,
     /// SIGTERM: forwarded to the child, which either exited within the grace
     /// period or did not.
@@ -713,19 +1003,21 @@ impl std::fmt::Display for Ending {
 /// interrupt, or a termination request.
 ///
 /// The two signals arrive as futures rather than as `tokio::signal` handles so
-/// that the semantics below can be tested without signalling the test runner.
-/// Cancellation is the caller's job — every ending cancels, so doing it here
-/// would only duplicate one line.
+/// that the semantics below can be tested without signalling the test runner;
+/// the interrupt future says *what kind* of interrupt it was ([`Shutdown`]),
+/// because a Ctrl-C read as a keystroke under the terminal UI is one the child
+/// has not been told about. Cancellation is the caller's job — every ending
+/// cancels, so doing it here would only duplicate one line.
 pub(super) async fn supervise(
     mut child: Option<Child>,
-    interrupt: impl Future<Output = ()>,
+    interrupt: impl Future<Output = Shutdown>,
     terminate: impl Future<Output = ()>,
 ) -> Ending {
     // Bound to its own `let` so the borrow `wait_for` takes is released before
     // the arms below need the child back.
     let outcome = tokio::select! {
         status = wait_for(child.as_mut()) => Outcome::Exited(status),
-        _ = interrupt => Outcome::Interrupt,
+        shutdown = interrupt => Outcome::Interrupt(shutdown),
         _ = terminate => Outcome::Terminate,
     };
 
@@ -737,10 +1029,20 @@ pub(super) async fn supervise(
             warn!("We lost track of the application we started ({e}).");
             Ending::Child(1)
         }
-        Outcome::Interrupt => Ending::Interrupted,
+        Outcome::Interrupt(Shutdown::Quiet) => Ending::Interrupted,
+        Outcome::Interrupt(Shutdown::ForwardSigint) => {
+            // The graceful path a real Ctrl-C would have taken, performed by
+            // hand: the child is told to stop and given the same grace period
+            // a termination gets, rather than being abandoned to a wrapper
+            // which has already exited.
+            if let Some(child) = child.as_mut() {
+                forward_signal(child, libc::SIGINT, "interrupt").await;
+            }
+            Ending::Interrupted
+        }
         Outcome::Terminate => {
             let child_exited = match child.as_mut() {
-                Some(child) => forward_sigterm(child).await,
+                Some(child) => forward_signal(child, libc::SIGTERM, "shutdown").await,
                 None => true,
             };
             Ending::Terminated { child_exited }
@@ -752,7 +1054,7 @@ pub(super) async fn supervise(
 /// so the child can be borrowed again once the select's futures are dropped.
 enum Outcome {
     Exited(std::io::Result<std::process::ExitStatus>),
-    Interrupt,
+    Interrupt(Shutdown),
     Terminate,
 }
 
@@ -764,24 +1066,28 @@ async fn wait_for(child: Option<&mut Child>) -> std::io::Result<std::process::Ex
     }
 }
 
-/// Forwards SIGTERM to the child and gives it [`SIGTERM_GRACE`] to wind down.
+/// Forwards a signal to the child and gives it [`SIGTERM_GRACE`] to wind down.
+///
+/// Both shutdown paths come through here: SIGTERM (Steam stopping the game) and
+/// the SIGINT the terminal never sent for us, because raw mode delivered the
+/// user's Ctrl-C to this process as a key press instead.
 ///
 /// Returns whether it actually stopped in time; we proceed with shutdown either
 /// way, because an application which refuses to exit must not keep the wrapper
 /// (and therefore Steam) hanging indefinitely.
-async fn forward_sigterm(child: &mut Child) -> bool {
+async fn forward_signal(child: &mut Child, signal: libc::c_int, what: &str) -> bool {
     let Some(pid) = child.id() else {
         // Already reaped: there is nothing left to signal.
         return true;
     };
 
-    debug!(pid, "Forwarding SIGTERM to the application.");
+    debug!(pid, signal, "Forwarding a signal to the application.");
     // SAFETY: `kill` is safe to call with any pid, and this one belongs to a
     // child we started and have not yet reaped, so it cannot have been recycled
     // onto an unrelated process.
-    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } != 0 {
         let error = std::io::Error::last_os_error();
-        warn!("We could not pass the shutdown signal on to the application ({error}).");
+        warn!("We could not pass the {what} signal on to the application ({error}).");
     }
 
     match tokio::time::timeout(SIGTERM_GRACE, child.wait()).await {
@@ -991,6 +1297,19 @@ mod tests {
     #[case(RecognitionEvent::Final("salute".into()), Narration::Silent, None)]
     #[case(RecognitionEvent::Partial("sal".into()), Narration::Silent, None)]
     #[case(RecognitionEvent::Muted, Narration::Silent, None)]
+    #[case(RecognitionEvent::Failed, Narration::Silent, None)]
+    // A recognizer which cannot decode is reported wherever anything is: a
+    // session where nothing works otherwise looks like one where nobody spoke.
+    #[case(
+        RecognitionEvent::Failed,
+        Narration::Utterances,
+        Some("warning: the speech recognizer could not decode the audio")
+    )]
+    #[case(
+        RecognitionEvent::Failed,
+        Narration::Everything,
+        Some("warning: the speech recognizer could not decode the audio")
+    )]
     // `test` reports what it heard, and nothing else — an utterance with no
     // 'matched:' line under it is how an unrecognized command shows up.
     #[case(
@@ -1064,11 +1383,69 @@ mod tests {
         forwarder.await.expect("the forwarder should not panic");
     }
 
+    #[tokio::test]
+    async fn test_every_command_is_reported_on_its_way_to_the_keyboard() {
+        // What the log says fired must be exactly what the executor played, in
+        // order: the reporter is *in* the path rather than tapping it, for the
+        // same reason the recognition narrator is.
+        let (queue_tx, queue_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let (executor_tx, mut executor_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        let reporter = tokio::spawn(narrate_commands(
+            queue_rx,
+            executor_tx,
+            EventSink::Channel(events_tx),
+        ));
+
+        let profile = profile(
+            "model: /models/en\ncommands:\n  - name: Autocannon\n    phrase: autocannon\n    keys: [\"leftctrl+4\"]\n",
+        );
+        let output = profile.commands[0]
+            .compile(&profile.defaults)
+            .expect("the command should compile");
+        queue_tx
+            .send(CommandAction {
+                command: "Autocannon".to_string(),
+                output: output.clone(),
+            })
+            .await
+            .expect("the reporter should be listening");
+        drop(queue_tx);
+
+        assert_eq!(
+            events_rx.recv().await,
+            Some(UiEvent::Matched {
+                name: "Autocannon".to_string(),
+                // The plan a person reads, not the compiled event list — and
+                // the same rendering `test` reports.
+                plan: "leftctrl+4".to_string(),
+            })
+        );
+
+        let played = executor_rx
+            .recv()
+            .await
+            .expect("the command should have reached the executor");
+        assert_eq!(played.command, "Autocannon");
+        assert_eq!(played.output, output);
+
+        reporter
+            .await
+            .expect("the reporter should not panic")
+            .expect("the reporter should stop cleanly when the queue closes");
+    }
+
     // --- Child supervision -----------------------------------------------
 
     /// A future which never resolves, for the signals a test is not exercising.
-    fn never() -> impl Future<Output = ()> {
+    fn never<T>() -> impl Future<Output = T> {
         std::future::pending()
+    }
+
+    /// An interrupt which has already happened, of the given kind.
+    fn interrupted(shutdown: Shutdown) -> impl Future<Output = Shutdown> {
+        std::future::ready(shutdown)
     }
 
     async fn child(program: &str, args: &[&str]) -> Child {
@@ -1100,13 +1477,80 @@ mod tests {
         // signal it ourselves — the child here outlives the supervisor.
         let mut sleeping = child("/bin/sleep", &["30"]).await;
 
-        let ending = supervise(None, std::future::ready(()), never()).await;
+        let ending = supervise(None, interrupted(Shutdown::Quiet), never()).await;
         assert_eq!(ending, Ending::Interrupted);
         assert_eq!(ending.exit_code(), 0);
 
         assert!(
             sleeping.try_wait().expect("the child is ours").is_none(),
             "an interrupt must not stop anything itself"
+        );
+        sleeping.kill().await.expect("the child should be killable");
+    }
+
+    #[rstest::rstest]
+    // Under the terminal UI, Ctrl-C is a keystroke: raw mode means the kernel
+    // never delivered a SIGINT to anybody, so the child has to be told.
+    #[case(Stop::Keyboard, true, Shutdown::ForwardSigint)]
+    // Nothing to tell.
+    #[case(Stop::Keyboard, false, Shutdown::Quiet)]
+    // A real signal reached the whole process group already; a second one
+    // would be a double interrupt, not a graceful shutdown.
+    #[case(Stop::Signal, true, Shutdown::Quiet)]
+    #[case(Stop::Signal, false, Shutdown::Quiet)]
+    fn test_shutdown_for(#[case] stop: Stop, #[case] has_child: bool, #[case] expected: Shutdown) {
+        assert_eq!(shutdown_for(stop, has_child), expected);
+    }
+
+    #[tokio::test]
+    async fn test_quitting_the_ui_asks_for_the_interrupt_to_be_forwarded() {
+        // The UI's only way of stopping the session is this token, and with a
+        // child running that must become a SIGINT — the decision is made here
+        // rather than in the key handler so it can be asserted without one.
+        let quit = CancellationToken::new();
+        quit.cancel();
+
+        assert_eq!(
+            stopped_by_ui(quit.clone(), true).await,
+            Shutdown::ForwardSigint
+        );
+        assert_eq!(stopped_by_ui(quit, false).await, Shutdown::Quiet);
+    }
+
+    #[tokio::test]
+    async fn test_a_keyboard_interrupt_is_forwarded_to_the_child() {
+        // 'q' (or Ctrl-C) under the UI: the child gets the SIGINT the terminal
+        // did not send, and is waited for rather than abandoned.
+        let started = std::time::Instant::now();
+        let ending = supervise(
+            Some(child("/bin/sleep", &["30"]).await),
+            interrupted(Shutdown::ForwardSigint),
+            never(),
+        )
+        .await;
+
+        assert_eq!(ending, Ending::Interrupted);
+        assert_eq!(
+            ending.exit_code(),
+            0,
+            "a session the user ended is a successful one"
+        );
+        assert!(
+            started.elapsed() < SIGTERM_GRACE,
+            "the child should have taken the signal well inside the grace period"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_keyboard_interrupt_without_a_child_signals_nothing() {
+        let mut sleeping = child("/bin/sleep", &["30"]).await;
+
+        let ending = supervise(None, interrupted(Shutdown::ForwardSigint), never()).await;
+
+        assert_eq!(ending, Ending::Interrupted);
+        assert!(
+            sleeping.try_wait().expect("the child is ours").is_none(),
+            "only the child we were given may ever be signalled"
         );
         sleeping.kill().await.expect("the child should be killable");
     }
@@ -1137,10 +1581,12 @@ mod tests {
         assert_eq!(ending.exit_code(), 0);
     }
 
-    #[test]
-    fn test_no_application_means_no_child() {
+    #[rstest::rstest]
+    fn test_no_application_means_no_child(
+        #[values(ReportMode::Plain, ReportMode::Tui)] mode: ReportMode,
+    ) {
         assert!(
-            spawn_child(&[])
+            spawn_child(&[], mode)
                 .expect("no application is not a failure")
                 .is_none(),
             "an empty application list is the always-listening case"
@@ -1149,14 +1595,135 @@ mod tests {
 
     #[test]
     fn test_a_missing_application_is_named_in_the_error() {
-        let error = spawn_child(&["/definitely/not/a/program".to_string()])
-            .expect_err("a missing executable cannot be started");
+        let error = spawn_child(
+            &["/definitely/not/a/program".to_string()],
+            ReportMode::Plain,
+        )
+        .expect_err("a missing executable cannot be started");
 
         assert!(
             error.to_string().contains("'/definitely/not/a/program'"),
             "the error should name the executable, got: {error}"
         );
         assert!(error.is(human_errors::Kind::User));
+    }
+
+    #[tokio::test]
+    async fn test_only_a_ui_session_pipes_the_childs_output() {
+        // The wrapper contract: with no UI the child writes to our stdout and
+        // stderr directly, exactly as though voice-orders were not here. Under
+        // the UI it must not, or it would draw over the alternate screen.
+        let app = vec!["/bin/true".to_string()];
+
+        let mut plain = spawn_child(&app, ReportMode::Plain)
+            .expect("the child should start")
+            .expect("there is an application to wrap");
+        assert!(plain.stdout.is_none(), "plain mode inherits our stdout");
+        assert!(plain.stderr.is_none(), "plain mode inherits our stderr");
+        plain.wait().await.expect("the child is ours");
+
+        let mut piped = spawn_child(&app, ReportMode::Tui)
+            .expect("the child should start")
+            .expect("there is an application to wrap");
+        assert!(
+            piped.stdout.is_some(),
+            "a UI session reads the child's output"
+        );
+        assert!(piped.stderr.is_some());
+        piped.wait().await.expect("the child is ours");
+    }
+
+    #[rstest::rstest]
+    // The header wants something short: a Steam launch command is a path
+    // hundreds of characters long, and its last component is the game.
+    #[case(&["/usr/bin/sleep", "30"], Some("sleep"))]
+    #[case(&["sleep"], Some("sleep"))]
+    #[case(&["/opt/games/Helldivers 2/bin/helldivers2"], Some("helldivers2"))]
+    #[case(&["/opt/games/helldivers2/"], Some("helldivers2"))]
+    // A path with no file name in it at all: the argument is still what we
+    // were told to run, so it is what we say.
+    #[case(&["/"], Some("/"))]
+    #[case(&[], None)]
+    fn test_program_name(#[case] app: &[&str], #[case] expected: Option<&str>) {
+        let app: Vec<String> = app.iter().map(ToString::to_string).collect();
+
+        assert_eq!(program_name(&app).as_deref(), expected);
+    }
+
+    #[rstest::rstest]
+    // Plain `run` says nothing: its stdout belongs to the wrapped application
+    // (and, under Steam, to a log nobody reads).
+    #[case(ReportMode::Plain, false, Narration::Silent)]
+    // Under the UI there is a log to fill, and it is the reason the UI exists.
+    #[case(ReportMode::Tui, false, Narration::Utterances)]
+    // `--debug-recognition` shows the working out either way.
+    #[case(ReportMode::Plain, true, Narration::Everything)]
+    #[case(ReportMode::Tui, true, Narration::Everything)]
+    fn test_narration_for(
+        #[case] mode: ReportMode,
+        #[case] debug_recognition: bool,
+        #[case] expected: Narration,
+    ) {
+        assert_eq!(narration_for(mode, debug_recognition), expected);
+    }
+
+    #[tokio::test]
+    async fn test_the_childs_output_becomes_log_entries() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let output = "hello-from-child\nand another line\n";
+
+        forward_lines(
+            output.as_bytes(),
+            "helldivers2".to_string(),
+            EventSink::Channel(events_tx),
+        )
+        .await;
+
+        let mut logged = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            logged.push(event);
+        }
+
+        assert_eq!(
+            logged,
+            vec![
+                UiEvent::Child {
+                    program: "helldivers2".to_string(),
+                    line: "hello-from-child".to_string(),
+                },
+                UiEvent::Child {
+                    program: "helldivers2".to_string(),
+                    line: "and another line".to_string(),
+                },
+            ],
+            "every line the application writes should be one entry, named after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_forwarder_stops_when_the_stream_closes() {
+        // A child which exits mid-line still gets its last line reported, and
+        // the task must end rather than wait on a pipe nobody will write to.
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            forward_lines(
+                &b"no trailing newline"[..],
+                "sh".to_string(),
+                EventSink::Channel(events_tx),
+            ),
+        )
+        .await
+        .expect("the forwarder should end with the stream");
+
+        assert_eq!(
+            events_rx.try_recv(),
+            Ok(UiEvent::Child {
+                program: "sh".to_string(),
+                line: "no trailing newline".to_string(),
+            })
+        );
     }
 
     // --- The matcher end of the pipeline ---------------------------------

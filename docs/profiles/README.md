@@ -542,13 +542,27 @@ voice-orders test drg.yaml
 
 It runs the full pipeline — audio capture, recognition, the hotkey, the matcher and the completion-timeout state
 machine — but instead of opening `/dev/uinput` it shows what would have happened. In a terminal it renders a
-full-screen view: a header with the profile's name, stats and source; a scrolling event log where each line leads
-with a colored dot (green for a matched command with the keys it would have played, grey for an utterance which
-matched nothing, yellow for a command interrupted or discarded by [`hotkey.interrupt`](#hotkey-interrupt), blue for
-listening-state changes, red for pipeline errors); and a footer with the live listening state and the loaded model.
-Press `q` (or `Ctrl-C`) to stop.
+full-screen view: a header with the profile's name, stats and source; a scrolling event log; and a footer with the
+live listening state and the loaded model. Press `q` (or `Ctrl-C`) to stop. (`voice-orders run` renders the same
+view, with the commands actually being played.)
 
-When its output is piped — into a file, another tool, or CI — it falls back to plain lines with the same content:
+Each recognition is **one line** in that log, and it upgrades in place. The utterance appears in grey the moment it
+is heard, and turns green with the command and its keys when the matcher resolves it:
+
+```
+19:04:11 ● "deploy the auto cannon" → Deploy the autocannon (4)
+19:04:19 ● "reload the thing"
+19:04:23 ● warning: the speech recognizer could not decode the audio
+```
+
+A line which **stays grey** is the signal to look for: the model understood you, but no command's phrases cover what
+you said. The dot carries the same reading as the color — green for a matched command, grey for an utterance nothing
+matched, yellow for a warning or for a command interrupted or discarded by
+[`hotkey.interrupt`](#hotkey-interrupt), red for pipeline errors. The listening state is not logged: the footer shows
+it live as you press and release the hotkey.
+
+When its output is piped — into a file, another tool, or CI — it falls back to plain lines, unchanged, with one line
+per event:
 
 ```
 listening: on
@@ -558,8 +572,7 @@ heard: "reload"
 listening: off
 ```
 
-A `heard:` line with no `matched:` line beneath it is the signal to look for: the model understood you, but no
-command's phrases cover what you said.
+There, a `heard:` line with no `matched:` line beneath it is the same signal the grey line is on screen.
 
 Because it emits no input events at all, it is safe to run over a terminal you are reading, and it needs **no uinput
 permissions** — so it is the right thing to reach for before you have finished setting your system up, and the right
