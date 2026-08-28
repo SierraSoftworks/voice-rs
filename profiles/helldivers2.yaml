@@ -1,11 +1,16 @@
 # Helldivers 2 — voice-orders profile
 #
-# Translated from a LinVAM profile. Stratagem inputs are the arrow keys; each
-# command speaks the stratagem's natural name. Unlike LinVAM, voice-orders
-# supports ambiguous prefixes, so the sentry call-ins use their natural order
-# ("auto cannon sentry", not "sentry auto cannon"): saying "auto cannon" alone
-# calls the support weapon after the completion timeout, and continuing with
-# "sentry" calls the sentry instead.
+# Every stratagem in the game, taken from https://helldivers.wiki.gg/wiki/Stratagems.
+# Stratagem inputs are the arrow keys; each command speaks the stratagem's natural
+# name, without its equipment designation ("autocannon", not "AC-8 Autocannon").
+# Unlike LinVAM, voice-orders supports ambiguous prefixes, so the sentry call-ins
+# use their natural order ("auto cannon sentry", not "sentry auto cannon"): saying
+# "auto cannon" alone calls the support weapon after the completion timeout, and
+# continuing with "sentry" calls the sentry instead.
+#
+# Where a name is a compound the speech model has never heard — "autocannon",
+# "hellbomb", "meltagun" — the phrase splits it into words the model does know and
+# a `name:` carries the real spelling into the logs and the validate report.
 #
 # Play with: voice-orders run profiles/helldivers2.yaml -- %command%
 name: Helldivers 2
@@ -23,7 +28,7 @@ defaults:
   interval: 30ms
 
 commands:
-  # ── Mission stratagems ────────────────────────────────────────────────
+  # ── Mission stratagems: ship ──────────────────────────────────────────
   - phrase: "{reinforce, reinforcements}"
     keys: [up, down, right, left, up]
 
@@ -33,27 +38,34 @@ commands:
   - phrase: "[eagle] rearm"
     keys: [up, up, left, up, right]
 
-  - phrase: "super destroyer"
+  - phrase: "[call in] super destroyer"
     keys: [up, up, down, down, left, right, left, right]
+
+  - name: SOS beacon
+    phrase: "sos beacon"
+    keys: [up, down, right, up]
+
+  # ── Mission stratagems: objectives ────────────────────────────────────
+  - name: Hellbomb
+    phrase: "hell bomb"
+    keys: [down, up, left, down, up, right, down, up]
 
   - phrase: "cargo container"
     keys: [up, up, down, down, right, down]
 
-  - phrase: "hell bomb"
-    keys: [down, up, left, down, up, right, down, up]
-
   - phrase: "prospecting drill"
     keys: [down, down, left, right, down, down]
 
-  - phrase: "artillery"
+  - name: SEAF artillery
+    phrase: "artillery"
     keys: [right, up, up, down]
 
   - phrase: "seismic probe"
     keys: [up, up, left, right, down, down]
 
-  - name: SSD
+  - name: SSSD delivery
     phrase: "{ssd, hard drive}"
-    keys: [down, down, down, down, down, down, up, up]
+    keys: [down, down, down, down, down, up, up]
 
   - phrase: "[raise] [super earth] flag"
     keys: [down, up, down, up]
@@ -79,13 +91,46 @@ commands:
   - phrase: "[portable] comms relay"
     keys: [up, up, down, down, left, left, down]
 
+  # Mission-issued only: no permit buys this one.
+  - phrase: "[orbital] illumination flare"
+    keys: [right, right, left, left]
+
   # ── Support weapons ───────────────────────────────────────────────────
+  - name: Machine gun
+    phrase: "machine gun"
+    keys: [down, left, down, up, right]
+
+  - phrase: "stalwart"
+    keys: [down, left, down, up, up, left]
+
+  - phrase: "heavy machine gun"
+    keys: [down, left, up, down, down]
+
+  - name: Bullet Storm
+    phrase: "bullet storm"
+    keys: [down, left, down, right, up, left]
+
+  - name: Maxigun
+    phrase: "maxi gun"
+    keys: [down, left, right, down, up, up]
+
+  - name: Anti-Materiel Rifle
+    phrase: "anti {materiel, material} rifle"
+    keys: [down, left, right, up, down]
+
   - name: Autocannon
     phrase: "auto cannon"
     keys: [down, left, down, up, up, right]
 
+  - phrase: "laser cannon"
+    keys: [down, left, down, up, left]
+
   - phrase: "quasar cannon"
     keys: [down, down, up, left, right]
+
+  - name: Railgun
+    phrase: "rail gun"
+    keys: [down, right, down, up, left, right]
 
   - phrase: "{recoil less rifle, recoil rifle}"
     keys: [down, left, right, right, left]
@@ -93,53 +138,149 @@ commands:
   - phrase: "expendable anti tank"
     keys: [down, down, left, up, right]
 
-  - phrase: "arc thrower"
-    keys: [down, right, down, up, left, left]
+  - phrase: "expendable napalm"
+    keys: [down, down, left, up, left]
 
-  - phrase: "rail gun"
-    keys: [down, right, down, up, left, right]
+  - name: Leveller
+    phrase: "leveller"
+    keys: [down, down, left, up, down]
 
-  - phrase: "wasp"
+  - phrase: "spear"
+    keys: [down, down, up, down, down]
+
+  - name: W.A.S.P. launcher
+    phrase: "wasp [launcher]"
     keys: [down, down, up, down, right]
 
-  - phrase: "heavy machine gun"
-    keys: [down, left, up, down, down]
+  - phrase: "commando"
+    keys: [down, left, up, down, right]
 
-  - phrase: "stalwart"
-    keys: [down, left, down, up, up, left]
-
-  - phrase: "machine gun"
-    keys: [down, left, down, up, right]
-
-  - phrase: "flame thrower"
-    keys: [down, left, up, down, up]
+  - name: Airburst rocket launcher
+    phrase: "airburst rocket launcher"
+    keys: [down, up, up, left, right]
 
   - phrase: "grenade launcher"
     keys: [down, left, up, left, down]
 
-  # ── Backpacks & mechs ─────────────────────────────────────────────────
-  - phrase: "jump pack"
-    keys: [down, up, up, down, up]
+  - phrase: "belt fed grenade launcher"
+    keys: [down, left, up, left, up, up]
 
+  - phrase: "arc thrower"
+    keys: [down, right, down, up, left, left]
+
+  - name: Speargun
+    phrase: "speargun"
+    keys: [down, right, down, left, up, right]
+
+  - phrase: "flame thrower"
+    keys: [down, left, up, down, up]
+
+  - phrase: "sterilizer"
+    keys: [down, left, up, down, left]
+
+  - name: Cremator
+    phrase: "{crema tor, cremate or}"
+    keys: [down, down, right, down, up, up]
+
+  - name: Meltagun
+    phrase: "melt a gun"
+    keys: [down, left, up, left, left, down]
+
+  - name: Epoch
+    phrase: "epoch"
+    keys: [down, left, up, left, right]
+
+  - name: De-Escalator
+    phrase: "de escalator"
+    keys: [down, right, up, left, right]
+
+  - name: C4 pack
+    phrase: "c four pack"
+    keys: [down, right, up, up, right, up]
+
+  - phrase: "solo silo"
+    keys: [down, up, right, down, down]
+
+  - phrase: "one true flag"
+    keys: [down, left, right, right, up]
+
+  - phrase: "breaching hammer"
+    keys: [down, left, right, left, up]
+
+  - phrase: "defoliation tool"
+    keys: [down, left, right, right, down]
+
+  # ── Backpacks ─────────────────────────────────────────────────────────
   - phrase: "guard dog"
     keys: [down, up, left, up, right, down]
 
   - phrase: "[guard dog] rover"
     keys: [down, up, left, up, right, right]
 
+  - name: K-9
+    phrase: "[guard dog] {k nine, canine}"
+    keys: [down, up, left, up, right, left]
+
+  - name: Hot Dog
+    phrase: "[guard dog] hot dog"
+    keys: [down, up, left, up, left, left]
+
+  - name: Dog Breath
+    phrase: "[guard dog] dog breath"
+    keys: [down, up, left, up, right, up]
+
+  - phrase: "supply pack"
+    keys: [down, left, down, up, up, down]
+
+  - phrase: "jump pack"
+    keys: [down, up, up, down, up]
+
+  - phrase: "hover pack"
+    keys: [down, up, up, down, left, right]
+
+  - phrase: "warp pack"
+    keys: [down, left, right, down, left, right]
+
   - phrase: "shield [generator] pack"
     keys: [down, up, left, right, left, right]
 
-  - phrase: "portable hell bomb"
+  - phrase: "ballistic shield [backpack]"
+    keys: [down, left, down, down, up, left]
+
+  - phrase: "directional shield"
+    keys: [down, up, left, right, up, up]
+
+  - name: Portable hellbomb
+    phrase: "portable hell bomb"
     keys: [down, right, up, up, up]
+
+  # ── Vehicles ──────────────────────────────────────────────────────────
+  - phrase: "patriot [exo suit]"
+    keys: [left, down, right, up, left, down, down]
 
   - phrase: "emancipator [exo suit]"
     keys: [left, down, right, up, left, down, up]
 
-  - phrase: "patriot [exo suit]"
-    keys: [left, down, right, up, left, down, down]
+  - phrase: "lumberer [exo suit]"
+    keys: [left, down, right, up, right, left, up]
 
-  - phrase: "{tank, bastion}"
+  - phrase: "breakthrough [exo suit]"
+    keys: [left, down, right, left, right, down, up]
+
+  - name: Gunner FRV
+    phrase: "gunner {f r v, buggy}"
+    keys: [left, down, right, down, right, down, up]
+
+  - name: Supply FRV
+    phrase: "supply {f r v, buggy}"
+    keys: [left, down, left, left, down, up, right]
+
+  - name: Incinerator FRV
+    phrase: "incinerator {f r v, buggy}"
+    keys: [left, down, right, left, down, up, up]
+
+  - name: Bastion
+    phrase: "{tank, bastion}"
     keys: [left, down, right, down, left, down, up, down, up]
 
   # ── Orbitals ──────────────────────────────────────────────────────────
@@ -149,36 +290,57 @@ commands:
   - phrase: "[orbital] gatling barrage"
     keys: [right, down, left, up, up]
 
+  - phrase: "[orbital] air burst [strike]"
+    keys: [right, right, right]
+
   - phrase: "[orbital] gas strike"
     keys: [right, right, down, right]
+
+  - name: Orbital EMS strike
+    phrase: "[orbital] ems [strike]"
+    keys: [right, right, left, down]
+
+  - phrase: "[orbital] smoke [strike]"
+    keys: [right, right, down, up]
 
   - phrase: "[orbital] {one twenty, one hundred twenty} [millimeter] barrage"
     keys: [right, right, down, left, right, down]
 
-  - phrase: "[orbital] air burst [strike]"
-    keys: [right, right, right]
+  - phrase: "[orbital] walking barrage"
+    keys: [right, down, right, down, right, down]
 
   - phrase: "[orbital] {three eighty, three hundred eighty} [millimeter] barrage"
     keys: [right, down, up, up, left, down, down]
 
-  - phrase: "orbital laser"
-    keys: [right, down, up, right, down]
-
   - phrase: "[orbital] napalm barrage"
     keys: [right, right, down, left, right, up]
 
-  - phrase: "[orbital] rail cannon [strike]"
+  - name: Orbital railcannon strike
+    phrase: "[orbital] rail cannon [strike]"
     keys: [right, up, down, down, right]
 
+  - phrase: "orbital laser"
+    keys: [right, down, up, right, down]
+
   # ── Eagles ────────────────────────────────────────────────────────────
+  - phrase: "[eagle] strafing run"
+    keys: [up, right, right]
+
   - phrase: "[eagle] airstrike"
     keys: [up, right, down, right]
 
   - phrase: "[eagle] cluster bomb"
     keys: [up, right, down, down, right]
 
-  - phrase: "eagle napalm [strike]"
+  - phrase: "eagle napalm [{strike, airstrike}]"
     keys: [up, right, down, up]
+
+  - phrase: "eagle smoke [strike]"
+    keys: [up, right, up, down]
+
+  - name: Eagle 110mm rocket pods
+    phrase: "[eagle] {one ten, one hundred ten} [millimeter] rocket pods"
+    keys: [up, right, up, left]
 
   - phrase: "[eagle] five hundred [kilo] [bomb]"
     keys: [up, right, down, down, down]
@@ -200,6 +362,9 @@ commands:
   - phrase: "ems mortar sentry"
     keys: [down, up, right, down, right]
 
+  - phrase: "gas mortar sentry"
+    keys: [down, up, right, down, left]
+
   - phrase: "rocket sentry"
     keys: [down, up, right, right, left]
 
@@ -213,16 +378,26 @@ commands:
     keys: [down, up, right, down, up, up]
 
   # ── Emplacements & mines ──────────────────────────────────────────────
+  - phrase: "{anti personnel mines, anti personnel minefield}"
+    keys: [down, left, up, right]
+
   - phrase: "{anti tank mines, anti tank minefield}"
     keys: [down, left, up, up]
 
-  - phrase: "{anti personnel mines, anti personnel minefield}"
-    keys: [down, left, up, right]
+  - phrase: "incendiary {mines, minefield}"
+    keys: [down, left, left, down]
+
+  - phrase: "gas {mines, minefield}"
+    keys: [down, left, left, right]
 
   - phrase: "shield [generator] relay"
     keys: [down, down, left, right, left, right]
 
-  - phrase: "[heavy] machine gun emplacement"
+  - phrase: "grenadier battlement"
+    keys: [down, right, down, left, right]
+
+  - name: HMG emplacement
+    phrase: "[heavy] machine gun emplacement"
     keys: [down, up, left, right, right, left]
 
   - phrase: "anti tank emplacement"
