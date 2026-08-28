@@ -168,19 +168,23 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # The runner has no microphone, no membership of the `input` group and no
+      # writable /dev/uinput, so the tests which need real hardware or a Vosk
+      # model are gated behind `pure_tests` and skipped here.
       - name: Run tests
-        run: cargo test --no-fail-fast
+        run: cargo test --features pure_tests --no-fail-fast
         env:
             RUSTFLAGS: -Cinstrument-coverage
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Model-gated tests are advisory until they've stabilised in CI: they
-      # depend on a real acoustic model and on recognition behaviour we don't
-      # yet pin, so a failure here shouldn't redden an otherwise good build.
-      # Flip continue-on-error off once they're trustworthy.
+      # The gated tests are advisory: the model-driven ones depend on
+      # recognition behaviour we don't yet pin, and the hardware-driven ones
+      # cannot pass on a runner at all, so a failure here shouldn't redden an
+      # otherwise good build. Flip continue-on-error off once they're
+      # trustworthy and the hardware ones have somewhere real to run.
       - name: Run model-gated tests
         continue-on-error: true
-        run: cargo test -- --ignored --no-fail-fast
+        run: cargo test --features pure_tests -- --ignored --no-fail-fast
         env:
             RUSTFLAGS: -Cinstrument-coverage
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
