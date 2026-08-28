@@ -1,0 +1,15 @@
+name: Changelog
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  update:
+    name: Prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: release-drafter/release-drafter@v7.5.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

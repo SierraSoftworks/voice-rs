@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    groups:
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing*"
+          - "tonic"
+
+  # The VuePress documentation website under /docs.
+  - package-ecosystem: "npm"
+    directory: "/docs"
+    schedule:
+      interval: "daily"
+    groups:
+      vuepress:
+        patterns:
+          - "vuepress"
+          - "@vuepress/*"
