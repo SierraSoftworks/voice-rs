@@ -11,12 +11,23 @@ Wayland, and inside fullscreen games.
 
 ## Step #1: Install voice-orders and libvosk
 
-Download the latest release tarball from the [GitHub releases page][releases] and unpack it somewhere on your `PATH`.
-The release tarballs bundle `libvosk.so` next to the binary, so there is nothing else to install:
+Install from the Homebrew tap, then add `libvosk.so` to the Homebrew prefix — the formula ships the binary alone, and
+the binary links the library dynamically:
 
 ```sh
-tar -xzf voice-orders-linux-amd64.tar.gz
-sudo install -m 0755 voice-orders /usr/local/bin/
+brew install sierrasoftworks/tap/voice-orders
+curl -fsSL -o "$(brew --prefix)/lib/libvosk.so" \
+  https://github.com/SierraSoftworks/voice-rs/releases/latest/download/libvosk-linux-amd64.so
+```
+
+Or take the two files straight from the [GitHub releases page][releases], which publishes them raw:
+
+```sh
+curl -fsSLO https://github.com/SierraSoftworks/voice-rs/releases/latest/download/voice-orders-linux-amd64
+curl -fsSLO https://github.com/SierraSoftworks/voice-rs/releases/latest/download/libvosk-linux-amd64.so
+sudo install -m 0755 voice-orders-linux-amd64 /usr/local/bin/voice-orders
+sudo install -m 0644 libvosk-linux-amd64.so /usr/local/lib/libvosk.so
+sudo ldconfig
 ```
 
 If you are building from source instead, you will need `libvosk.so` on your linker path first — `vosk-sys` links it

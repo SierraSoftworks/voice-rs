@@ -4304,6 +4304,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rstest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "shellexpand",
  "strsim",
@@ -4313,27 +4314,8 @@ dependencies = [
  "tokio-util",
  "tracing-batteries",
  "uinput-tokio",
- "vosk",
  "wiremock",
 ]
-
-[[package]]
-name = "vosk"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae9e2a552b3fb49f097849cfed3d4a2a7163bb7ea507268666980605a676c627"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "vosk-sys",
-]
-
-[[package]]
-name = "vosk-sys"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73ab2937e19c7d32c1a077a4a220011cbbb2b6ab83bb35635ffb65a82b7e43f6"
 
 [[package]]
 name = "vtparse"
