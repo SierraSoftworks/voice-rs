@@ -209,19 +209,20 @@ jobs:
       matrix:
         include:
           # Linux builds only - the evdev/uinput layer is deliberately
-          # Linux-first, so there are no Windows or macOS targets.
+          # Linux-first, so there are no Windows or macOS targets. Both arches
+          # build natively on a runner of their own architecture, which keeps
+          # the ALSA and libudev headers, libvosk and the linker all in the
+          # same place rather than juggling them across a cross container.
           - arch: amd64
             os: linux
             run_on: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             vosk_arch: x86_64
-            builder: cargo
           - arch: arm64
             os: linux
-            run_on: ubuntu-latest
+            run_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             vosk_arch: aarch64
-            builder: cross
 
     steps:
       - name: Check out code
@@ -265,42 +266,6 @@ jobs:
             echo "LD_LIBRARY_PATH=$dir"
           } >> "$GITHUB_ENV"
 
-      # Install cross *before* Setup Cache. rust-cache restores cargo's
-      # install metadata (.crates2.json) but not the cargo bin directory,
-      # so if the cache runs first, binstall sees cross as "already
-      # installed", skips it, and the binary is never materialised. Running
-      # the install against a clean CARGO_HOME (with --force) guarantees the
-      # binary actually exists.
-      - name: Install Cross
-        if: matrix.builder == 'cross'
-        shell: bash
-        run: |
-          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-          cargo binstall --no-confirm --force cross
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
-
-      # cross runs the compiler inside a container, so the aarch64 libvosk we
-      # just downloaded on the host has to be bind-mounted at the same absolute
-      # path and the linker environment forwarded in. The container also needs
-      # the arm64 ALSA headers for cpal's alsa-sys build script, which is what
-      # the pre-build hook installs.
-      - name: Configure Cross
-        if: matrix.builder == 'cross'
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "CROSS_CONTAINER_OPTS=-v ${VOSK_LIB_DIR}:${VOSK_LIB_DIR}"
-            echo "CROSS_BUILD_ENV_PASSTHROUGH=LIBRARY_PATH LD_LIBRARY_PATH PKG_CONFIG_ALLOW_CROSS PKG_CONFIG_PATH"
-            echo "PKG_CONFIG_ALLOW_CROSS=1"
-            echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig"
-          } >> "$GITHUB_ENV"
-          # $CROSS_DEB_ARCH is defined by cross inside the container, so it must
-          # reach the config unexpanded.
-          cat >> "$GITHUB_ENV" <<'CROSSENV'
-          CROSS_BUILD_PRE_BUILD=dpkg --add-architecture $CROSS_DEB_ARCH && apt-get update && apt-get install --assume-yes --no-install-recommends pkg-config libasound2-dev:$CROSS_DEB_ARCH libudev-dev:$CROSS_DEB_ARCH
-          CROSSENV
-
       - name: Setup Cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -314,7 +279,7 @@ jobs:
       # -rpath,$ORIGIN makes the binary look for libvosk.so beside itself, which
       # is what lets the release tarball ship the two side by side.
       - name: cargo build
-        run: ${{ matrix.builder }} build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
         env:
           RUSTFLAGS: "-C link-args=-Wl,-rpath,$ORIGIN"
 
