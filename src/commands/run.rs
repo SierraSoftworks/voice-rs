@@ -40,6 +40,8 @@ use crate::matcher::{CommandAction, CompiledCommand, PhraseTrie, matcher_task};
 use crate::output::{Interrupt, UinputSink, executor};
 use crate::recognition::{AudioMsg, RecognitionEvent, vosk};
 
+use super::test::{EventSink, TestEvent};
+
 /// The sample rate we ask the microphone for and hand to the recognizer.
 ///
 /// Every Vosk model published for English is trained at 16 kHz, and the crate
@@ -108,6 +110,9 @@ pub async fn run(args: RunArgs) -> Result<i32, crate::Error> {
             Narration::Silent
         },
         announce_listening: false,
+        // `run` has no terminal UI: whatever it narrates goes straight to
+        // stdout, exactly as it always has.
+        events: EventSink::Plain,
     };
     let (mut pipeline, queue) = Pipeline::start(&profile, &settings, model, parts, options)?;
 
@@ -148,9 +153,10 @@ pub async fn run(args: RunArgs) -> Result<i32, crate::Error> {
 /// How the recognition-event forwarder narrates what passes through it.
 ///
 /// The forwarder sits *in* the event path rather than tapping it, so what it
-/// prints is exactly what the matcher sees, in the order it sees it. `println!`
-/// rather than tracing: these lines are the user-facing report, and they must
-/// appear with no telemetry configured.
+/// reports is exactly what the matcher sees, in the order it sees it. It
+/// reports through an [`EventSink`] rather than tracing: these lines are the
+/// user-facing report, they must appear with no telemetry configured, and
+/// under `test` they are what the terminal UI draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Narration {
     /// Say nothing; no forwarder is spawned at all.
@@ -165,9 +171,12 @@ pub(super) enum Narration {
 pub(super) struct PipelineOptions {
     /// Whether recognized speech is reported to the terminal.
     pub narration: Narration,
-    /// Whether listening-state changes are printed for the user (`test`) or
+    /// Whether listening-state changes are reported to the user (`test`) or
     /// only logged (`run`).
     pub announce_listening: bool,
+    /// Where everything the pipeline reports goes: straight to stdout, or to
+    /// `test`'s terminal UI.
+    pub events: EventSink,
 }
 
 /// What the pipeline ended up made of, for the startup summary and for `test`'s
@@ -271,7 +280,12 @@ impl Pipeline {
             Narration::Silent => (events_rx, None),
             narration => {
                 let (narrated_tx, narrated_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
-                let task = tokio::spawn(narrate_recognition(events_rx, narrated_tx, narration));
+                let task = tokio::spawn(narrate_recognition(
+                    events_rx,
+                    narrated_tx,
+                    narration,
+                    options.events.clone(),
+                ));
                 (narrated_rx, Some(task))
             }
         };
@@ -310,7 +324,7 @@ impl Pipeline {
                     listening_flag,
                     bridge_audio,
                     cancel.clone(),
-                    options.announce_listening,
+                    options.announce_listening.then_some(options.events),
                 )))
             }
             // Always listening: the watch never changes, so there is nothing to
@@ -511,12 +525,15 @@ pub(super) fn build_pipeline_parts(
 /// abandoned rather than in front of it. The recognizer emits the matcher's
 /// `Muted` event itself when it processes that reset, so nothing synthetic is
 /// injected into the event channel here — exactly one `Muted` per mute.
+///
+/// `announce` is `Some` when the listening state is part of the user-facing
+/// report (`test`, whose UI draws it in the footer); `run` only logs it.
 async fn listening_bridge(
     mut listening: watch::Receiver<bool>,
     mirror: Arc<AtomicBool>,
     audio: SyncSender<AudioMsg>,
     cancel: CancellationToken,
-    announce: bool,
+    announce: Option<EventSink>,
 ) {
     loop {
         tokio::select! {
@@ -533,10 +550,9 @@ async fn listening_bridge(
                 let now = *listening.borrow_and_update();
                 mirror.store(now, Ordering::Relaxed);
 
-                let state = if now { "on" } else { "off" };
-                debug!(listening = now, "Listening is now {state}.");
-                if announce {
-                    println!("listening: {state}");
+                debug!(listening = now, "Listening is now {}.", if now { "on" } else { "off" });
+                if let Some(events) = &announce {
+                    events.send(TestEvent::Listening(now));
                 }
 
                 // Muting resets the recognizer (and tells the matcher via
@@ -557,19 +573,20 @@ async fn listening_bridge(
     }
 }
 
-/// Prints recognition events on their way to the matcher.
+/// Reports recognition events on their way to the matcher.
 ///
-/// Sitting in the path rather than tapping it means the printed order is
+/// Sitting in the path rather than tapping it means the reported order is
 /// exactly the matcher's order, so a `heard:` line with no `matched:` line
 /// after it really does mean "recognized, but matched nothing".
 async fn narrate_recognition(
     mut events: mpsc::Receiver<RecognitionEvent>,
     matcher: mpsc::Sender<RecognitionEvent>,
     narration: Narration,
+    sink: EventSink,
 ) {
     while let Some(event) = events.recv().await {
-        if let Some(line) = narration_line(&event, narration) {
-            println!("{line}");
+        if let Some(reported) = narration_event(&event, narration) {
+            sink.send(reported);
         }
 
         if matcher.send(event).await.is_err() {
@@ -578,19 +595,19 @@ async fn narrate_recognition(
     }
 }
 
-/// The line one recognition event deserves, or [`None`] when it is noise the
+/// The report one recognition event deserves, or [`None`] when it is noise the
 /// user has not asked to see.
-fn narration_line(event: &RecognitionEvent, narration: Narration) -> Option<String> {
+fn narration_event(event: &RecognitionEvent, narration: Narration) -> Option<TestEvent> {
     match (event, narration) {
         (_, Narration::Silent) => None,
         // A finalized utterance is the whole point: it is what the matcher gets
-        // to work with, so it is printed whenever anything is printed at all.
-        (RecognitionEvent::Final(text), _) => Some(format!("heard: {text:?}")),
+        // to work with, so it is reported whenever anything is reported at all.
+        (RecognitionEvent::Final(text), _) => Some(TestEvent::Heard(text.clone())),
         // Partials and mutes are noise unless they were asked for.
         (RecognitionEvent::Partial(text), Narration::Everything) => {
-            Some(format!("hearing: {text:?}"))
+            Some(TestEvent::Hearing(text.clone()))
         }
-        (RecognitionEvent::Muted, Narration::Everything) => Some("hearing: (muted)".to_string()),
+        (RecognitionEvent::Muted, Narration::Everything) => Some(TestEvent::Muted),
         _ => None,
     }
 }
@@ -1004,8 +1021,12 @@ mod tests {
         #[case] narration: Narration,
         #[case] expected: Option<&str>,
     ) {
+        // Asserted through the plain rendering, because these exact lines are
+        // `test`'s piped output — the terminal UI draws the same text.
         assert_eq!(
-            narration_line(&event, narration).as_deref(),
+            narration_event(&event, narration)
+                .map(|reported| reported.plain_line())
+                .as_deref(),
             expected,
             "{event:?} under {narration:?}"
         );
@@ -1019,6 +1040,7 @@ mod tests {
             events_rx,
             matcher_tx,
             Narration::Utterances,
+            EventSink::Plain,
         ));
 
         // Including the ones it prints nothing for: narration must never change

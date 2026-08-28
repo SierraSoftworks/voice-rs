@@ -10,11 +10,21 @@
 //! - **no child process**, because there is nothing to wrap.
 //!
 //! In place of the executor, the command queue is consumed by a reporter which
-//! prints what *would* have been typed. Every finalized utterance is printed as
-//! it is heard, so an utterance which matched nothing shows up as a `heard:`
+//! reports what *would* have been typed. Every finalized utterance is reported
+//! as it is heard, so an utterance which matched nothing shows up as a `heard:`
 //! line with no `matched:` line under it — which is exactly the thing you want
 //! to see when a command refuses to trigger.
+//!
+//! Everything the rehearsal has to say travels as a single [`TestEvent`]
+//! (`event.rs`), produced by the pipeline's existing seams and consumed by
+//! exactly one of two renderers, chosen once by [`ReportMode`]:
+//!
+//! - a **terminal UI** (`tui.rs`) when stdout is a TTY, which is what DESIGN.md
+//!   §"The `test` terminal UI (ratatui)" describes; and
+//! - the **plain line-printed report** otherwise, unchanged to the character,
+//!   because piped output is something scripts and CI already read.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,8 +38,14 @@ use crate::matcher::CommandAction;
 use crate::output::{CompiledOutput, Interrupt, KeyCode, KeyEvent};
 
 use super::run::{
-    Narration, Pipeline, PipelineOptions, build_pipeline_parts, interrupts, supervise, terminations,
+    Ending, Narration, Pipeline, PipelineOptions, build_pipeline_parts, interrupts, supervise,
+    terminations,
 };
+
+mod event;
+mod tui;
+
+pub(super) use event::{EventSink, TestEvent};
 
 #[derive(Args, Debug)]
 pub struct TestArgs {
@@ -46,6 +62,43 @@ pub struct TestArgs {
     pub debug_recognition: bool,
 }
 
+/// How a rehearsal reports itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportMode {
+    /// The full-screen terminal UI.
+    Tui,
+    /// One line per event on stdout.
+    Plain,
+}
+
+impl ReportMode {
+    /// The UI is only ever taken out when stdout is a terminal we own: piped
+    /// output (a script, a CI job, `| head`) gets the plain report, because
+    /// escape sequences and an alternate screen are worse than useless there.
+    ///
+    /// Taken as an argument rather than read here so the choice — the one part
+    /// of the decision which could ever be wrong — is testable.
+    fn of(stdout_is_terminal: bool) -> Self {
+        if stdout_is_terminal {
+            ReportMode::Tui
+        } else {
+            ReportMode::Plain
+        }
+    }
+
+    /// Where events go under this mode, and the receiving end when there is a
+    /// UI to hand them to.
+    fn sink(self) -> (EventSink, Option<mpsc::UnboundedReceiver<TestEvent>>) {
+        match self {
+            ReportMode::Plain => (EventSink::Plain, None),
+            ReportMode::Tui => {
+                let (events_tx, events_rx) = mpsc::unbounded_channel();
+                (EventSink::Channel(events_tx), Some(events_rx))
+            }
+        }
+    }
+}
+
 /// Rehearses a profile, returning the exit code to leave with.
 pub async fn run(args: TestArgs) -> Result<i32, crate::Error> {
     let loaded = loader::load(&args.profile).await?;
@@ -60,6 +113,8 @@ pub async fn run(args: TestArgs) -> Result<i32, crate::Error> {
     let parts = build_pipeline_parts(&profile)?;
     let model = resolve_model(args.model.as_deref(), &profile, &system)?;
 
+    let (events, ui) = ReportMode::of(std::io::stdout().is_terminal()).sink();
+
     let (mut pipeline, queue) = Pipeline::start(
         &profile,
         &settings,
@@ -72,27 +127,81 @@ pub async fn run(args: TestArgs) -> Result<i32, crate::Error> {
                 Narration::Utterances
             },
             announce_listening: true,
+            events: events.clone(),
         },
     )?;
-
-    print_header(&profile, &settings, pipeline.summary());
 
     let cancel = pipeline.cancel();
     let interrupt = pipeline.interrupt();
     pipeline.watch(
         "command reporter",
-        tokio::spawn(report_task(queue, cancel, interrupt)),
+        tokio::spawn(report_task(queue, cancel, interrupt, events)),
     );
 
-    // No child to supervise: we run until the user stops us.
-    let ending = supervise(None, interrupts(), terminations()?).await;
-    debug!("{ending}; shutting the rehearsal down.");
-    println!();
+    // No child to supervise either way: we run until the user stops us, from
+    // the keyboard or with a signal.
+    let (ending, failure) = match ui {
+        Some(ui) => {
+            let overview =
+                tui::Overview::describe(&profile, &settings, &loaded.source, pipeline.summary());
+            rehearse_on_screen(overview, ui).await?
+        }
+        None => {
+            print_header(&profile, &settings, pipeline.summary());
+            let ending = supervise(None, interrupts(), terminations()?).await;
+            println!();
+            (ending, None)
+        }
+    };
 
-    match pipeline.shutdown().await {
+    debug!("{ending}; shutting the rehearsal down.");
+
+    // The pipeline's own failure wins: the UI's is almost always a consequence
+    // of the terminal going away, which is not the interesting half.
+    match pipeline.shutdown().await.or(failure) {
         Some(e) => Err(e),
         None => Ok(ending.exit_code()),
     }
+}
+
+/// Runs the rehearsal behind the terminal UI, returning how it ended and
+/// whatever the UI itself failed with.
+///
+/// The UI owns the screen for as long as it is up, so nothing here may print:
+/// the ending is reported by the caller once the terminal has been handed back.
+async fn rehearse_on_screen(
+    overview: tui::Overview,
+    events: mpsc::UnboundedReceiver<TestEvent>,
+) -> Result<(Ending, Option<crate::Error>), crate::Error> {
+    let quit = CancellationToken::new();
+    let ui = tokio::spawn(tui::run(overview, events, quit.clone()));
+
+    // Two ways out, and the supervisor has to watch for both: 'q' (and Ctrl-C,
+    // which raw mode delivers as a key rather than a signal) cancels the token,
+    // while a signal sent to the process still arrives as a signal.
+    let stopped = {
+        let quit = quit.clone();
+        async move {
+            tokio::select! {
+                () = quit.cancelled() => {}
+                () = interrupts() => {}
+            }
+        }
+    };
+
+    let ending = supervise(None, stopped, terminations()?).await;
+    quit.cancel();
+
+    let failure = match ui.await {
+        Ok(result) => result.err(),
+        Err(e) => Some(human_errors::wrap_system(
+            e,
+            "The rehearsal display stopped unexpectedly.",
+            &["Please report this issue on GitHub so that we can investigate."],
+        )),
+    };
+
+    Ok((ending, failure))
 }
 
 /// Prints what we are about to rehearse, so the report below it has context:
@@ -146,6 +255,7 @@ async fn report_task(
     mut queue: mpsc::Receiver<CommandAction>,
     cancel: CancellationToken,
     mut interrupt: Interrupt,
+    events: EventSink,
 ) -> Result<(), crate::Error> {
     loop {
         let action = tokio::select! {
@@ -157,7 +267,7 @@ async fn report_task(
             () = interrupt.triggered() => {
                 // Nothing is being rehearsed, but the matcher may have queued
                 // commands behind us which `run` would now throw away.
-                discard_queued(&mut queue);
+                discard_queued(&mut queue, &events);
                 continue;
             }
             action = queue.recv() => action,
@@ -168,11 +278,10 @@ async fn report_task(
             return Ok(());
         };
 
-        println!(
-            "matched: {:?} → {}",
-            action.command,
-            render_plan(&action.output)
-        );
+        events.send(TestEvent::Matched {
+            name: action.command.clone(),
+            plan: render_plan(&action.output),
+        });
 
         if matches!(interrupt, Interrupt::Never) {
             continue;
@@ -189,8 +298,8 @@ async fn report_task(
         };
 
         if interrupted {
-            println!("interrupted: {:?}", action.command);
-            discard_queued(&mut queue);
+            events.send(TestEvent::Interrupted(action.command));
+            discard_queued(&mut queue, &events);
         }
     }
 }
@@ -199,9 +308,9 @@ async fn report_task(
 ///
 /// The mirror image of the executor's drain: `run` would throw these away
 /// unplayed, so a rehearsal must not pretend they still fire.
-fn discard_queued(queue: &mut mpsc::Receiver<CommandAction>) {
+fn discard_queued(queue: &mut mpsc::Receiver<CommandAction>, events: &EventSink) {
     while let Ok(action) = queue.try_recv() {
-        println!("discarded: {:?}", action.command);
+        events.send(TestEvent::Discarded(action.command));
     }
 }
 
@@ -286,6 +395,41 @@ mod tests {
     use rstest::rstest;
     use std::time::Duration;
 
+    // --- Choosing how to report -------------------------------------------
+
+    #[rstest]
+    // A terminal we own: the full-screen UI DESIGN.md describes.
+    #[case(true, ReportMode::Tui)]
+    // Piped, redirected, or running under CI: the plain report, because that
+    // is what scripts (and the tests above) read.
+    #[case(false, ReportMode::Plain)]
+    fn test_the_report_mode_follows_stdout(
+        #[case] is_terminal: bool,
+        #[case] expected: ReportMode,
+    ) {
+        assert_eq!(ReportMode::of(is_terminal), expected);
+    }
+
+    #[test]
+    fn test_only_the_terminal_ui_gets_an_event_channel() {
+        // Plain mode prints from wherever the event was reported, so there is
+        // nothing to receive and no UI task to start.
+        let (sink, ui) = ReportMode::Plain.sink();
+        assert!(matches!(sink, EventSink::Plain));
+        assert!(ui.is_none(), "plain mode has no UI to hand events to");
+
+        let (sink, ui) = ReportMode::Tui.sink();
+        assert!(matches!(sink, EventSink::Channel(_)));
+        let mut ui = ui.expect("the UI needs the receiving end");
+
+        sink.send(TestEvent::Heard("salute".to_string()));
+        assert_eq!(
+            ui.try_recv(),
+            Ok(TestEvent::Heard("salute".to_string())),
+            "everything reported should reach the UI"
+        );
+    }
+
     fn key(name: &str) -> KeyCode {
         keys::from_name(name).expect("a known key")
     }
@@ -365,7 +509,12 @@ mod tests {
     async fn test_the_reporter_drains_the_queue_and_stops_with_it() {
         let (queue_tx, queue_rx) = mpsc::channel(4);
         let cancel = CancellationToken::new();
-        let reporter = tokio::spawn(report_task(queue_rx, cancel.clone(), Interrupt::Never));
+        let reporter = tokio::spawn(report_task(
+            queue_rx,
+            cancel.clone(),
+            Interrupt::Never,
+            EventSink::Plain,
+        ));
 
         queue_tx
             .send(CommandAction {
@@ -389,7 +538,12 @@ mod tests {
     async fn test_the_reporter_stops_on_cancellation() {
         let (queue_tx, queue_rx) = mpsc::channel(4);
         let cancel = CancellationToken::new();
-        let reporter = tokio::spawn(report_task(queue_rx, cancel.clone(), Interrupt::Never));
+        let reporter = tokio::spawn(report_task(
+            queue_rx,
+            cancel.clone(),
+            Interrupt::Never,
+            EventSink::Plain,
+        ));
 
         cancel.cancel();
 
@@ -429,6 +583,7 @@ mod tests {
             queue_rx,
             cancel.clone(),
             Interrupt::when_listening_stops(listening_rx),
+            EventSink::Plain,
         ));
 
         // A long hold, and two commands the matcher queued behind it.

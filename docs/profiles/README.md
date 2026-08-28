@@ -541,18 +541,25 @@ voice-orders test drg.yaml
 ```
 
 It runs the full pipeline — audio capture, recognition, the hotkey, the matcher and the completion-timeout state
-machine — but instead of opening `/dev/uinput` it prints what would have happened:
+machine — but instead of opening `/dev/uinput` it shows what would have happened. In a terminal it renders a
+full-screen view: a header with the profile's name, stats and source; a scrolling event log where each line leads
+with a colored dot (green for a matched command with the keys it would have played, grey for an utterance which
+matched nothing, yellow for a command interrupted or discarded by [`hotkey.interrupt`](#hotkey-interrupt), blue for
+listening-state changes, red for pipeline errors); and a footer with the live listening state and the loaded model.
+Press `q` (or `Ctrl-C`) to stop.
+
+When its output is piped — into a file, another tool, or CI — it falls back to plain lines with the same content:
 
 ```
 listening: on
-heard: deploy the auto cannon
-matched: Deploy the autocannon
-  down 4, wait 30ms, up 4
-heard: reload
-matched: Reload  (after waiting 350ms)
-  down r, wait 30ms, up r
+heard: "deploy the auto cannon"
+matched: "Deploy the autocannon" → 4
+heard: "reload"
 listening: off
 ```
+
+A `heard:` line with no `matched:` line beneath it is the signal to look for: the model understood you, but no
+command's phrases cover what you said.
 
 Because it emits no input events at all, it is safe to run over a terminal you are reading, and it needs **no uinput
 permissions** — so it is the right thing to reach for before you have finished setting your system up, and the right
