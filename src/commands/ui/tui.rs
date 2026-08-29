@@ -20,6 +20,12 @@
 //! state is not logged at all — the footer shows it live, which is both fewer
 //! lines and more current.
 //!
+//! **Self-update.** Starting this UI also starts a background check for a newer
+//! release (see [`crate::update`] and DESIGN.md §"Self-update"); if it finds
+//! one, the footer gains a dim `⬆ v1.2.3 — voice-orders update` note on the
+//! next draw. Nothing waits for it, a failure says nothing at all, and plain
+//! mode — which never reaches this function — never checks.
+//!
 //! **On tracing and the alternate screen:** this process logs to stdout (see
 //! `telemetry.rs` — for a CLI, `info!`/`warn!` are user-facing output), and
 //! stdout is the same handle the alternate screen is drawn on, so `main.rs`
@@ -38,7 +44,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing_batteries::prelude::*;
 
@@ -62,6 +68,9 @@ const TICK: Duration = Duration::from_millis(250);
 /// so a blocking thread does the reading and this bounds how long it lingers
 /// once the rehearsal is over.
 const KEY_POLL: Duration = Duration::from_millis(100);
+
+/// The glyph which leads the footer's "a newer release is available" note.
+const UPDATE_MARK: &str = "⬆";
 
 /// A key event, or the reason we stopped being able to read them.
 type KeyResult = Result<KeyEvent, String>;
@@ -150,6 +159,16 @@ pub(crate) struct App {
     overview: Overview,
     log: EventLog,
     listening: bool,
+    /// The newest release the background update check found, once it has found
+    /// one.
+    ///
+    /// A watch channel rather than another [`UiEvent`] because the check is not
+    /// something the *session* reported: it belongs to the footer, not to the
+    /// log, and it needs no redraw machinery of its own — the answer is simply
+    /// read on the next draw, which the loop's tick guarantees within a quarter
+    /// of a second. [`None`] when nothing is checking at all, which is every
+    /// [`App`] but the one [`run`] builds.
+    update: Option<watch::Receiver<Option<String>>>,
 }
 
 impl App {
@@ -158,7 +177,20 @@ impl App {
             listening: overview.listening,
             overview,
             log: EventLog::new(SCROLLBACK),
+            update: None,
         }
+    }
+
+    /// Watches a background update check, so the footer can mention a newer
+    /// release once one is found.
+    fn watching_for_updates(mut self, updates: watch::Receiver<Option<String>>) -> Self {
+        self.update = Some(updates);
+        self
+    }
+
+    /// The newer release to mention, if the check has finished and found one.
+    fn available_update(&self) -> Option<String> {
+        self.update.as_ref()?.borrow().clone()
     }
 
     /// Folds one reported event into the state.
@@ -217,11 +249,38 @@ pub(crate) async fn run(
         move || read_keys(&keys_tx, &quit)
     });
 
-    let outcome = drive(&mut terminal, App::new(overview), events, keys, &quit).await;
+    // The update check lives here, and only here, because this function is
+    // exactly the "stdout is a terminal we own" branch of both `test` and
+    // `run`: a plain launch — a pipe, CI, Steam — never reaches it and so never
+    // makes the request. See DESIGN.md §"Self-update".
+    //
+    // It runs alongside the session rather than in front of it: nothing waits
+    // for it, a failure is silent, and whatever it finds is picked up by the
+    // next draw.
+    let (found, updates) = watch::channel(None);
+    let checker = tokio::spawn({
+        let quit = quit.clone();
+        async move {
+            tokio::select! {
+                () = quit.cancelled() => {}
+                newer = crate::update::check_for_update() => {
+                    if let Some(version) = newer {
+                        let _ = found.send(Some(version));
+                    }
+                }
+            }
+        }
+    });
+
+    let app = App::new(overview).watching_for_updates(updates);
+    let outcome = drive(&mut terminal, app, events, keys, &quit).await;
 
     // Wait for the reader to notice it is done before handing the terminal
-    // back, so it cannot swallow a keystroke meant for the shell.
+    // back, so it cannot swallow a keystroke meant for the shell. The update
+    // check is not waited for at all — it is bounded by its own timeout, and a
+    // session which is over must not sit here waiting on GitHub.
     quit.cancel();
+    checker.abort();
     let _ = reader.await;
 
     // Restore before anything else can print: the alternate screen must be
@@ -450,7 +509,8 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The live listening state, and which model is doing the listening.
+/// The live listening state, which model is doing the listening, and — once the
+/// background check has found one — the newer release which is waiting.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let [state_area, model_area] = split_row(area, &app.overview.model);
 
@@ -460,15 +520,25 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         (true, false) => ("listening: off", Color::Gray),
     };
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(DOT, Style::new().fg(color)),
-            Span::raw(" "),
-            Span::styled(state, Style::new().fg(color)),
-            Span::styled("  —  q to quit", Style::new().fg(Color::DarkGray)),
-        ])),
-        state_area,
-    );
+    let mut footer = vec![
+        Span::styled(DOT, Style::new().fg(color)),
+        Span::raw(" "),
+        Span::styled(state, Style::new().fg(color)),
+        Span::styled("  —  q to quit", Style::new().fg(Color::DarkGray)),
+    ];
+
+    // Last, and dim: a newer release is worth knowing about but is never the
+    // thing the user is watching this screen for, so it is the first thing a
+    // narrow terminal truncates away. Nothing is drawn while the check is still
+    // running, or when it found nothing.
+    if let Some(version) = app.available_update() {
+        footer.push(Span::styled(
+            format!("  {UPDATE_MARK} v{version} — voice-orders update"),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(footer)), state_area);
     frame.render_widget(
         Paragraph::new(Span::styled(
             app.overview.model.clone(),
@@ -657,6 +727,86 @@ mod tests {
         assert!(
             footer.starts_with(&format!("{DOT} listening: on")),
             "the footer should follow the hotkey: {footer:?}"
+        );
+    }
+
+    /// An app whose background update check has already answered: `Some` when
+    /// it found a newer release, `None` when it found nothing (or is still
+    /// running, which looks the same on screen).
+    ///
+    /// The sender is dropped immediately on purpose — a watch receiver keeps
+    /// serving the last value it was sent, which is exactly the shape of the
+    /// real check: it reports once and goes away.
+    fn checked(version: Option<&str>) -> App {
+        let (_found, updates) = watch::channel(version.map(ToString::to_string));
+
+        App::new(overview()).watching_for_updates(updates)
+    }
+
+    #[test]
+    fn test_the_footer_mentions_a_newer_release_once_the_check_finds_one() {
+        let footer = row(&screen(&checked(Some("1.2.3")), 90, 12), 11);
+
+        assert!(
+            footer.contains(&format!("{UPDATE_MARK} v1.2.3 — voice-orders update")),
+            "the newer release and how to get it belong in the footer: {footer:?}"
+        );
+        assert!(
+            footer.starts_with(&format!("{DOT} listening: off")),
+            "and they must not displace the listening state: {footer:?}"
+        );
+        assert!(
+            footer.ends_with("vosk-model-small-en-us-0.15"),
+            "nor the model: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn test_the_footer_says_nothing_when_there_is_no_newer_release() {
+        // The two silent cases — the check found nothing, and no check is
+        // running at all (a plain-mode session, or any other `App`) — must draw
+        // exactly the footer they always have.
+        let quiet = row(&screen(&checked(None), 90, 12), 11);
+        let unchecked = row(&screen(&App::new(overview()), 90, 12), 11);
+
+        assert_eq!(
+            quiet, unchecked,
+            "a check which found nothing changes nothing"
+        );
+        assert!(
+            !quiet.contains(UPDATE_MARK),
+            "nothing should be drawn: {quiet:?}"
+        );
+    }
+
+    #[test]
+    fn test_the_update_note_is_dim_cyan() {
+        // Deliberately the quietest thing on the screen: a session which is
+        // mid-game must not have its eye pulled by it.
+        let buffer = screen(&checked(Some("1.2.3")), 90, 12);
+        let mark = (0..90)
+            .map(|x| buffer.cell((x, 11)).expect("inside the buffer"))
+            .find(|cell| cell.symbol() == UPDATE_MARK)
+            .expect("the footer should carry the update mark");
+
+        assert_eq!(mark.fg, Color::Cyan);
+        assert!(mark.modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn test_a_tiny_terminal_drops_the_update_note_rather_than_the_state() {
+        // The note is last on the line, so a narrow terminal truncates it away
+        // and keeps the thing the footer is actually for. (50 columns: the
+        // model name claims 27 of them, leaving 23 for the state.)
+        let footer = row(&screen(&checked(Some("1.2.3")), 50, 8), 7);
+
+        assert!(
+            footer.starts_with(&format!("{DOT} listening: off")),
+            "the listening state survives: {footer:?}"
+        );
+        assert!(
+            !footer.contains("voice-orders update"),
+            "there is no room for the note: {footer:?}"
         );
     }
 

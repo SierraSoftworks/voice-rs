@@ -817,6 +817,24 @@ pub enum Command {
         #[arg(long, hide = true)]
         debug_recognition: bool,
     },
+    /// Update voice-orders itself to the latest release from GitHub.
+    /// See "Self-update" below.
+    Update {
+        /// The version to move to, as a tag (`v1.2.3`) or bare (`1.2.3`).
+        /// Defaults to the latest release newer than this one; an older
+        /// version is a rollback.
+        version: Option<String>,
+        /// Print the available releases instead of installing one.
+        #[arg(long)]
+        list: bool,
+        /// Consider pre-release versions as well as stable ones.
+        #[arg(long)]
+        prerelease: bool,
+        /// Serialized update state, set by the updater when it relaunches us
+        /// between phases.
+        #[arg(long, hide = true)]
+        state: Option<String>,
+    },
 }
 ```
 
@@ -1044,6 +1062,55 @@ misses, suggest in order:
   the completion-timeout behavior discoverable per profile.
 - **Expansion volume:** per-command counts; warning above 128, error above 512.
 - **Output lints:** `down` without a matching `up`, `up` without a prior `down`, empty `keys` lists.
+
+## Self-update
+
+`voice-orders update` replaces this binary with a release from GitHub, using
+[update-rs](https://crates.io/crates/update-rs) — the crate extracted from Git-Tool, whose
+three-phase *prepare → replace → cleanup* dance is what lets a running executable overwrite itself.
+`src/update.rs` configures it and owns the policy; `src/commands/update.rs` is the user-facing half.
+
+**The manager.** A `GitHubSource` for `SierraSoftworks/voice-rs` with a `v` release-tag prefix, and a
+`Launcher` whose resume arguments are `["update", "--state", <json>]` — a sub-command rather than
+update-rs' default `RESUME_FLAG`, because voice-orders parses its arguments with clap-derive and a
+bare flag would have to be intercepted before `Args::parse()`. There is nothing to carry across the
+relaunch, so no extra environment variables. Failures need no conversion at the boundary:
+`update_rs::Error` *is* `human_errors::Error`, which is `crate::Error`, so an updater failure already
+arrives with a description and advice.
+
+**Asset naming.** The release workflow stages each build as `voice-orders-{os}-{arch}`
+(`voice-orders-linux-amd64`, `voice-orders-linux-arm64`) — exactly `update_rs::naming::go`'s Go-style
+convention, so no custom pattern is needed. update-rs anchors the glob at both ends, which is what
+keeps the `libvosk-linux-<arch>.so` asset published beside it out of the way: **an update replaces
+the voice-orders binary and never touches libvosk**, which is the right split, since the two move on
+completely independent schedules (see "libvosk & model distribution" below). The expected name is
+pinned against a literal of what the workflow produces, so renaming an asset breaks a test rather
+than everybody's updater.
+
+**Selection is a pure function.** `update::choose(releases, installed, target, prerelease)` returns
+`Install` / `UpToDate` / `Unavailable` / `DevelopmentBuild`, which is the whole policy in one
+testable place: an explicit version installs exactly that release (a rollback is as legitimate as a
+roll-forward), otherwise the newest release which has an asset for this platform and is *strictly*
+newer than what is running wins, with pre-releases excluded unless asked for. A debug build reports
+`0.0.0-dev` from `version!()`, which compares against nothing — so it is answered with "self-updates
+are only available in released builds" rather than a parse error, and without making the request at
+all. `--list` still works there; it simply marks nothing as installed.
+
+**The background check, and why plain mode does not run it.** When the terminal UI starts, it spawns
+`update::check_for_update()` as a background task; if that finds a release newer than the one
+running, the footer gains a dim cyan `⬆ v1.2.3 — voice-orders update` note. Everything about it is
+shaped by *when* it runs — at session start, which under `run` is game-launch time:
+
+- **silent on failure.** Every error is swallowed at `debug!` level. A game launch must never stall,
+  warn or fail because GitHub is unreachable.
+- **bounded.** A 3s total request timeout, and nothing waits for it; the answer is read on the next
+  draw, which the UI's 250ms tick guarantees. No extra redraw machinery, and no new `UiEvent` — this
+  is not something the *session* reported, it belongs to the footer rather than the log.
+- **skipped in a development build**, which has no version to compare.
+- **never run in plain mode.** The check lives inside `tui::run`, which is by construction the
+  "stdout is a terminal we own" branch of both `test` and `run` — so a piped, CI or **Steam** launch
+  never reaches it and never makes a network call. Adding one to the wrapper path would put GitHub
+  between a user and their game for no benefit: nobody reads a Steam launch's stdout.
 
 ## libvosk & model distribution
 

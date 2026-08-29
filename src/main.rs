@@ -13,6 +13,7 @@ mod matcher;
 mod output;
 mod recognition;
 mod telemetry;
+mod update;
 
 pub use commands::Command;
 pub use human_errors::Error;

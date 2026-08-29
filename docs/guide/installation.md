@@ -68,6 +68,37 @@ cargo build --release
 Building needs `libvosk.so` available to the linker, because `vosk-sys` links it dynamically and there is no
 crates.io fallback — see the next section.
 
+### Updating
+
+A released binary can replace itself:
+
+```sh
+voice-orders update           # move to the latest release
+voice-orders update --list    # see what is available; * marks the one you have
+voice-orders update v1.2.3    # move to a specific version, including backwards
+```
+
+It downloads the release asset for your platform, swaps it over the binary you ran, and exits — so
+run it from wherever `voice-orders` is installed, and make sure that file is writable by you (a
+`/usr/local/bin` install wants `sudo`). Add `--prerelease` if you want release candidates offered
+too.
+
+::: tip
+`update` replaces the **voice-orders binary only**. `libvosk.so` and your speech model are left
+exactly where they are, because they move on their own schedule — a voice-orders release does not
+imply a new libvosk. If you ever need a newer library, install it the same way you did the first
+time.
+
+A build you made yourself (`cargo build`) will tell you that self-updates are only available in
+released builds — there is nothing for it to replace.
+:::
+
+When `test` or `run` are showing their full-screen terminal UI, they check for a newer release in the
+background and, if there is one, add a dim `⬆ v1.2.3 — voice-orders update` note to the footer. The
+check is silent and time-limited, so an unreachable GitHub costs you nothing — and it does **not**
+happen when output is piped or redirected, which includes launching through Steam: nothing gets
+between you and your game.
+
 ## libvosk
 
 Download the prebuilt library from the [Vosk API releases][vosk-releases] — the file is named
