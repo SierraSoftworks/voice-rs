@@ -1392,7 +1392,7 @@ mod tests {
             let grammar = Grammar::parse(&source).expect("the canonical grammar should load");
             Automaton::compile(&grammar).unwrap_or_else(|diagnostics| {
                 panic!(
-                    "profiles/arma.yaml should compile with zero diagnostics:\n{}",
+                    "profiles/arma3.yaml should compile with zero diagnostics:\n{}",
                     diagnostics
                         .iter()
                         .map(|diagnostic| diagnostic.render(&source))
