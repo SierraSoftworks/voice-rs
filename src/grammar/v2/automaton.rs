@@ -154,6 +154,11 @@ impl Automaton {
             rule_sizes: builder.rule_sizes,
         };
 
+        let duplicates = automaton.duplicate_diagnostics();
+        if !duplicates.is_empty() {
+            return Err(duplicates);
+        }
+
         Ok(automaton)
     }
 
@@ -533,6 +538,182 @@ impl<'g> Builder<'g> {
         .with_help(
             "Every repetition bound multiplies the size of everything it repeats, and every rule reference copies the whole referenced rule. Lower the largest bounds, or split the biggest rules into smaller commands.",
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate detection: bounded subset construction over the flat automaton.
+// ---------------------------------------------------------------------------
+
+/// The most subset states duplicate detection explores before giving up.
+///
+/// Exploration is breadth-first, so the shortest phrases — where colliding
+/// commands actually get written — are swept first, and a grammar too large
+/// to sweep exhaustively is still checked to this budget's depth.
+const MAX_DUPLICATE_SUBSETS: usize = 10_000;
+
+impl Automaton {
+    /// The load-time duplicate check: two published rules accepting the same
+    /// word sequence with different evaluated outputs is an error naming both
+    /// rules and a witness phrase, and so is one rule accepting the same
+    /// words two ways with different outputs. Identical outputs collapse
+    /// silently — deliberate synonyms are legal.
+    ///
+    /// The sweep is a subset construction over the flat automaton: every
+    /// subset of states reachable by some word sequence is visited once
+    /// (breadth-first, so shortest sequences first). A subset where two
+    /// accept entries coexist — or where an accepting state is *tainted*,
+    /// i.e. reachable by two different op paths over the same words — gets
+    /// one witness sequence reconstructed and run through the real hypothesis
+    /// walk, and only a walk that produces two different action vectors
+    /// raises the error, so false positives are impossible.
+    ///
+    /// Two honest gaps: nothing beyond [`MAX_DUPLICATE_SUBSETS`] subset
+    /// states is checked, and each subset is witnessed by a single word
+    /// sequence — rules whose outputs agree on the checked witness but
+    /// diverge on another sequence through the very same subsets go
+    /// unreported.
+    fn duplicate_diagnostics(&self) -> Vec<Diagnostic> {
+        use std::collections::{BTreeMap, HashSet, VecDeque};
+
+        /// One explored subset: the states reachable by one word sequence,
+        /// each flagged when several distinct op paths reach it, plus the
+        /// breadcrumb for reconstructing the witness sequence.
+        struct Subset {
+            members: Vec<(usize, bool)>,
+            parent: Option<(usize, u32)>,
+        }
+
+        let word_names: HashMap<u32, &str> = self
+            .words
+            .iter()
+            .map(|(word, id)| (*id, word.as_str()))
+            .collect();
+
+        let mut diagnostics = Vec::new();
+        let mut reported: HashSet<(String, String)> = HashSet::new();
+
+        let mut arena: Vec<Subset> = vec![Subset {
+            members: vec![(0, false)],
+            parent: None,
+        }];
+        let mut seen: HashSet<Vec<(usize, bool)>> = HashSet::new();
+        seen.insert(arena[0].members.clone());
+        let mut queue: VecDeque<usize> = VecDeque::from([0]);
+        let mut processed = 0usize;
+
+        while let Some(index) = queue.pop_front() {
+            processed += 1;
+            if processed > MAX_DUPLICATE_SUBSETS {
+                break;
+            }
+
+            let members = arena[index].members.clone();
+            let mut accept_entries = 0usize;
+            let mut tainted_accept = false;
+            for &(state, tainted) in &members {
+                let count = self.states[state].accepts.len();
+                accept_entries += count;
+                if tainted && count > 0 {
+                    tainted_accept = true;
+                }
+            }
+
+            if accept_entries >= 2 || tainted_accept {
+                let mut words: Vec<&str> = Vec::new();
+                let mut cursor = index;
+                while let Some((parent, word)) = arena[cursor].parent {
+                    words.push(word_names[&word]);
+                    cursor = parent;
+                }
+                words.reverse();
+
+                let mut walk = self.walk();
+                for word in &words {
+                    walk.step(word);
+                }
+                let accepts = walk.accepts();
+                for first in 0..accepts.len() {
+                    for second in first + 1..accepts.len() {
+                        let (a, b) = (&accepts[first], &accepts[second]);
+                        if a.actions == b.actions {
+                            continue;
+                        }
+                        let mut pair = [a.rule.clone(), b.rule.clone()];
+                        pair.sort();
+                        let [x, y] = pair;
+                        if reported.insert((x, y)) {
+                            diagnostics.push(self.duplicate_diagnostic(a, b, &words.join(" ")));
+                        }
+                    }
+                }
+            }
+
+            // Successors: a target reached by two transitions on the same
+            // word — or from an already tainted state — is tainted, because
+            // two op paths now cover one word sequence.
+            let mut by_word: BTreeMap<u32, BTreeMap<usize, (usize, bool)>> = BTreeMap::new();
+            for &(state, tainted) in &members {
+                for transition in &self.states[state].transitions {
+                    let entry = by_word
+                        .entry(transition.word)
+                        .or_default()
+                        .entry(transition.target)
+                        .or_insert((0, false));
+                    entry.0 += 1;
+                    entry.1 |= tainted;
+                }
+            }
+            for (word, targets) in by_word {
+                let successor: Vec<(usize, bool)> = targets
+                    .into_iter()
+                    .map(|(state, (paths, tainted))| (state, tainted || paths >= 2))
+                    .collect();
+                if seen.insert(successor.clone()) {
+                    arena.push(Subset {
+                        members: successor,
+                        parent: Some((index, word)),
+                    });
+                    queue.push_back(arena.len() - 1);
+                }
+            }
+        }
+
+        diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.span.end));
+        diagnostics
+    }
+
+    fn duplicate_diagnostic(&self, a: &Accept, b: &Accept, phrase: &str) -> Diagnostic {
+        let span = self
+            .rules
+            .iter()
+            .find(|rule| rule.name == a.rule)
+            .map(|rule| rule.name_span)
+            .unwrap_or(Span::new(0, 0));
+
+        if a.rule == b.rule {
+            Diagnostic::analysis(
+                format!(
+                    "Your command '{}' can match \"{phrase}\" in more than one way, and the ways press different keys — we couldn't tell which one you meant.",
+                    a.rule
+                ),
+                span,
+            )
+            .with_help(
+                "Make the overlapping branches press the same keys, or reword one of them so every spoken phrase resolves to exactly one set of presses.",
+            )
+        } else {
+            Diagnostic::analysis(
+                format!(
+                    "Your commands '{}' and '{}' can both match \"{phrase}\", but they press different keys — we couldn't tell which one you meant.",
+                    a.rule, b.rule
+                ),
+                span,
+            )
+            .with_help(
+                "Reword one of the phrases so that every spoken phrase belongs to exactly one command, or give both commands the same keys if they are deliberate synonyms.",
+            )
+        }
     }
 }
 
@@ -1147,6 +1328,57 @@ mod tests {
             warning.contains(&MAX_HYPOTHESES.to_string()),
             "got: {warning}"
         );
+    }
+
+    #[rstest]
+    // Two published rules, same phrase, different keys.
+    #[case::cross_rule(
+        "A = \"go\" { 1 }\nB = \"go\" { 2 }",
+        &["'A'", "'B'", "\"go\""]
+    )]
+    // The witness names the full colliding word sequence.
+    #[case::cross_rule_long(
+        "A = \"fire\" \"at\" \"will\" { 1 }\nB = \"fire\" \"at\" \"will\" { 2 }",
+        &["'A'", "'B'", "\"fire at will\""]
+    )]
+    // One rule, one phrase, two branches with different keys.
+    #[case::same_rule(
+        "R = ( \"go\" { 1 } | \"go\" { 2 } )",
+        &["'R'", "more than one way", "\"go\""]
+    )]
+    // One rule, one phrase, two *op paths* converging on the same word — the
+    // taint case: both branches can skip their optional word, so bare "x"
+    // evaluates two different branch blocks.
+    #[case::same_rule_converging(
+        "R = ( \"y\"? { 1 } | \"z\"? { 2 } ) \"x\"",
+        &["'R'", "more than one way", "\"x\""]
+    )]
+    fn test_duplicate_outputs_are_load_errors(#[case] source: &str, #[case] expected: &[&str]) {
+        let grammar = Grammar::parse(source).expect("the grammar should parse");
+        let diagnostics =
+            Automaton::compile(&grammar).expect_err("the duplicate should be rejected");
+        let messages: Vec<&str> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        for needle in expected {
+            assert!(
+                messages.iter().any(|message| message.contains(needle)),
+                "expected {needle:?} in: {messages:?}"
+            );
+        }
+    }
+
+    #[rstest]
+    // Identical outputs may silently collapse: deliberate synonyms are legal.
+    #[case::cross_rule_same_output("A = \"go\" { 1 }\nB = \"go\" { 1 }")]
+    #[case::same_rule_same_output("R = ( \"go\" { 1 } | \"go\" { 1 } )")]
+    // A prefix relation is the completion timeout's job, not a duplicate.
+    #[case::prefix("A = \"go\" { 1 }\nB = \"go\" \"now\" { 2 }")]
+    // Different phrases with the same keys are fine in either direction.
+    #[case::synonym_rules("A = \"halt\" { 1 }\nB = \"stop\" { 1 }")]
+    fn test_legal_overlaps_compile(#[case] source: &str) {
+        compile(source);
     }
 
     // -----------------------------------------------------------------------
