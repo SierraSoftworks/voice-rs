@@ -143,13 +143,13 @@ impl Grammar {
 pub(crate) mod fixtures {
     /// The `grammar:` block of the canonical Arma profile.
     pub fn arma_source() -> String {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma.yaml");
-        let raw = std::fs::read_to_string(path).expect("profiles/arma.yaml should be readable");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma3.yaml");
+        let raw = std::fs::read_to_string(path).expect("profiles/arma3.yaml should be readable");
         let profile: serde_yaml::Value =
-            serde_yaml::from_str(&raw).expect("profiles/arma.yaml should be valid YAML");
+            serde_yaml::from_str(&raw).expect("profiles/arma3.yaml should be valid YAML");
         profile["grammar"]
             .as_str()
-            .expect("profiles/arma.yaml should carry an inline grammar block")
+            .expect("profiles/arma3.yaml should carry an inline grammar block")
             .to_owned()
     }
 }
@@ -166,7 +166,7 @@ mod tests {
         let source = arma_grammar();
         let grammar = Grammar::parse(&source).unwrap_or_else(|diagnostics| {
             panic!(
-                "profiles/arma.yaml should parse cleanly:\n{}",
+                "profiles/arma3.yaml should parse cleanly:\n{}",
                 diagnostics
                     .iter()
                     .map(|diagnostic| diagnostic.render(&source))
@@ -177,7 +177,7 @@ mod tests {
 
         assert!(
             grammar.lints().is_empty(),
-            "profiles/arma.yaml should be lint-free:\n{}",
+            "profiles/arma3.yaml should be lint-free:\n{}",
             grammar
                 .lints()
                 .iter()
