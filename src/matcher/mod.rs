@@ -15,6 +15,7 @@
 // Consumed by `commands/run.rs` when the pipeline assembly lands.
 #![allow(dead_code)]
 
+pub mod engine;
 pub mod trie;
 
 pub use trie::{CommandId, CompiledCommand, PhraseTrie};
