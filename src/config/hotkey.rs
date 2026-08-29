@@ -44,6 +44,17 @@ pub struct HotkeyConfig {
     pub interrupt: Option<bool>,
 }
 
+impl HotkeyConfig {
+    /// Returns the device if it is not `auto`, else `None`.
+    fn explicit_device(&self) -> Option<String> {
+        if matches!(self.device.as_deref(), Some("auto")) {
+            None
+        } else {
+            self.device.clone()
+        }
+    }
+}
+
 /// A hotkey with every question answered: what the profile said, what the
 /// machine said, and what the schema defaults say, resolved into one thing the
 /// pipeline can act on.
@@ -76,8 +87,8 @@ pub fn resolve(
     system: Option<&HotkeyConfig>,
 ) -> Result<Option<ResolvedHotkey>, crate::Error> {
     let device = profile
-        .and_then(|hotkey| hotkey.device.clone())
-        .or_else(|| system.and_then(|hotkey| hotkey.device.clone()))
+        .and_then(|hotkey| hotkey.explicit_device())
+        .or_else(|| system.and_then(|hotkey| hotkey.explicit_device()))
         .unwrap_or_else(default::hotkey_device);
 
     let key = profile
