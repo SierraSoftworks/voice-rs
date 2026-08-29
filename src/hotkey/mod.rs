@@ -20,7 +20,11 @@
 mod discovery;
 #[cfg(target_os = "linux")]
 mod task;
-#[cfg(not(target_os = "linux"))]
+// Compiled everywhere, like the key table's Windows column: the hook thread
+// inside it is `cfg(windows)`, but the logic above it — which events are ours,
+// which key an event is, and how Windows' unlabelled key repeats become the
+// values [`transition`] expects — is pure, and a rule only Windows could see
+// would be a rule only Windows could test.
 mod win;
 
 // Re-exported for the `run` assembly, which lands in a later wave.
@@ -51,8 +55,9 @@ pub use task::hotkey_task;
 /// The returned future is what gets spawned.
 ///
 /// On Linux this is evdev discovery plus the `/dev/input/event*` event stream.
-/// On Windows the low-level keyboard hook which replaces it arrives in W3, and
-/// this reports an honest error until then.
+/// On Windows it is a `WH_KEYBOARD_LL` hook on a thread of its own ([`win`]),
+/// where the fallible part of starting is installing the hook rather than
+/// resolving a device.
 #[cfg(target_os = "linux")]
 pub fn watch(
     device_hint: &str,
@@ -71,6 +76,11 @@ pub fn watch(
 
 #[cfg(not(target_os = "linux"))]
 pub use win::watch;
+// `doctor`'s equivalent of creating a throwaway virtual keyboard: it installs a
+// real hook rather than inferring that one would install.
+#[allow(unused_imports)]
+#[cfg(not(target_os = "linux"))]
+pub use win::probe_hook;
 
 /// How the listen hotkey affects the listening state.
 ///

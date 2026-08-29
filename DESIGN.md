@@ -125,12 +125,12 @@ voice-orders/
     │   ├── mod.rs                 # ListenMode logic + the platform-neutral watch() seam
     │   ├── discovery.rs           # evdev device discovery and ranking          [linux]
     │   ├── task.rs                # evdev EventStream task                      [linux]
-    │   └── win.rs                 # WH_KEYBOARD_LL hook (stub until W3)         [windows]
+    │   └── win.rs                 # WH_KEYBOARD_LL hook thread                  [windows]
     └── output/
         ├── mod.rs                 # executor task consuming the command queue
         ├── keys.rs                # KeyCode + name/uinput/Windows table (macro-generated)
         ├── uinput.rs              # uinput-tokio device wrapper                 [linux]
-        └── sendinput.rs           # SendInput KeySink (stub until W2)           [windows]
+        └── sendinput.rs           # SendInput KeySink                           [windows]
 ```
 
 ### Dependencies
@@ -1212,6 +1212,19 @@ the key above `s` on AZERTY too, which is what a movement macro means). `output/
 encoding per row as `WinKey::{Scan, ScanExt, VirtualKey}`, and the one row which cannot be a
 scancode at all — `pause`, whose keyboard sequence is `E1 1D 45` — is injected by virtual key.
 
+`wVk` is left at **zero** on every scancode event. Filling it from
+`MapVirtualKeyExW(MAPVK_VSC_TO_VK_EX)` was considered and rejected: that translation runs against
+*our* keyboard layout, so on an AZERTY machine the `w` scancode would map to `VK_Z` and the record
+whose entire purpose is layout-independence would carry a layout-dependent field. It is also
+unnecessary — when Windows turns a `KEYEVENTF_SCANCODE` record into a `WM_KEYDOWN` it derives
+`wParam` from the scancode using the *receiving* thread's layout, so an application reading virtual
+keys already gets a correct one — and leaving the field alone keeps the whole encoding a pure
+function of the key table, which is what lets it be unit-tested on Linux.
+
+Every injected event carries `INJECTED_MARKER` (ASCII `"voic"`) in `dwExtraInfo`. The hotkey hook is
+system-wide and therefore sees our own output; without the marker, a macro bound to the same key as
+the hotkey would toggle listening every time it ran.
+
 `enigo` was considered and rejected. Two reasons, either sufficient: its extended-key handling is an
 acknowledged TODO in its own source (`LWIN`/`RWIN`, the numeric-keypad `Enter` and the media keys
 are all missing from its extended list, and it works from virtual keys rather than scancodes
@@ -1259,8 +1272,8 @@ Windows it would be asserting something false.
 | # | Phase | Contents | Status |
 |---|---|---|---|
 | W1 | Portability refactor | The only phase which touches Linux code. `keys.rs` gains a Windows column and literal key codes (with a Linux test pinning them against `evdev`); `libvosk.rs` migrates to `libloading` with the two optional endpointer symbols; every Linux-only module is `cfg`-gated behind a platform-neutral seam (`output::PlatformSink`, `hotkey::watch`, `doctor`'s platform checks, `run`'s signal handling); Windows CI job. | **done** |
-| W2 | Keyboard output | `output/sendinput.rs`: a real `SendInput` `KeySink` replacing the stub, driven by `keys::to_windows`. | stub |
-| W3 | Hotkey | `hotkey/win.rs`: the `WH_KEYBOARD_LL` hook thread, feeding the same `transition`/`ListenMode` logic the Linux task uses. | stub |
+| W2 | Keyboard output | `output/sendinput.rs`: a real `SendInput` `KeySink` replacing the stub, driven by `keys::to_windows`. Every injected event carries an `INJECTED_MARKER` in `dwExtraInfo` so W3's hook can ignore our own typing; `wVk` is left at zero for scancode events (see below). `doctor` check 2 presses `f24` through the real sink. | **done** |
+| W3 | Hotkey | `hotkey/win.rs`: the `WH_KEYBOARD_LL` hook thread, feeding the same `transition`/`ListenMode` logic the Linux task uses. `hotkey.device` warns and proceeds; `doctor` check 3 installs and removes a real hook. | **done** |
 | W4 | Child processes | Job-object containment and a graceful stop for the wrapped application, replacing the `send_signal` no-op. | stub |
 | W5 | Polish | Local time in the session log (the UTC fallback stands in today), Windows paths and docs. | stub |
 | W6 | Release | Windows build matrix, the `voice-orders-windows-amd64.exe` asset, libvosk DLL packaging. | not started |

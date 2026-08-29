@@ -25,7 +25,10 @@ use crate::config::{
 use crate::hotkey::discover_device;
 use crate::output::KeyCode;
 #[cfg(target_os = "linux")]
-use crate::output::{UinputSink, keys};
+use crate::output::UinputSink;
+use crate::output::keys;
+#[cfg(not(target_os = "linux"))]
+use crate::output::{KeySink, PlatformSink};
 use crate::recognition::libvosk;
 
 /// The device node the virtual keyboard is created on.
@@ -305,32 +308,74 @@ async fn platform_checks() -> Vec<CheckResult> {
 
 /// Checks 1–3 on Windows.
 ///
-/// The first is genuinely good news — nothing has to be configured, which is
-/// the whole of what the Linux checks 1 and 3 are about — and the other two
-/// are honest failures rather than reassuring silence: this build cannot press
-/// keys (W2) and cannot watch for a hotkey (W3), and a `doctor` which said
-/// otherwise would be lying about what a `run` would do.
+/// The first is genuinely good news — nothing has to be configured, which is the
+/// whole of what the Linux checks 1 and 3 are about. The other two follow the
+/// same philosophy the Linux ones do: rather than inferring that keyboard output
+/// and the hotkey would work, they *do* them — a keystroke nothing is bound to,
+/// and a hook installed and immediately removed.
 #[cfg(not(target_os = "linux"))]
 async fn platform_checks() -> Vec<CheckResult> {
-    /// Advice for the parts of the Windows port which are not finished.
-    const UNFINISHED_ADVICE: &[&str] = &[
-        "This is a preview build of the Windows port: profiles load, the model and microphone can be checked, but input is not wired up yet.",
-        "On Linux, voice-orders is feature complete — see https://sierrasoftworks.github.io/voice-rs/ for the installation guide.",
-    ];
-
     vec![
         CheckResult::ok(
             "Windows needs no drivers, kernel modules or group membership for voice-orders: keyboard output goes through SendInput and the listen hotkey through a low-level keyboard hook.",
         ),
-        CheckResult::failed(
-            "Keyboard output is not implemented in this Windows build yet, so voice-orders cannot press keys for you.",
-            UNFINISHED_ADVICE,
-        ),
-        CheckResult::failed(
-            "The global listen hotkey is not implemented in this Windows build yet, so voice-orders cannot watch for your listen key.",
-            UNFINISHED_ADVICE,
-        ),
+        check_send_input().await,
+        check_keyboard_hook(),
     ]
+}
+
+// ── Check 2 (Windows): pressing a key ───────────────────────────────────────
+
+/// Presses and releases a key nothing is bound to, through the real sink.
+///
+/// The Windows counterpart of creating a virtual keyboard: `SendInput` needs no
+/// device, so the only thing which can go wrong is the thing worth reporting —
+/// Windows refusing to deliver our keystrokes at all, which is what UIPI does to
+/// a program trying to type into a window running at a higher integrity level.
+/// `f24` is the probe for the same reason the Linux side uses it: no keyboard
+/// has one and nothing is listening for it.
+#[cfg(not(target_os = "linux"))]
+async fn check_send_input() -> CheckResult {
+    /// The key we press to prove we can press keys.
+    const PROBE_KEY: &str = "f24";
+
+    let key = keys::from_name(PROBE_KEY).expect("the probe key must be in the key table");
+
+    let mut sink = match PlatformSink::new().await {
+        Ok(sink) => sink,
+        Err(e) => return CheckResult::from_error(&e),
+    };
+
+    if let Err(e) = sink.press(key).await {
+        return CheckResult::from_error(&e);
+    }
+
+    if let Err(e) = sink.release(key).await {
+        return CheckResult::from_error(&e);
+    }
+
+    CheckResult::ok(
+        "Keyboard output works: a test keystroke was accepted by Windows, so voice-orders can press keys for you.",
+    )
+}
+
+// ── Check 3 (Windows): watching the keyboard ────────────────────────────────
+
+/// Installs the low-level keyboard hook the listen hotkey watches with, and
+/// immediately removes it.
+///
+/// Like check 2, this is the real mechanism rather than an inference about it.
+/// The report says plainly that the hook is system-wide and that it observes
+/// rather than consumes, because both are things people reasonably worry about
+/// before letting a program watch their keyboard.
+#[cfg(not(target_os = "linux"))]
+fn check_keyboard_hook() -> CheckResult {
+    match crate::hotkey::probe_hook() {
+        Ok(()) => CheckResult::ok(
+            "The listen hotkey can be watched for: a low-level keyboard hook installs, which sees your hotkey system-wide (including inside fullscreen games) and passes every key on to whatever you are running.",
+        ),
+        Err(e) => CheckResult::from_error(&e),
+    }
 }
 
 // ── Check 1: the device node ────────────────────────────────────────────────
@@ -741,17 +786,20 @@ fn resolve_hotkey_device(device: &str, key: KeyCode) -> Result<String, crate::Er
         .map(|device| device.name().unwrap_or("<unnamed device>").to_string())
 }
 
-/// On Windows there is no per-device hotkey to resolve yet: the low-level
-/// keyboard hook which replaces evdev is system-wide, and it lands in W3.
+/// On Windows there is no per-device hotkey to resolve: the low-level keyboard
+/// hook which replaces evdev watches every keyboard at once, so a configured
+/// hotkey always resolves — and `hotkey.device`, which only ever meant a
+/// `/dev/input/event*` node, is reported as the no-op it is here rather than
+/// quietly ignored (DESIGN.md §"Windows support").
 #[cfg(not(target_os = "linux"))]
-fn resolve_hotkey_device(_device: &str, _key: KeyCode) -> Result<String, crate::Error> {
-    Err(human_errors::user(
-        "This profile configures a listen hotkey, which is not implemented in this Windows build yet.",
-        &[
-            "The global listen hotkey is being added in a later phase of the Windows port; leave the 'hotkey:' block out of your profile to have voice-orders listen continuously instead.",
-            "On Linux, voice-orders is feature complete — see https://sierrasoftworks.github.io/voice-rs/ for the installation guide.",
-        ],
-    ))
+fn resolve_hotkey_device(device: &str, _key: KeyCode) -> Result<String, crate::Error> {
+    Ok(if device == "auto" {
+        "every keyboard on this machine (a system-wide keyboard hook)".to_string()
+    } else {
+        format!(
+            "every keyboard on this machine (a system-wide keyboard hook; 'hotkey.device: {device}' has no effect on Windows and can be left out)"
+        )
+    })
 }
 
 #[cfg(test)]
