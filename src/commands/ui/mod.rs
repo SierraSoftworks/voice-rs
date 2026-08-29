@@ -92,10 +92,14 @@ mod tests {
         assert!(matches!(sink, EventSink::Channel(_)));
         let mut ui = ui.expect("the UI needs the receiving end");
 
-        sink.send(UiEvent::Heard("salute".to_string()));
+        let heard = UiEvent::Heard {
+            text: "salute".to_string(),
+            seq: 1,
+        };
+        sink.send(heard.clone());
         assert_eq!(
             ui.try_recv(),
-            Ok(UiEvent::Heard("salute".to_string())),
+            Ok(heard),
             "everything reported should reach the UI"
         );
     }

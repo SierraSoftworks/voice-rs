@@ -82,4 +82,12 @@ pub struct CommandAction {
     pub command: String,
     /// The assembled output plan to execute.
     pub output: CompiledOutput,
+    /// The sequence number of the utterance this command was heard in. The
+    /// engine numbers utterance slots as the recognition narrator does —
+    /// every `Final` and every `Muted` takes one — so a report can attach the
+    /// command to the transcript line it belongs to even when it fires before
+    /// that utterance's `Final` is narrated (an eager fire) or after a later
+    /// utterance has already been heard (a completion-timeout fire). The
+    /// executor ignores it.
+    pub utterance: u64,
 }

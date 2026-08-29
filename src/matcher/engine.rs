@@ -206,12 +206,19 @@ impl<'a> Engine<'a> {
     /// Assembly happens here — at fire time — because a capture-carrying
     /// command's program only exists once its words are known; there is no
     /// per-command pre-compiled output to reuse.
-    async fn fire(&self, accept: &Accept) -> bool {
+    ///
+    /// `utterance` is the sequence number of the utterance this command was
+    /// heard in, so a report can attach it to the right transcript line even
+    /// when it fires before that utterance's `Final` is narrated (an eager
+    /// fire) or after the next utterance has already been heard (a
+    /// completion-timeout fire).
+    async fn fire(&self, accept: &Accept, utterance: u64) -> bool {
         info!(command = %accept.display, "Matched the command '{}'.", accept.display);
         self.queue
             .send(CommandAction {
                 command: accept.display.clone(),
                 output: CompiledOutput::Keyboard(assemble(&accept.actions, &self.pacing)),
+                utterance,
             })
             .await
             .is_ok()
@@ -444,11 +451,16 @@ impl<'a> Engine<'a> {
     /// Handles a finalized utterance: the full walk, and — when the eager
     /// path already fired from this utterance's partials — reconciliation.
     /// Returns whether the command queue is still open.
+    ///
+    /// `seq` is this utterance's sequence number. Commands the walk fires
+    /// belong to it — except a flushed pending command (the position-0 seed),
+    /// which was spoken in, and is reported against, the previous utterance.
     async fn on_final(
         &self,
         state: &mut MatchState<'a>,
         eager: &mut Option<EagerContext<'a>>,
         utterance: &Utterance,
+        seq: u64,
     ) -> bool {
         // The walk origin: an open eager context pins it (this utterance's
         // partials already walked from there, and may have fired), otherwise
@@ -487,7 +499,7 @@ impl<'a> Engine<'a> {
             // are ever combined, which config validation currently forbids.)
             if let Some(accept) = &passed
                 && context.as_ref().is_none_or(|ctx| ctx.fired.is_empty())
-                && !self.fire(accept).await
+                && !self.fire(accept, seq - 1).await
             {
                 return false;
             }
@@ -543,9 +555,12 @@ impl<'a> Engine<'a> {
             && already.iter().zip(&matched).all(|(a, b)| same_match(a, b))
         {
             // What the partials fired is a prefix of what the utterance says
-            // (trivially so with no eager context): fire the remainder.
+            // (trivially so with no eager context): fire the remainder. A
+            // match at position 0 is the flushed pending seed — a command the
+            // *previous* utterance spoke, so it reports against that one.
             for matched in &matched[already.len()..] {
-                if !self.fire(&matched.accept).await {
+                let of = if matched.position == 0 { seq - 1 } else { seq };
+                if !self.fire(&matched.accept, of).await {
                     return false;
                 }
             }
@@ -688,11 +703,17 @@ impl<'a> Engine<'a> {
 
     /// Handles a partial hypothesis with eager matching on. Returns whether
     /// the command queue is still open.
+    ///
+    /// `closed` is the count of utterances closed so far (finals and mutes):
+    /// the utterance these partials belong to is `closed + 1` — its own
+    /// `Final` has not been counted yet — while a flushed pending command
+    /// (the position-0 seed) belongs to the previous one, `closed`.
     async fn on_eager_partial(
         &self,
         state: &mut MatchState<'a>,
         eager: &mut Option<EagerContext<'a>>,
         text: &str,
+        closed: u64,
     ) -> bool {
         let words = words_of(text);
 
@@ -768,8 +789,15 @@ impl<'a> Engine<'a> {
         for matched in certain {
             if !ctx.fired.iter().any(|fired| same_match(fired, &matched)) {
                 let accept = matched.accept.clone();
+                // Position 0 is the flushed pending seed: a command the
+                // previous utterance spoke; everything else is this one's.
+                let of = if matched.position == 0 {
+                    closed
+                } else {
+                    closed + 1
+                };
                 ctx.fired.push(matched);
-                if !self.fire(&accept).await {
+                if !self.fire(&accept, of).await {
                     return false;
                 }
             }
@@ -841,6 +869,13 @@ pub async fn engine_task(
     // The eager path's open utterance, when there is one. See
     // [`EagerContext`] for the invariant tying it to `state`.
     let mut eager: Option<EagerContext> = None;
+    // How many utterance slots have closed: every `Final` *and* every `Muted`
+    // takes one. The recognition narrator counts the very same stream the
+    // same way, which is what lets a fired command's `utterance` stamp meet
+    // the narrated `heard:` line it belongs to — mutes must count too, or an
+    // utterance muted away after an eager fire would hand its number to the
+    // next one. The open utterance (partials only so far) is `closed + 1`.
+    let mut closed: u64 = 0;
 
     loop {
         // At most one deadline is armed at a time: an open eager context's
@@ -882,13 +917,17 @@ pub async fn engine_task(
             }
             event = events.recv() => match event {
                 Some(RecognitionEvent::Final(utterance)) => {
-                    if !engine.on_final(&mut state, &mut eager, &utterance).await {
+                    closed += 1;
+                    if !engine.on_final(&mut state, &mut eager, &utterance, closed).await {
                         return Ok(());
                     }
                 }
                 Some(RecognitionEvent::Partial(text)) => {
                     if engine.options.eager {
-                        if !engine.on_eager_partial(&mut state, &mut eager, &text).await {
+                        if !engine
+                            .on_eager_partial(&mut state, &mut eager, &text, closed)
+                            .await
+                        {
                             return Ok(());
                         }
                     } else if let MatchState::Pending { walk, deadline, .. } = &mut state {
@@ -937,6 +976,7 @@ pub async fn engine_task(
                     }
                     state = MatchState::Idle;
                     eager = None;
+                    closed += 1;
                 }
                 None => {
                     // The recognizer closed the events channel: the pipeline
@@ -954,13 +994,13 @@ pub async fn engine_task(
                         if let Some(accept) = &ctx.passed
                             && ctx.fired.is_empty()
                         {
-                            engine.fire(accept).await;
+                            engine.fire(accept, closed).await;
                         }
                         if ctx.resting.is_some() {
                             debug!("Dropping an unconfirmed partial hypothesis: the recognition channel closed.");
                         }
                     } else if let MatchState::Pending { accept, .. } = state {
-                        engine.fire(&accept).await;
+                        engine.fire(&accept, closed).await;
                     }
                     debug!("The recognition channel was closed, stopping the matcher.");
                     return Ok(());
@@ -985,13 +1025,14 @@ pub async fn engine_task(
                         ctx.committed = rest.position;
                         ctx.origin = engine.automaton.walk();
                         ctx.passed = None;
-                        if !engine.fire(&rest.accept).await {
+                        // The open utterance's Final has not been counted yet.
+                        if !engine.fire(&rest.accept, closed + 1).await {
                             return Ok(());
                         }
                     }
                 } else if let MatchState::Pending { accept, .. } =
                     std::mem::replace(&mut state, MatchState::Idle)
-                    && !engine.fire(&accept).await
+                    && !engine.fire(&accept, closed).await
                 {
                     // The speaker paused long enough: the pending command is
                     // the one they meant.
@@ -2047,6 +2088,86 @@ mod tests {
 
         h.hear_final("deploy sentry").await;
         assert_eq!(h.fired(), vec!["DeploySentry"]);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commands_are_stamped_with_the_utterance_they_were_heard_in() {
+        // The report-side contract: every fired command names its utterance's
+        // slot, numbered exactly as the recognition narrator numbers Finals
+        // (and mutes), so the transcript can attach each command to the line
+        // it belongs to — an eager fire arrives *before* its utterance's
+        // Final, a completion-timeout fire *after* the next utterance.
+        let mut h = Harness::start_with(arsenal(), eager_options());
+
+        // Utterance 1: "autocannon", spoken and left to the timer — the fire
+        // happens before Final #1 is ever seen, and still belongs to slot 1.
+        h.hear_partial("autocannon").await;
+        h.advance(TIMEOUT).await;
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            (actions[0].command.as_str(), actions[0].utterance),
+            ("Autocannon", 1)
+        );
+        h.hear_final("autocannon").await;
+        h.nothing_fired();
+
+        // Utterance 2: an eager stability fire, again ahead of its Final.
+        h.hear_partial("deploy sentry").await;
+        h.advance(EAGER_DELAY).await;
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            (actions[0].command.as_str(), actions[0].utterance),
+            ("DeploySentry", 2)
+        );
+        h.hear_final("deploy sentry").await;
+        h.nothing_fired();
+
+        // Utterance 3 goes Pending; utterance 4 flushes it. The flushed
+        // command was *spoken* in utterance 3 and reports against it, while
+        // utterance 4's own command reports against 4.
+        h.hear_final("autocannon").await;
+        h.hear_final("reload").await;
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert_eq!(
+            (actions[0].command.as_str(), actions[0].utterance),
+            ("Autocannon", 3)
+        );
+        assert_eq!(
+            (actions[1].command.as_str(), actions[1].utterance),
+            ("Reload", 4)
+        );
+        h.no_warnings();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mute_consumes_an_utterance_slot() {
+        // An utterance muted away after an eager fire never gets a Final, but
+        // the mute itself closes its slot — on the narrator's side just as
+        // here — so the next utterance cannot inherit its number (and with it
+        // the muted utterance's eagerly fired command).
+        let mut h = Harness::start_with(arsenal(), eager_options());
+
+        h.hear_partial("deploy sentry reload").await; // certain fire mid-utterance
+        let actions = h.fired_actions();
+        assert_eq!(
+            (actions[0].command.as_str(), actions[0].utterance),
+            ("DeploySentry", 1)
+        );
+
+        h.mute().await; // slot 1 closes without a Final
+
+        h.hear_final("reload").await;
+        let actions = h.fired_actions();
+        assert_eq!(
+            (actions[0].command.as_str(), actions[0].utterance),
+            ("Reload", 2),
+            "the post-mute utterance takes the next slot"
+        );
         h.shutdown().await;
     }
 

@@ -818,7 +818,13 @@ mod tests {
             hotkey: "always listening".to_string(),
             ..overview()
         });
-        app.record_at(at(), UiEvent::Heard("salute".to_string()));
+        app.record_at(
+            at(),
+            UiEvent::Heard {
+                text: "salute".to_string(),
+                seq: 1,
+            },
+        );
 
         let footer = row(&screen(&app, 90, 12), 11);
         assert!(
@@ -832,12 +838,19 @@ mod tests {
         let mut app = App::new(overview());
         // The listening change belongs to the footer, not the log.
         app.record_at(at(), UiEvent::Listening(true));
-        app.record_at(at(), UiEvent::Heard("deploy the autocannon".to_string()));
+        app.record_at(
+            at(),
+            UiEvent::Heard {
+                text: "deploy the autocannon".to_string(),
+                seq: 1,
+            },
+        );
         app.record_at(
             at(),
             UiEvent::Matched {
                 name: "Autocannon".to_string(),
                 plan: "leftctrl+4".to_string(),
+                utterance: Some(1),
             },
         );
         app.record_at(
@@ -891,7 +904,13 @@ mod tests {
     fn test_the_body_shows_only_the_newest_events_it_has_room_for() {
         let mut app = App::new(overview());
         for i in 0..50 {
-            app.record_at(at(), UiEvent::Heard(format!("utterance {i}")));
+            app.record_at(
+                at(),
+                UiEvent::Heard {
+                    text: format!("utterance {i}"),
+                    seq: i + 1,
+                },
+            );
         }
 
         // 12 rows: 2 of header, 2 rules and a footer leave 7 lines of log.
@@ -926,6 +945,7 @@ mod tests {
             UiEvent::Matched {
                 name: "Autocannon".to_string(),
                 plan: "4".to_string(),
+                utterance: None,
             },
         );
 
@@ -942,7 +962,13 @@ mod tests {
     fn test_a_tiny_terminal_still_renders() {
         // Nothing here may panic on an area the layout cannot honour.
         let mut app = App::new(overview());
-        app.record_at(at(), UiEvent::Heard("salute".to_string()));
+        app.record_at(
+            at(),
+            UiEvent::Heard {
+                text: "salute".to_string(),
+                seq: 1,
+            },
+        );
 
         for (width, height) in [(1, 1), (4, 3), (20, 4), (200, 2)] {
             screen(&app, width, height);
@@ -1021,7 +1047,10 @@ mod tests {
         let quit = CancellationToken::new();
 
         events_tx
-            .send(UiEvent::Heard("salute".to_string()))
+            .send(UiEvent::Heard {
+                text: "salute".to_string(),
+                seq: 1,
+            })
             .expect("the UI should be listening");
 
         let ui = tokio::spawn(loop_with(events, keys, quit.clone()));

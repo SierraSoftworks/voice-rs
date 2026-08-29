@@ -951,11 +951,21 @@ entries, because they say something about a command which already fired rather t
 utterance. Listening-state changes are **not** logged at all: the footer shows the live state, which
 is both fewer lines and more current.
 
-Matches are correlated to utterances by order alone: a match belongs to the **oldest** recognition
-nothing has matched yet, because the completion timeout means a later utterance can be logged before
-an earlier one's match fires. The cost is pinned by a test — an utterance which matches nothing,
-followed by one which matches, resolves the wrong way round. Telling those two sequences apart would
-need the matcher to say which utterance a command came from, which the event stream does not carry.
+Matches are correlated to utterances by **sequence**, not by order: the matcher stamps every
+`CommandAction` with the slot of the utterance it was heard in, and the recognition narrator stamps
+every `heard:` event the same way (both count the very same event stream — every `Final` *and*
+every `Muted` closes a slot, so an utterance muted away after an eager fire cannot hand its number
+to the next one). The log attaches each match to the entry with the matching sequence: a
+completion-timeout fire lands on its own utterance however many lines have been logged since, an
+eager fire — which arrives *before* its utterance's `Final` — is **held** and attached when that
+entry appears, and a held match whose slot a mute consumed is logged on its own line once the next
+recognition proves it was skipped. Field testing motivated this: eager fires used to land on the
+previous utterance's line (painting a partial as a completed command and cascading every later
+match one entry up), because the earlier order-alone rule attached a match to the oldest
+unmatched recognition. The caveat that rule carried — an unmatched utterance stealing the next
+utterance's match, pinned as a known cost — disappears entirely: the stamp says which utterance a
+command came from, so the two sequences the old rule could not tell apart now render correctly,
+and that too is pinned by tests.
 
 **Failures are visible.** A `DecodingState::Failed` from the recognizer becomes
 `RecognitionEvent::Failed`, coalesced to one event per run of failures (a decoder which cannot decode

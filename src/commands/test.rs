@@ -235,6 +235,7 @@ async fn report_task(
         events.send(UiEvent::Matched {
             name: action.command.clone(),
             plan: render_plan(&action.output),
+            utterance: Some(action.utterance),
         });
 
         if matches!(interrupt, Interrupt::Never) {
@@ -323,6 +324,7 @@ mod tests {
             .send(CommandAction {
                 command: "Salute".to_string(),
                 output: plan("{ x }"),
+                utterance: 1,
             })
             .await
             .expect("the reporter should be listening");
@@ -392,6 +394,7 @@ mod tests {
                 .send(CommandAction {
                     command: command.to_string(),
                     output: plan("{ hold(w), wait(1h), release(w) }"),
+                    utterance: 1,
                 })
                 .await
                 .expect("the reporter should be listening");

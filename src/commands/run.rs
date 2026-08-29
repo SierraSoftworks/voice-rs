@@ -738,8 +738,19 @@ async fn narrate_recognition(
     narration: Narration,
     sink: EventSink,
 ) {
+    // Utterance slots, counted exactly as the matcher counts them: every
+    // Final *and* every Muted closes one. This is the narrator's half of the
+    // correlation contract — the sequence stamped on a `heard:` entry here is
+    // the sequence the matcher stamps on the commands that utterance fired,
+    // which is how the terminal UI reunites them however far apart they land
+    // (an eager fire precedes its own Final; a completion-timeout fire trails
+    // the next utterance).
+    let mut closed: u64 = 0;
     while let Some(event) = events.recv().await {
-        if let Some(reported) = narration_event(&event, narration) {
+        if matches!(event, RecognitionEvent::Final(_) | RecognitionEvent::Muted) {
+            closed += 1;
+        }
+        if let Some(reported) = narration_event(&event, narration, closed) {
             sink.send(reported);
         }
 
@@ -750,13 +761,17 @@ async fn narrate_recognition(
 }
 
 /// The report one recognition event deserves, or [`None`] when it is noise the
-/// user has not asked to see.
-fn narration_event(event: &RecognitionEvent, narration: Narration) -> Option<UiEvent> {
+/// user has not asked to see. `seq` is the utterance slot the event closed,
+/// meaningful for `Final`s.
+fn narration_event(event: &RecognitionEvent, narration: Narration, seq: u64) -> Option<UiEvent> {
     match (event, narration) {
         (_, Narration::Silent) => None,
         // A finalized utterance is the whole point: it is what the matcher gets
         // to work with, so it is reported whenever anything is reported at all.
-        (RecognitionEvent::Final(utterance), _) => Some(UiEvent::Heard(utterance.text.clone())),
+        (RecognitionEvent::Final(utterance), _) => Some(UiEvent::Heard {
+            text: utterance.text.clone(),
+            seq,
+        }),
         // A recognizer which cannot decode is reported as loudly as an
         // utterance: without it, a session where nothing works looks exactly
         // like one where nobody spoke. The recognizer thread has already
@@ -793,6 +808,7 @@ async fn narrate_commands(
         events.send(UiEvent::Matched {
             name: action.command.clone(),
             plan: super::ui::render_plan(&action.output),
+            utterance: Some(action.utterance),
         });
 
         if executor.send(action).await.is_err() {
@@ -1826,7 +1842,7 @@ mod tests {
         // Asserted through the plain rendering, because these exact lines are
         // `test`'s piped output — the terminal UI draws the same text.
         assert_eq!(
-            narration_event(&event, narration)
+            narration_event(&event, narration, 1)
                 .map(|reported| reported.plain_line())
                 .as_deref(),
             expected,
@@ -1895,6 +1911,7 @@ mod tests {
             .send(CommandAction {
                 command: "Autocannon".to_string(),
                 output: output.clone(),
+                utterance: 1,
             })
             .await
             .expect("the reporter should be listening");
@@ -1907,6 +1924,7 @@ mod tests {
                 // The plan a person reads, not the compiled event list — and
                 // the same rendering `test` reports.
                 plan: "leftctrl+4".to_string(),
+                utterance: Some(1),
             })
         );
 
