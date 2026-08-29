@@ -10,7 +10,7 @@
 # private building blocks. A rule without a trailing `{ ... }` action block
 # implicitly propagates its children's commands. Named captures (`:name`)
 # collect their term's commands, spliced with `name...`. In action blocks a
-# bare chord ("m", "1", "shift+f1") is a press; `hold(..)`, `release(..)` and
+# bare chord ("m", "1", "leftshift+f1") is a press; `hold(..)`, `release(..)` and
 # `wait(..)` cover the uncommon cases.
 #
 # NOTE: this profile uses the v2 inline-grammar format, which is designed but
@@ -57,11 +57,11 @@ grammar: |
   // spoken order.
   squad_selection = squad_number ("and"? squad_number)[0..9]
 
-  team_colour = ( "red"    { shift+f1 }
-                | "green"  { shift+f2 }
-                | "blue"   { shift+f3 }
-                | "yellow" { shift+f4 }
-                | "white"  { shift+f5 } )
+  team_colour = ( "red"    { leftshift+f1 }
+                | "green"  { leftshift+f2 }
+                | "blue"   { leftshift+f3 }
+                | "yellow" { leftshift+f4 }
+                | "white"  { leftshift+f5 } )
 
   // NOTE: Articulate only accepts "team red"; the trailing "red team" order is
   // our addition.
@@ -71,7 +71,7 @@ grammar: |
   // everyone), the first word of team_selection ("team red"), and an optional
   // word of the Assign object ("assign to team red"). The matcher must keep
   // every reading alive until a later word or the completion timeout settles it.
-  subject_all = "all" | "everyone" | "team" | "squad" { tilde }
+  subject_all = "all" | "everyone" | "team" | "squad" { grave }
 
   subject = subject_all | squad_selection | team_selection
 
