@@ -336,6 +336,9 @@ fn lint_output(plan: &[KeyEvent], findings: &mut Vec<Finding>) {
                     "this command releases '{key}' without ever pressing it — check the 'events:' list for a missing 'down: {key}'"
                 ))),
             },
+            // `release(*)` discharges every outstanding hold, so nothing which
+            // went down before it is left dangling.
+            KeyEvent::ReleaseAll => held.clear(),
             KeyEvent::Wait(_) => {}
         }
     }
