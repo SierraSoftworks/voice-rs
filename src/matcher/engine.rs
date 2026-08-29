@@ -2007,4 +2007,190 @@ mod tests {
         h.nothing_fired();
         h.shutdown().await;
     }
+
+    // --- Grammar v2 specifics ---------------------------------------------
+    //
+    // Everything above re-proves the v1 contract; these tests cover what the
+    // trie never could — captures, splices, shared subject rules, and the
+    // hypothesis-set failure modes.
+
+    use crate::output::assembly::ActionItem;
+    use crate::output::keys;
+
+    /// A chord press: `press("leftshift+f1")`.
+    fn press(chord: &str) -> ActionItem {
+        ActionItem::Press(
+            chord
+                .split('+')
+                .map(|name| keys::from_name(name).expect("a known key"))
+                .collect(),
+        )
+    }
+
+    /// The plan `items` assemble to under the test pacing.
+    fn keyboard(items: &[ActionItem]) -> CompiledOutput {
+        CompiledOutput::Keyboard(assemble(items, &pacing()))
+    }
+
+    /// The canonical Arma automaton, compiled once — the fixture the design
+    /// says must load.
+    fn arma() -> Automaton {
+        use std::sync::OnceLock;
+        static ARMA: OnceLock<Automaton> = OnceLock::new();
+        ARMA.get_or_init(|| compile(&crate::grammar::v2::fixtures::arma_source()))
+            .clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn captures_assemble_different_outputs_for_different_spoken_words() {
+        // The assign_colour pattern: one command whose keys depend on which
+        // word was spoken, assembled at fire time — there is no per-command
+        // pre-compiled output a trie could have carried.
+        let mut h = Harness::start(compile(
+            r#"
+            colour = ( "red" { 1 } | "blue" { 3 } )
+            Assign = "assign" ("team"? colour):c { 9, c... }
+            "#,
+        ));
+
+        h.hear_final("assign red").await;
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Assign(red)");
+        assert_eq!(actions[0].output, keyboard(&[press("9"), press("1")]));
+
+        // The same command, a different object, a different plan — and the
+        // optional "team" contributes words to the display but no presses.
+        h.hear_final("assign team blue").await;
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Assign(team blue)");
+        assert_eq!(actions[0].output, keyboard(&[press("9"), press("3")]));
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arma_subject_led_command_splices_the_subject_first() {
+        // "two three advance": the shared subject rule's presses (F2, F3)
+        // land before the menu presses the action block adds.
+        let mut h = Harness::start(arma());
+
+        h.hear_final("two three advance").await;
+
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Advance");
+        assert_eq!(
+            actions[0].output,
+            keyboard(&[press("f2"), press("f3"), press("1"), press("2")])
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arma_watch_splices_captures_around_the_menu_presses() {
+        // Watch's block reorders its captures — subject, menu, a beat for the
+        // menu to open, then the direction — which spoken order alone could
+        // never produce.
+        let mut h = Harness::start(arma());
+
+        h.hear_final("two watch east").await;
+
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Watch(two, east)");
+        assert_eq!(
+            actions[0].output,
+            keyboard(&[
+                press("f2"),
+                press("3"),
+                press("8"),
+                ActionItem::Wait(Duration::from_millis(20)),
+                press("3"),
+            ])
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arma_select_bare_subject_fires_only_via_the_completion_timeout() {
+        // Every subject is an ambiguous prefix of every subject-led command,
+        // so a bare "two" only ever fires Select by waiting out the timeout.
+        let mut h = Harness::start(arma());
+
+        h.hear_final("two").await;
+        h.nothing_fired();
+
+        h.advance(TIMEOUT - Duration::from_millis(1)).await;
+        h.nothing_fired();
+        h.advance(Duration::from_millis(1)).await;
+
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Select");
+        assert_eq!(actions[0].output, keyboard(&[press("f2")]));
+
+        // Continued in time, the subject-led command supersedes Select
+        // entirely.
+        h.hear_final("two").await;
+        h.hear_final("advance").await;
+        assert_eq!(h.fired(), vec!["Advance"]);
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synonym_rules_with_identical_keys_fire_the_first_defined_silently() {
+        // Two published rules accepting the same words with the same keys are
+        // deliberate synonyms — load-time duplicate detection lets them
+        // collapse, and the engine fires the first-defined one without
+        // warning anybody.
+        let mut h = Harness::start(compile(
+            r#"
+            Alpha = "go" { 1 }
+            Beta = "go" { 1 }
+            "#,
+        ));
+
+        h.hear_final("go").await;
+
+        assert_eq!(h.fired(), vec!["Alpha"]);
+        h.no_warnings();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hypothesis_overflow_warns_once_and_drops_the_utterance() {
+        // Ten "x"s multiply into over 2^10 readings — past MAX_HYPOTHESES —
+        // without any pair of them colliding on an accepted phrase, so the
+        // grammar loads and the overflow only exists at runtime. The walk
+        // goes dead, the utterance drops, and the user hears about it once.
+        let mut h = Harness::start(compile(
+            r#"
+            first = "x" { 1 }
+            second = "x" { 2 }
+            seg = ( first | second )
+            TenOne = seg[10] "one" { f1 }
+            TenTwo = seg[10] "two" { f2 }
+            "#,
+        ));
+
+        let utterance = format!("{} one", ["x"; 10].join(" "));
+        h.hear_final(&utterance).await;
+
+        h.nothing_fired();
+        let warnings = h.warnings();
+        assert_eq!(warnings.len(), 1, "one overflow, one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("possible readings"),
+            "the warning should explain the overflow: {}",
+            warnings[0]
+        );
+
+        // The engine is still healthy: a small utterance matches normally.
+        h.hear_final("x one").await;
+        h.nothing_fired(); // too few x's — an incomplete phrase, dropped
+        h.shutdown().await;
+    }
 }
