@@ -5,6 +5,7 @@
 // that lands nothing in the binary reaches them.
 #![allow(dead_code)]
 
+pub mod assembly;
 pub mod keys;
 
 // The virtual keyboard is `/dev/uinput` on Linux and `SendInput` on Windows.
@@ -843,6 +844,117 @@ mod tests {
                 SinkEvent::Release(w),
             ],
             "the panic command releases the hold, and the shutdown finds nothing left to free"
+        );
+    }
+
+    // --- Assembled grammar plans, played end to end -----------------------
+
+    /// Plays one assembled action program and reports what the keyboard saw
+    /// and when, so the pacing rules are asserted against the real executor
+    /// rather than against [`assembly::assemble`]'s output alone.
+    async fn play_assembled(items: &[assembly::ActionItem]) -> (Vec<SinkEvent>, Vec<Duration>) {
+        let pacing = assembly::Pacing {
+            duration: Duration::from_millis(30),
+            interval: Duration::from_millis(25),
+        };
+
+        let (tx, rx) = mpsc::channel(4);
+        let sink = FakeSink::default();
+
+        tx.send(action("assembled", assembly::assemble(items, &pacing)))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let origin = Instant::now();
+        executor(rx, sink.clone(), CancellationToken::new(), Interrupt::Never)
+            .await
+            .unwrap();
+
+        (sink.keys(), sink.key_offsets(origin))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn assembled_presses_are_separated_by_the_interval() {
+        let (a, b) = (key("a"), key("b"));
+        let (events, offsets) = play_assembled(&[
+            assembly::ActionItem::Press(vec![a]),
+            assembly::ActionItem::Press(vec![b]),
+        ])
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                SinkEvent::Press(a),
+                SinkEvent::Release(a),
+                SinkEvent::Press(b),
+                SinkEvent::Release(b),
+            ]
+        );
+        assert_eq!(
+            offsets,
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(30),
+                Duration::from_millis(55),
+                Duration::from_millis(85),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_assembled_wait_replaces_the_interval() {
+        let (a, b) = (key("a"), key("b"));
+        let (_, offsets) = play_assembled(&[
+            assembly::ActionItem::Press(vec![a]),
+            assembly::ActionItem::Wait(Duration::from_millis(20)),
+            assembly::ActionItem::Press(vec![b]),
+        ])
+        .await;
+
+        assert_eq!(
+            offsets,
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(30),
+                // 20ms after the first press let go — the interval it replaced
+                // is not added on top of it.
+                Duration::from_millis(50),
+                Duration::from_millis(80),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_assembled_hold_spans_the_press_inside_it() {
+        let (shift, one) = (key("leftshift"), key("1"));
+        let (events, offsets) = play_assembled(&[
+            assembly::ActionItem::Hold(vec![shift]),
+            assembly::ActionItem::Press(vec![one]),
+            assembly::ActionItem::Release(vec![shift]),
+        ])
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                SinkEvent::Press(shift),
+                SinkEvent::Press(one),
+                SinkEvent::Release(one),
+                SinkEvent::Release(shift),
+            ],
+            "the explicit release balances the hold, so the shutdown finds nothing to free"
+        );
+        assert_eq!(
+            offsets,
+            vec![
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::from_millis(30),
+                Duration::from_millis(30),
+            ],
+            "a hold and a release are immediate; only the press is paced"
         );
     }
 
