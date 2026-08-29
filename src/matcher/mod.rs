@@ -14,6 +14,8 @@
 //! `Final` is reconciled against what already fired.
 
 pub mod engine;
+#[cfg(test)]
+mod recorded;
 
 use std::sync::Arc;
 use std::time::Duration;
