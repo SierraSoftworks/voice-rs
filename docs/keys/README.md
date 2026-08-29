@@ -1,8 +1,8 @@
 # Key Reference
 
 Every key name voice-orders accepts is listed on this page. There are **121** of them, and they are the same names
-everywhere: in a command's [`keys:`](../profiles/README.md#keys) list, in an [`events:`](../profiles/README.md#events)
-step, and in [`hotkey.key`](../profiles/README.md#hotkey-key).
+everywhere: in a grammar rule's [action block](../grammar/README.md#action-blocks), inside `hold(..)` and `release(..)`,
+and in [`hotkey.key`](../profiles/README.md#hotkey-key).
 
 The naming rule is simple: **the lowercase evdev key name with its `KEY_` prefix removed**. `KEY_LEFTCTRL` becomes
 `leftctrl`, `KEY_F5` becomes `f5`, `KEY_KP1` becomes `kp1`. If you have ever read `evtest` output, you already know
@@ -12,24 +12,27 @@ Names are matched exactly and are case-sensitive: `LEFTCTRL` and `leftcontrol` a
 
 ## Chords
 
-A `keys:` entry may be a single key or a **chord** — several key names joined with `+`:
+An action may be a single key or a **chord** — several key names joined with `+`:
 
-```yaml{3,7}
-commands:
-  - phrase: open [the] terminal
-    keys: ["leftctrl+leftalt+t"]
+```yaml{3,5}
+grammar: |
+  Terminal = "open" "the"? "terminal" { leftctrl+leftalt+t }
 
-  - phrase: cycle weapons
-    keys: ["1", "2", "3"]
+  CycleWeapons = "cycle weapons" { 1, 2, 3 }
 ```
 
-A chord goes **down in the order written**, is held for the command's `duration`, then comes **up in reverse order**,
-so modifiers outlive the key they modify. Spaces around the `+` are a formatting accident rather than an error, so
-`"leftctrl + t"` parses the same as `"leftctrl+t"`. An empty segment — `"leftctrl+"`, `"+t"`, `"a++b"` — is a load
-error.
+A chord goes **down in the order written**, is held for
+[`defaults.duration`](../profiles/README.md#defaults-duration), then comes **up in reverse order**, so modifiers
+outlive the key they modify. Consecutive presses are separated by
+[`defaults.interval`](../profiles/README.md#defaults-interval).
 
-Chords are only meaningful in the `keys:` shorthand. The `events:` form presses and releases keys individually, which
-is how you express a chord with unusual timing.
+`hold(..)` and `release(..)` take a chord too, and are how you express a press whose two edges belong to different
+moments:
+
+```yaml{2}
+grammar: |
+  Salute = "salute" { hold(x), wait(750ms), release(x) }
+```
 
 ::: warning
 [`hotkey.key`](../profiles/README.md#hotkey-key) takes a **single key name**, not a chord. A `+` there is a load error.
@@ -66,7 +69,8 @@ The number row above the letters. The keypad digits are [separate keys](#keypad)
 differently.
 
 ::: tip
-YAML will read a bare `4` as a number, so quote digit keys: `keys: ["4"]`, not `keys: [4]`.
+Digit keys need no quoting inside a grammar action block — `{ 4 }` is the key labelled 4, because the block is grammar
+text rather than YAML.
 :::
 
 ## Function keys

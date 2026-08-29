@@ -127,7 +127,7 @@ The Windows build of libvosk is frozen at **0.3.45**, which predates Vosk's endp
 - [`recognition.silence`](../profiles/README.md#recognition-silence) has no effect: Vosk's stock trailing-silence
   behaviour decides when an utterance has ended. voice-orders says so once, at startup — *"this libvosk build does not
   support endpointer tuning; recognition.silence has no effect"* — rather than letting the option quietly do nothing.
-- Commands still fire from partial results the moment the phrase is unambiguous, so what you wait for is eager
+- Commands still fire from partial results the moment the match is unambiguous, so what you wait for is eager
   matching's latency and not the full end-of-utterance one. It is the reason the frozen library is liveable.
 :::
 
@@ -180,7 +180,7 @@ would fire your macros off unrelated chatter.
 
 | Model | Size | Dynamic graph | Notes |
 |---|---|---|---|
-| `vosk-model-en-us-0.22-lgraph` | ~128 MB | yes | **The recommended default.** Its much larger vocabulary means far fewer of your phrase words come back unknown from `validate`, and it ships a readable `graph/words.txt`, so `validate` can suggest the nearest words the model does know. |
+| `vosk-model-en-us-0.22-lgraph` | ~128 MB | yes | **The recommended default.** Its much larger vocabulary means far fewer of your grammar's words come back unknown from `validate`, and it ships a readable `graph/words.txt`, so `validate` can suggest the nearest words the model does know. |
 | `vosk-model-small-en-us-0.15` | ~40 MB | yes | The lightweight option, and a fine choice if download size or memory matters. Its vocabulary is smaller, and it does not ship a readable word list — `validate` will still offer spelling fixes and compound splits, but not nearest-word suggestions. |
 | `vosk-model-en-us-0.22` | ~1.8 GB | **no** | Not usable. It is a static-graph model, so it cannot be constrained to a grammar. |
 
@@ -206,9 +206,8 @@ That leaves you with `~/.local/share/vosk/vosk-model-en-us-0.22-lgraph/`, which 
 name: Deep Rock Galactic
 model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
 
-commands:
-  - phrase: salute
-    keys: ["x"]
+grammar: |
+  Salute = "salute" { x }
 ```
 
 A leading `~` is expanded against `$HOME` when the profile loads, so a profile written this way can be shared between

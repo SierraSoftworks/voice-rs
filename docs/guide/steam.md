@@ -94,7 +94,7 @@ voice-orders run /home/you/profiles/elite.yaml -- %command%
 
 There is no runtime profile switching: one `voice-orders run` listens for exactly one profile's commands for its whole
 life. That is deliberate — the recognition grammar is compiled from the profile at startup, and a grammar containing
-only the phrases *this* game can act on is what makes recognition as accurate as it is.
+only what *this* game can act on is what makes recognition as accurate as it is.
 
 You can also point a launch option straight at a profile published online, which is a nice way to use a profile someone
 else maintains:
@@ -123,7 +123,7 @@ leave the `hotkey:` block out entirely.
 
 If that is not it, quit the game and run [`voice-orders test`](../profiles/README.md#rehearsing-a-profile) on the same
 profile: it prints every utterance it hears, every command it matches, and every change of listening state, which
-settles whether the problem is the microphone, the hotkey, or the phrases.
+settles whether the problem is the microphone, the hotkey, or the grammar.
 
 ### The game does not launch at all
 

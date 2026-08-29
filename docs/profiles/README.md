@@ -4,15 +4,15 @@ A profile is a single, self-contained YAML file describing what voice-orders sho
 when it hears it. Profiles are portable: they can be kept in a repository, shared as a Gist, and loaded straight from an
 `https://` URL.
 
-Everything a profile can say is checked when it loads. Phrases are parsed, key names are resolved, durations are parsed,
-and unknown fields are rejected — so a typo is a load-time error with a precise location, never a command which
-mysteriously never fires.
+Everything a profile can say is checked when it loads. The grammar is parsed and statically analyzed, key names are
+resolved, durations are parsed, and unknown fields are rejected — so a typo is a load-time error with a precise
+location, never a command which mysteriously never fires.
 
 ## Example
 
-```yaml{2,10-12,14,16-18,21-22}
+```yaml{2,7-10,12,14-16,20-28}
 name: Deep Rock Galactic
-model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
+model: ~/.local/share/vosk/vosk-model-small-en-us-0.15
 
 audio:
   device: default
@@ -28,6 +28,36 @@ defaults:
   duration: 30ms
   interval: 25ms
 
+# TitleCase rules are published as speakable commands; lowercase rules are
+# private building blocks. `//` comments run to the end of the line.
+grammar: |
+  // "deploy the autocannon", "auto cannon sentry", ... — `?` marks a word you
+  // may leave unsaid, `( | )` groups the alternatives, and the `{ ... }` block
+  // says what a match presses.
+  Autocannon = "deploy"? "the"? ("autocannon" | "auto cannon") "sentry"? { 4 }
+
+  Terminal = "open" "the"? "terminal" { leftctrl+leftalt+t }
+
+  Salute = "salute" { hold(x), wait(750ms), release(x) }
+```
+
+`voice-orders new <path>` writes a profile just like this one, with every option present as a comment and its default
+value shown, so the file you start from doubles as a reference.
+
+::: warning Upgrading a profile written for an earlier release
+The `commands:` list is **gone**, along with its `phrase:`, `keys:`, `events:`, `duration:` and `interval:` options and
+the old `[optional]` / `{alternate, choices}` phrase DSL. Commands are written as [`grammar:`](#grammar) rules instead.
+This is a breaking change, and there is no compatibility mode: loading an old profile fails immediately, naming the
+field it could not understand.
+
+```
+unknown field `commands`, expected one of `name`, `model`, `audio`, `hotkey`,
+`completion_timeout`, `recognition`, `defaults`, `grammar` at line 2 column 1
+```
+
+The translation is mechanical. Before:
+
+```yaml
 commands:
   - name: Deploy the autocannon
     phrase: deploy [the] {autocannon, auto cannon} [sentry]
@@ -41,8 +71,21 @@ commands:
       - up: x
 ```
 
-`voice-orders new <path>` writes a profile just like this one, with every option present as a comment and its default
-value shown, so the file you start from doubles as a reference.
+After:
+
+```yaml
+grammar: |
+  Autocannon = "deploy"? "the"? ("autocannon" | "auto cannon") "sentry"? { 4 }
+  Salute = "salute" { hold(x), wait(750ms), release(x) }
+```
+
+Rule by rule: the command's `name:` becomes the rule's TitleCase name, `[optional]` becomes `"word"?`,
+`{alternate, choices}` becomes `("either" | "or")`, a `keys:` list becomes a comma-separated action block, and an
+`events:` list becomes `hold(..)`, `wait(..)` and `release(..)` in the same block. Per-command `duration:` and
+`interval:` overrides have no replacement — [`defaults`](#defaults) applies to every command, and an explicit
+`wait(..)` covers the case where one command needed its own spacing. The [grammar reference](../grammar/README.md)
+covers everything the rule language can do that the old DSL could not.
+:::
 
 ## Options
 
@@ -236,12 +279,12 @@ would take to type it, and stopping listening part-way through prints `interrupt
 :::
 
 ### completion_timeout <Badge text="default: 300ms"/>
-How long a command whose phrase is a **prefix** of another command's phrase waits, in case you are still talking.
+How long a command which is a **prefix** of a longer one waits, in case you are still talking.
 
-With both `reload` and `reload weapon` in a profile, saying "reload" and stopping fires the short command after this
-long; carrying on with "weapon" fires the longer one instead and cancels the short one. Durations are written the way
-you would say them: `300ms`, `1s`, `1s 500ms`. A bare number is a load error — voice-orders will not guess whether you
-meant seconds or milliseconds.
+With both `Reload = "reload"` and `ReloadWeapon = "reload weapon"` in a profile, saying "reload" and stopping fires the
+short command after this long; carrying on with "weapon" fires the longer one instead and cancels the short one.
+Durations are written the way you would say them: `300ms`, `1s`, `1s 500ms`. A bare number is a load error —
+voice-orders will not guess whether you meant seconds or milliseconds.
 
 ```yaml
 completion_timeout: 350ms
@@ -249,7 +292,8 @@ completion_timeout: 350ms
 
 `voice-orders validate` prints a note for every prefix relation it finds in your profile, quoting this value, so you can
 see exactly which of your commands pay the wait. The [grammar reference](../grammar/README.md#ambiguity-and-the-completion-timeout)
-explains what makes a phrase ambiguous and what the timeout costs you.
+explains what makes a point in a grammar ambiguous and what the timeout costs you — including the case where a rule
+publishes a shared subject, which makes every command built on it ambiguous.
 
 With [eager matching](#recognition-eager) on (the default), this wait starts the moment the recognizer's in-progress
 hypothesis comes to rest on the ambiguous phrase — not hundreds of milliseconds later when the utterance finalizes.
@@ -309,8 +353,8 @@ suppressed entirely — firing nothing beats firing a coin-flip — and a `warni
 warning: ambiguous: "mortar sentry" vs "rocket sentry" (margin 1.2)
 ```
 
-Alternatives which would run the same command (homophones like "one up" / "won up" in one phrase group), or which match
-nothing at all, never suppress anything. `3`–`5` is a sensible range. Implies [`eager: false`](#recognition-eager).
+Alternatives which would run the same command (homophones like "one up" / "won up" written as alternatives of one
+rule), or which match nothing at all, never suppress anything. `3`–`5` is a sensible range. Implies [`eager: false`](#recognition-eager).
 
 #### recognition.confidence_margin <Badge text="default: 3.0"/>
 How close a competing alternative's confidence must be to the winner's before the utterance counts as ambiguous.
@@ -319,8 +363,7 @@ short phrase typically gap by several units, while genuinely confusable ones lan
 more conservative (more suppressions), lower it to be more trusting.
 
 ### defaults
-Timing shared by every command which uses the [`keys:`](#keys) shorthand. The block is optional, and so is each field
-inside it.
+The pacing applied to every command's key presses. The block is optional, and so is each field inside it.
 
 ```yaml
 defaults:
@@ -332,134 +375,74 @@ defaults:
 How long each chord is held down before it is released.
 
 #### defaults.interval <Badge text="default: 25ms"/>
-The gap left between one chord and the next. There is no trailing wait after the last chord.
+The gap left between one chord and the next. There is no trailing wait after the last chord, and an explicit
+`wait(..)` in an action block **replaces** this interval rather than adding to it — so `1, wait(200ms), 2` is exactly
+200ms apart.
 
-Both may be overridden per command with [`duration:`](#duration) and [`interval:`](#interval).
+There are no per-command overrides: a command which needs its own spacing writes it out with `wait(..)`, and
+`hold(..)` / `release(..)` carry no implicit pacing at all. See
+[pacing](../grammar/README.md#pacing) in the grammar reference.
 
-### commands <Badge text="required" type="danger"/>
-The commands this profile listens for. At least one is required — a profile with none is a load error, because there
-would be nothing to listen for.
-
-```yaml
-commands:
-  - phrase: salute
-    keys: ["x"]
-```
-
-Each entry takes the options below.
-
-#### name
-A friendly name for this command, used in logs and as the section heading in `validate` reports. When it is omitted,
-the command is identified by its phrase source exactly as you wrote it — which is often clear enough that you do not
-need a name at all.
+### grammar <Badge text="required" type="danger"/>
+The commands this profile listens for, written as [grammar rules](../grammar/README.md). It is the one option a
+profile cannot leave out — a profile with no grammar has nothing to listen for.
 
 ```yaml
-commands:
-  - name: Deploy the autocannon
-    phrase: deploy [the] {autocannon, auto cannon} [sentry]
-    keys: ["4"]
+grammar: |
+  Salute = "salute" { x }
 ```
 
-#### phrase <Badge text="required" type="danger"/>
-What to listen for, written in the [phrase DSL](../grammar/README.md): plain words are required in order, `[optional]`
-groups may be left unsaid, and `{alternate, choices}` groups require exactly one of their branches. The two nest freely.
+`grammar:` is a YAML **block scalar** (`|`), so the whole grammar lives inline and a profile stays a single,
+URL-shareable file. Nothing inside it needs quoting or escaping for YAML's sake.
+
+Each rule is a name, a pattern and an optional `{ ... }` action block. **TitleCase rules are published** as speakable
+commands; **lowercase rules are private** building blocks other rules refer to, which is what lets forty commands share
+the phrase they all start with:
 
 ```yaml
-phrase: deploy [the] {autocannon, auto cannon} [sentry]
+grammar: |
+  // A private rule: reusable words with the keys they press.
+  direction = ( "north" { up }
+              | "south" { down }
+              | "east"  { right }
+              | "west"  { left } )
+
+  // "deploy the sentry", "deploy turret", ...
+  Deploy = "deploy" "the"? ("sentry" { 4 } | "turret" { 5 })
+
+  // "look north", ... — the capture places the direction's press after the
+  // map key and its settle time.
+  Look = "look" direction:dir { m, wait(20ms), dir... }
 ```
 
-Phrases are parsed while the profile loads, so a syntax error is reported with its line and column before anything
-starts:
+The [grammar reference](../grammar/README.md) is the full language: literals, alternation, groups, bounded repetition,
+captures and splices, action blocks, and how ambiguity and the completion timeout behave. In short:
+
+| Written | Means |
+|---|---|
+| `"quoted words"` | What you say. Multi-word literals are fine. |
+| `"word"?` | May be left unsaid. |
+| `("either" \| "or")` | Exactly one of the branches. |
+| `other_rule` | Reuses another rule — its words *and* its presses. |
+| `thing[1..4]` | A bounded repetition. |
+| `thing:name` | Captures the term's presses for `name...` to place. |
+| `{ 4, wait(20ms), leftctrl+t }` | What a match presses. |
+
+The grammar is parsed and statically analyzed **while the profile loads**, so a mistake is reported with the exact
+place in your grammar it happened, before anything starts:
 
 ```
-You have an unclosed '[' at line 1, column 8 — every optional group needs a matching ']'.
+Error: We don't recognize 'leftctlr' as a key name. Did you mean 'leftctrl'?
+   ╭─[ <unknown>:2:36 ]
+   │
+ 2 │ ReloadWeapon = "reload" "weapon" { leftctlr+r }
+   │                                    ────┬───
+   │                                        ╰───── We don't recognize 'leftctlr' as a key name. Did you mean 'leftctrl'?
+───╯
 ```
 
-#### keys
-The shorthand output form: a list of keys to press in sequence. Each entry is either a single
-[key name](../keys/README.md) (`"4"`) or a **chord** whose key names are joined with `+`
-(`"leftctrl+leftalt+t"`).
-
-```yaml{3}
-commands:
-  - phrase: open [the] terminal
-    keys: ["leftctrl+leftalt+t"]
-```
-
-Each chord compiles to: every key **down** in the order written → hold for [`duration`](#duration) → every key **up** in
-reverse order, so modifiers outlive the key they modify. Chords are separated by [`interval`](#interval), with no
-trailing wait after the last one. The chord above becomes:
-
-```
-down leftctrl, down leftalt, down t, wait 30ms, up t, up leftalt, up leftctrl
-```
-
-Mutually exclusive with [`events:`](#events); exactly one of the two is required, and an empty list is a load error
-naming the command.
-
-::: tip
-Spaces around the `+` are a formatting accident rather than an error, so `"leftctrl + leftshift"` parses the same as
-`"leftctrl+leftshift"`.
-:::
-
-#### events
-The explicit output form: full control over what happens and when. Each entry is a single-key mapping — `down:`, `up:`
-or `wait:` — and compiles one-to-one into the emitted plan.
-
-```yaml{4-6}
-commands:
-  - name: Salute
-    phrase: salute
-    events:
-      - down: x
-      - wait: 750ms
-      - up: x
-```
-
-- `down: <key>` presses a key and leaves it held.
-- `up: <key>` releases a key.
-- `wait: <duration>` waits before the next step.
-
-A step which tries to do two things at once (`down: x` and `up: x` in the same entry) is a load error, as is a step
-which does nothing.
-
-An unmatched `down:` is **legal** — that is exactly how a hold-style macro is written — and `validate` reports it as a
-note rather than a problem:
-
-```yaml{4}
-commands:
-  - phrase: hold forward
-    events:
-      - down: w
-```
-
-An `up:` with no preceding `down:` is a warning instead, because it is almost always a copy-paste slip. Whatever your
-macros hold, voice-orders releases every key it is still holding when it shuts down — a voice macro must never leave
-`W` pressed in your game.
-
-[`defaults`](#defaults) do not apply to this form: every wait is written out explicitly.
-
-#### duration
-Overrides [`defaults.duration`](#defaults-duration) for this command's `keys:` list.
-
-```yaml{4}
-commands:
-  - phrase: charge the shield
-    keys: ["f"]
-    duration: 1s
-```
-
-#### interval
-Overrides [`defaults.interval`](#defaults-interval) for this command's `keys:` list.
-
-```yaml{4}
-commands:
-  - phrase: cycle weapons
-    keys: ["1", "2", "3"]
-    interval: 100ms
-```
-
-Both overrides are ignored by the `events:` form, which has no implicit timing to override.
+Things which are legal but suspicious — a private rule nothing refers to, a `hold` nothing releases, a block which
+splices the same presses twice — load fine and are reported by [`validate`](../guide/validation.md) as warnings.
 
 ## System configuration
 
@@ -518,9 +501,8 @@ hotkey:
 ```yaml
 # the shared profile: no hotkey block, so it inherits the one above
 name: Helldivers 2
-commands:
-  - phrase: reinforce
-    keys: [up, down, right, left, up]
+grammar: |
+  Reinforce = "reinforce" | "reinforcements" { up, down, right, left, up }
 ```
 
 Two edges are worth knowing:
@@ -581,22 +563,25 @@ If your network is unreliable, download the profile to a local file and point at
 voice-orders validate drg.yaml
 ```
 
-`validate` reports **everything it finds in one pass**, one section per command: structural errors, grammar lints,
-output lints, and every word of every phrase checked against your model's vocabulary. It exits `1` if anything was an
-error and `0` when there were only warnings and notes, which makes it easy to run over a repository of profiles in CI.
+`validate` reports **everything it finds in one pass**, one section per published rule: grammar lints, the diagnostics
+raised when the grammar compiles, every word of your grammar checked against your model's vocabulary, and notes about
+how the profile will behave. It exits `1` if anything was an error and `0` when there were only warnings and notes,
+which makes it easy to run over a repository of profiles in CI.
 
-The checks it runs:
+```
+drg.yaml — Deep Rock Galactic
 
-| Finding | Severity | Meaning |
-|---|---|---|
-| A word your model does not know | error | The command can never be recognized. Comes with spelling, compound-split and nearest-word suggestions. |
-| Every term in a phrase is optional | error | The phrase expands to include the empty phrase, which nobody can say. |
-| A phrase expanding past 512 concrete phrases | error | The per-command cap; split the command up. |
-| A phrase expanding past 128 concrete phrases | warning | Legal, but the grammar is getting large and the command easy to trigger by accident. |
-| The same phrase used by two commands | warning | Only one of them can ever fire. (An error in `run`.) |
-| `up:` without a preceding `down:` | warning | The key is released at a keyboard which is not holding it. |
-| `down:` with no matching `up:` | note | A hold-style macro. Nothing releases the key until another command does, or voice-orders shuts down. |
-| One phrase being a prefix of another | note | Names the wait imposed by [`completion_timeout`](#completion-timeout). |
+Autocannon
+  note: compiles into 30 automaton states
+  note: saying "autocannon" will wait 350ms in case you continue with "autocannon sentry"
+
+Terminal
+  note: compiles into 15 automaton states
+
+3 commands checked — 0 errors, 0 warnings.
+```
+
+The [validation guide](../guide/validation.md) covers every finding it can report and what to do about each one.
 
 ## Rehearsing a profile
 
@@ -617,13 +602,17 @@ Each recognition is **one line** in that log, and it upgrades in place. The utte
 is heard, and turns green with the command and its keys when the matcher resolves it:
 
 ```
-19:04:11 ● "deploy the auto cannon" → Deploy the autocannon (4)
-19:04:19 ● "reload the thing"
-19:04:23 ● warning: the speech recognizer could not decode the audio
+19:04:11 ● "deploy the auto cannon" → Autocannon (4)
+19:04:19 ● "two watch north" → Watch(two, north) (f2 3 8 1)
+19:04:24 ● "reload the thing"
+19:04:29 ● warning: the speech recognizer could not decode the audio
 ```
 
-A line which **stays grey** is the signal to look for: the model understood you, but no command's phrases cover what
-you said. The dot carries the same reading as the color — green for a matched command, grey for an utterance nothing
+A command is named by the rule which matched it, with whatever it [captured](../grammar/README.md#captures) in
+parentheses — `Watch(two, north)` — so the log says what you actually said and not merely which rule fired.
+
+A line which **stays grey** is the signal to look for: the model understood you, but no rule in your grammar covers
+what you said. The dot carries the same reading as the color — green for a matched command, grey for an utterance nothing
 matched, yellow for a warning or for a command interrupted or discarded by
 [`hotkey.interrupt`](#hotkey-interrupt), red for pipeline errors. The listening state is not logged: the footer shows
 it live as you press and release the hotkey.
@@ -634,7 +623,7 @@ per event:
 ```
 listening: on
 heard: "deploy the auto cannon"
-matched: "Deploy the autocannon" → 4
+matched: "Autocannon" → 4
 heard: "reload"
 listening: off
 ```
@@ -647,5 +636,5 @@ thing to reach for when a command fires and you are not sure which one. `--model
 everywhere else, and Ctrl-C exits.
 
 This is also the fastest way to answer "is it hearing me at all?". A `heard:` line with no `matched:` line means the
-recognizer understood you but no command's phrase covers what you said; no `heard:` line at all means the audio or the
-listening state is the problem, not the grammar.
+recognizer understood you but no rule in your grammar covers what you said; no `heard:` line at all means the audio or
+the listening state is the problem, not the grammar.
