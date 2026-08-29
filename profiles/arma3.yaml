@@ -156,7 +156,9 @@ grammar: |
   LowAmmo = subject ("i'm running low on ammo" | "running low on ammo" | "ammo low") { ..., 5, 3 }
   Injured = subject ("i'm injured" | "injured" | "medic" | "i need a medic" | "i need some help"
                     | "i need some help now" | "somebody help me" | "wounded" | "i'm hit") { ..., 5, 4 }
-  Sitrep = subject ("report in over" | "sitrep" | "report status" | "report in") { ..., 5, 5 }
+  // NOTE: "sitrep" is not in the lgraph model's vocabulary, so it is spelled
+  // as the two words the model does know; the rule name keeps the real spelling.
+  Sitrep = subject ("report in over" | "sit rep" | "report status" | "report in") { ..., 5, 5 }
   UnderFire = subject ("i'm under fire" | "taking fire" | "under fire" | "enemy fire") { ..., 5, 6 }
   HostileDown = subject ("hostile down" | "target down" | "scratch one" | "he is down"
                         | "target neutralized" | "tango down") { ..., 5, 7 }

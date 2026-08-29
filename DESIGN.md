@@ -335,8 +335,9 @@ action     = chord | "wait" , "(" , duration , ")"
   construction; `validate` reports per-rule automaton size so a `*` at the cap is visible.
 - **No recursion.** A rule-reference cycle is a load error advising a bounded repetition instead.
 - **Rule termination.** The action block ends a rule when present; a rule without one ends at the
-  next `ident =` at the start of a line, and **implicitly propagates** its accumulated commands
-  (equivalent to `{ ... }`).
+  next `ident =` (a word followed by `=` is never a rule reference, so the grammar stays
+  whitespace-insensitive), and **implicitly propagates** its accumulated commands (equivalent to
+  `{ ... }`).
 
 ### Command semantics
 
@@ -770,8 +771,9 @@ pub enum KeyEvent { Down(KeyCode), Up(KeyCode), ReleaseAll, Wait(std::time::Dura
 `Down` in written order, holds it for `duration`, lifts in reverse order, and consecutive presses
 are separated by `interval` (an explicit `wait(..)` *replaces* that interval); `hold`/`release`
 carry no implicit pacing, and `release(*)` becomes `ReleaseAll`, played from the executor's
-tracked pressed-key set. A `hold` with no `release` on some accepting path is legal (hold-style
-macros) but linted at load.
+tracked pressed-key set. A `hold` with no `release` later in the same action block is legal
+(hold-style macros) but linted at load; the lint is per block, so a hold deliberately spanning
+rules is not flagged.
 
 ### Key naming
 
@@ -1092,8 +1094,8 @@ misses, suggest in order:
 ### Warnings and notes
 
 - **Grammar lints** from static analysis (an unreferenced private rule, a `hold` with no `release`
-  on some accepting path, `...` alongside a `name...` splice) surface as warnings; they never fail
-  validation on their own.
+  later in its action block, `...` alongside a `name...` splice) surface as warnings; they never
+  fail validation on their own.
 - **Automaton size:** each published rule gets a `note: compiles into N automaton states`, so a
   repetition at the cap is visible per rule.
 - **Decompositions:** each rule the recognition feed could not expand whole gets a note naming its
