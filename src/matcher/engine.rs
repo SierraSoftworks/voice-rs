@@ -1,18 +1,15 @@
-//! The grammar v2 matcher engine: the v1 state machine restated over the
+//! The matcher engine: the completion-timeout state machine restated over the
 //! automaton's hypothesis walk. See DESIGN.md §"Compilation: a word-level
-//! transducer" for how the trie semantics generalize.
+//! transducer".
 //!
-//! Everything the v1 matcher promised still holds, word for word — greedy
-//! longest-match segmentation with re-sync, the `Pending` completion-timeout
-//! machine, eager partial-driven firing, and confidence gating — but the walk
-//! position is a [`Walk`] (a set of alive hypotheses) instead of a trie node,
-//! *ambiguous* means "some hypothesis accepts while any can still consume a
-//! word", and a fired command's output is assembled from its evaluated action
-//! program at fire time rather than pre-compiled per command.
-//!
-//! The v1 matcher in the parent module stays untouched until G6 swaps `run`
-//! over to this engine and deletes it; the small helpers duplicated from it
-//! (`words_of`, `deadline_elapsed`, `quoted_list`) go with it then.
+//! Everything the original trie-based matcher promised still holds, word for
+//! word — greedy longest-match segmentation with re-sync, the `Pending`
+//! completion-timeout machine, eager partial-driven firing, and confidence
+//! gating — but the walk position is a [`Walk`] (a set of alive hypotheses)
+//! instead of a trie node, *ambiguous* means "some hypothesis accepts while
+//! any can still consume a word", and a fired command's output is assembled
+//! from its evaluated action program at fire time rather than pre-compiled per
+//! command.
 
 use std::collections::HashMap;
 
@@ -124,7 +121,7 @@ struct EagerContext<'a> {
     fired: Vec<Match>,
     /// The accept the latest partial's walk rests on, with its armed
     /// deadline. `None` when the walk rests mid-phrase or at the root.
-    resting: Option<EagerResting<'a>>,
+    resting: Option<EagerResting>,
     /// Walk warnings (hypothesis overflows, runtime-ambiguous accepts)
     /// already reported for this utterance. Every changed partial re-walks
     /// the same growing hypothesis, so without this the same overflow would
@@ -133,11 +130,13 @@ struct EagerContext<'a> {
 }
 
 /// An accept a partial hypothesis is resting on, waiting out a deadline.
+///
+/// The resting *walk* is not kept: a `Final` which pends here re-walks the
+/// utterance from the context's own origin, so only the accept's identity and
+/// its armed deadline matter.
 #[derive(Debug)]
-struct EagerResting<'a> {
+struct EagerResting {
     accept: Accept,
-    /// The resting walk, kept so a `Final` which pends here can continue it.
-    walk: Walk<'a>,
     /// The index just past the accept's last word in the partial.
     position: usize,
     /// Whether the resting walk is ambiguous. Ambiguous rests wait out the
@@ -556,7 +555,7 @@ impl<'a> Engine<'a> {
     /// finalizing it.
     fn pending_deadline(
         &self,
-        resting: Option<&EagerResting<'a>>,
+        resting: Option<&EagerResting>,
         accept: &Accept,
         position: usize,
     ) -> Instant {
@@ -757,7 +756,6 @@ impl<'a> Engine<'a> {
                         };
                         Some(EagerResting {
                             accept,
-                            walk,
                             position,
                             ambiguous,
                             deadline,
@@ -772,8 +770,7 @@ impl<'a> Engine<'a> {
 }
 
 /// Consumes [`RecognitionEvent`]s and produces [`CommandAction`]s onto the
-/// command queue, resolving ambiguous prefixes with the completion timeout —
-/// the grammar v2 replacement for [`super::matcher_task`].
+/// command queue, resolving ambiguous prefixes with the completion timeout.
 ///
 /// Runs until `cancel` fires, the events channel closes (the recognizer shut
 /// down), or the command queue closes (the executor shut down) — all of which

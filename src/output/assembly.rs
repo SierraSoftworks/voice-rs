@@ -255,25 +255,32 @@ mod tests {
     }
 
     #[test]
-    fn test_a_press_matches_the_keys_shorthand() {
-        // The grammar's pacing is not a second implementation of the `keys:`
-        // shorthand's; a chord sequence must assemble to exactly what the
-        // profile's own compiler produces for the same keys.
-        let chords = vec![
-            crate::config::output::Chord::parse("leftctrl+leftalt+t").unwrap(),
-            crate::config::output::Chord::parse("4").unwrap(),
-        ];
-        let pacing = pacing();
-
+    fn test_a_press_matches_the_old_keys_shorthand() {
+        // The pacing rules are exactly the v1 `keys:` shorthand's, and this
+        // pins the byte-for-byte plan that shorthand used to compile for the
+        // same chords: down in written order, hold, up in reverse, an interval
+        // between chords, nothing trailing the last one.
         assert_eq!(
             assemble(
                 &[
-                    ActionItem::Press(chords[0].keys().to_vec()),
-                    ActionItem::Press(chords[1].keys().to_vec()),
+                    ActionItem::Press(vec![key("leftctrl"), key("leftalt"), key("t")]),
+                    ActionItem::Press(vec![key("4")]),
                 ],
-                &pacing
+                &pacing()
             ),
-            crate::config::output::compile_chords(&chords, pacing.duration, pacing.interval)
+            vec![
+                KeyEvent::Down(key("leftctrl")),
+                KeyEvent::Down(key("leftalt")),
+                KeyEvent::Down(key("t")),
+                KeyEvent::Wait(ms(30)),
+                KeyEvent::Up(key("t")),
+                KeyEvent::Up(key("leftalt")),
+                KeyEvent::Up(key("leftctrl")),
+                KeyEvent::Wait(ms(25)),
+                KeyEvent::Down(key("4")),
+                KeyEvent::Wait(ms(30)),
+                KeyEvent::Up(key("4")),
+            ]
         );
     }
 }
