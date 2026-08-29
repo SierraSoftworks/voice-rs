@@ -2,9 +2,9 @@
 //!
 //! The scaffold shows *every* option with its default value, commented out, so
 //! that the file itself doubles as an option reference — but the parts which
-//! are left active (the model path and two worked commands, one per output
-//! form) make it a profile which loads as written. A unit test parses the
-//! scaffold through the real [`Profile::parse`] path so that it can never rot.
+//! are left active (the model path and a small worked grammar) make it a
+//! profile which loads as written. A unit test parses the scaffold through the
+//! real [`Profile::parse`] path so that it can never rot.
 //!
 //! [`Profile::parse`]: crate::config::Profile::parse
 
@@ -80,35 +80,45 @@ model: ~/.local/share/vosk/vosk-model-small-en-us-0.15
 # this long before firing, in case "weapon" is still coming.
 # completion_timeout: 300ms
 
-# Timing shared by every command which uses the `keys:` shorthand. Each command
-# may override either value on its own.
+# The pacing applied to every command's key presses.
 # defaults:
-#   # How long each chord is held down.
+#   # How long each press is held down.
 #   duration: 30ms
-#   # The gap left between one chord and the next.
+#   # The gap left between one press and the next.
 #   interval: 25ms
 
-commands:
-  # Phrases are written in a small DSL:
-  #   plain words     are required, in order
-  #   [optional]      groups may be left unsaid
-  #   {either, or}    groups require exactly one of their branches
-  # The two nest freely: "deploy [the] {autocannon, auto cannon} [sentry]".
+# The command grammar: a list of rules. TitleCase rules are published as
+# speakable commands; lowercase rules are private building blocks other rules
+# refer to. `//` comments run to the end of the line.
+#
+# In a rule's pattern:
+#   "quoted words"        are what you say (multi-word literals are fine)
+#   "word"?               may be left unsaid
+#   ("either" | "or")     groups alternatives
+#   other_rule            reuses a private rule — its words *and* its presses
+#   thing[1..4]           repeats a term a bounded number of times
+#   thing:name            captures the term's presses for `name...` below
+#
+# The `{ ... }` action block says what a match presses: a bare chord ("4",
+# "leftctrl+leftalt+t") is a press, `wait(20ms)` an explicit pause, and
+# `hold(..)` / `release(..)` the two halves of a press when they belong to
+# different moments (`release(*)` lets go of everything). `...` splices in
+# everything the matched words accumulated; `name...` splices one capture. A
+# rule with no block passes its accumulated presses along unchanged.
+grammar: |
+  // "deploy the sentry", "deploy turret", ... — each alternative carries its
+  // own press, and the rule passes them along implicitly.
+  Deploy = "deploy" "the"? ("sentry" { 4 } | "turret" { 5 })
 
-  # The shorthand output form: a list of single keys ("4") or chords whose key
-  # names are joined with '+'. Each chord goes down in the order written, is
-  # held for `duration`, then comes up in reverse order.
-  - phrase: open [the] terminal
-    keys: ["leftctrl+leftalt+t"]
+  // A private building block: reusable words with their presses.
+  direction = ( "north" { up }
+              | "south" { down }
+              | "east"  { right }
+              | "west"  { left } )
 
-  # The explicit output form: full control over what happens and when. An
-  # unmatched `down:` is legal — that is how you write a hold-style macro.
-  - name: Salute
-    phrase: salute
-    events:
-      - down: x
-      - wait: 750ms
-      - up: x
+  // "look north", ... — the capture lets the block place the direction's
+  // press exactly where it belongs: after the map key and its settle time.
+  Look = "look" direction:dir { m, wait(20ms), dir... }
 "#;
 
 /// Writes the scaffold profile to `args.profile`.
@@ -196,16 +206,28 @@ mod tests {
         assert_eq!(profile.hotkey, None);
         assert_eq!(profile.completion_timeout, Duration::from_millis(300));
 
-        // One command per output form, so both are demonstrated and both are
-        // proven to compile.
-        assert_eq!(profile.commands.len(), 2);
-        assert!(profile.commands[0].keys.is_some());
-        assert!(profile.commands[1].events.is_some());
-        for command in &profile.commands {
-            command
-                .compile(&profile.defaults)
-                .unwrap_or_else(|e| panic!("'{}' should compile: {e}", command.display_name()));
-        }
+        // The worked grammar demonstrates published rules, a private rule and
+        // a capture — and all of it is proven to compile, lint-free.
+        let published: Vec<&str> = profile
+            .grammar
+            .published()
+            .map(|rule| rule.name.as_str())
+            .collect();
+        assert_eq!(published, vec!["Deploy", "Look"]);
+        assert!(
+            profile
+                .grammar
+                .rule("direction")
+                .is_some_and(|rule| !rule.published()),
+            "the scaffold should demonstrate a private rule"
+        );
+        assert!(
+            profile.grammar.lints().is_empty(),
+            "the scaffold must be lint-free: {:?}",
+            profile.grammar.lints()
+        );
+        crate::grammar::Automaton::compile(&profile.grammar)
+            .expect("the scaffold's grammar should compile");
     }
 
     #[test]
@@ -223,10 +245,7 @@ mod tests {
             "defaults:",
             "duration:",
             "interval:",
-            "commands:",
-            "phrase:",
-            "keys:",
-            "events:",
+            "grammar:",
         ] {
             assert!(
                 SCAFFOLD.contains(option),

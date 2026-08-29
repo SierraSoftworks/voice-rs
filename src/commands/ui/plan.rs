@@ -82,7 +82,9 @@ fn render_chord(keys: &[KeyCode]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LoadedProfile, OutputDefaults, Profile};
+    use crate::config::OutputDefaults;
+    use crate::grammar::{Automaton, Grammar};
+    use crate::output::assembly::assemble;
     use crate::output::keys;
     use rstest::rstest;
     use std::time::Duration;
@@ -91,43 +93,36 @@ mod tests {
         keys::from_name(name).expect("a known key")
     }
 
-    /// Compiles one command's `keys:`/`events:` YAML the way the pipeline does,
-    /// so the rendering is asserted against real compiled plans rather than
-    /// hand-built ones.
-    fn plan(command: &str) -> CompiledOutput {
-        let profile = Profile::parse(&LoadedProfile {
-            source: "test-profile.yaml".to_string(),
-            content: format!("model: /models/en\ncommands:\n  - phrase: salute\n{command}"),
-        })
-        .expect("the profile should load");
-
-        profile.commands[0]
-            .compile(&profile.defaults)
-            .expect("the command should compile")
+    /// Compiles one action block the way the pipeline does — grammar →
+    /// automaton → walk → assemble — so the rendering is asserted against real
+    /// assembled plans rather than hand-built ones.
+    fn plan(actions: &str) -> CompiledOutput {
+        let source = format!("Salute = \"salute\" {actions}");
+        let grammar = Grammar::parse(&source).expect("the grammar should parse");
+        let automaton = Automaton::compile(&grammar).expect("the grammar should compile");
+        let mut walk = automaton.walk();
+        walk.step("salute");
+        let accepts = walk.accepts();
+        assert_eq!(accepts.len(), 1, "one reading expected: {accepts:?}");
+        CompiledOutput::Keyboard(assemble(&accepts[0].actions, &OutputDefaults::default()))
     }
 
     #[rstest]
     // A single key: the hold wait is elided.
-    #[case("    keys: [\"4\"]\n", "4")]
+    #[case("{ 4 }", "4")]
     // A chord: pressed in order, released in reverse, reported as one step.
-    #[case("    keys: [\"leftctrl+leftalt+t\"]\n", "leftctrl+leftalt+t")]
-    // A sequence: the inter-chord interval is elided too.
-    #[case("    keys: [\"a\", \"b\"]\n", "a b")]
-    #[case("    keys: [\"leftshift+a\", \"b\"]\n", "leftshift+a b")]
-    // The explicit form, including its long hold.
-    #[case(
-        "    events:\n      - down: x\n      - wait: 750ms\n      - up: x\n",
-        "x"
-    )]
+    #[case("{ leftctrl+leftalt+t }", "leftctrl+leftalt+t")]
+    // A sequence: the inter-press interval is elided too.
+    #[case("{ a, b }", "a b")]
+    #[case("{ leftshift+a, b }", "leftshift+a b")]
+    // Explicit hold/wait/release, including its long hold.
+    #[case("{ hold(x), wait(750ms), release(x) }", "x")]
     // A hold-style macro: legal, and worth saying out loud.
-    #[case("    events:\n      - down: w\n", "w (held)")]
+    #[case("{ hold(w) }", "w (held)")]
     // A release with no press before it: also legal, also worth saying.
-    #[case(
-        "    events:\n      - up: w\n      - down: x\n      - up: x\n",
-        "(release w) x"
-    )]
-    fn test_render_plan(#[case] command: &str, #[case] expected: &str) {
-        assert_eq!(render_plan(&plan(command)), expected);
+    #[case("{ release(w), x }", "(release w) x")]
+    fn test_render_plan(#[case] actions: &str, #[case] expected: &str) {
+        assert_eq!(render_plan(&plan(actions)), expected);
     }
 
     #[test]
@@ -180,12 +175,12 @@ mod tests {
 
     #[test]
     fn test_the_defaults_do_not_leak_into_the_rendering() {
-        // The timings a `keys:` list compiles to are a `run` concern; a
-        // rehearsal is about which keys, in which order.
+        // The timings a plan assembles with are a `run` concern; a rehearsal
+        // is about which keys, in which order.
         assert_eq!(
             OutputDefaults::default().duration,
             Duration::from_millis(30)
         );
-        assert_eq!(render_plan(&plan("    keys: [\"a\"]\n")), "a");
+        assert_eq!(render_plan(&plan("{ a }")), "a");
     }
 }

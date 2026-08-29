@@ -37,19 +37,6 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duratio
     parse(&text).map_err(serde::de::Error::custom)
 }
 
-/// A `serde(deserialize_with = ...)` helper for an optional duration field.
-///
-/// Pairs with `#[serde(default)]`: an absent field is `None`, and a present one
-/// is parsed exactly as [`deserialize`] would.
-pub fn deserialize_option<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Duration>, D::Error> {
-    match Option::<String>::deserialize(deserializer)? {
-        None => Ok(None),
-        Some(text) => parse(&text).map(Some).map_err(serde::de::Error::custom),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,19 +85,15 @@ mod tests {
     struct Doc {
         #[serde(deserialize_with = "deserialize")]
         timeout: Duration,
-        #[serde(default, deserialize_with = "deserialize_option")]
-        hold: Option<Duration>,
     }
 
     #[test]
     fn test_deserialize_helpers() {
-        let doc: Doc = serde_yaml::from_str("timeout: 350ms\nhold: 1s 500ms\n").unwrap();
+        let doc: Doc = serde_yaml::from_str("timeout: 350ms\n").unwrap();
         assert_eq!(doc.timeout, Duration::from_millis(350));
-        assert_eq!(doc.hold, Some(Duration::from_millis(1500)));
 
-        let doc: Doc = serde_yaml::from_str("timeout: 1s\n").unwrap();
-        assert_eq!(doc.timeout, Duration::from_secs(1));
-        assert_eq!(doc.hold, None);
+        let doc: Doc = serde_yaml::from_str("timeout: 1s 500ms\n").unwrap();
+        assert_eq!(doc.timeout, Duration::from_millis(1500));
     }
 
     #[test]

@@ -2,12 +2,14 @@
 //! cross-field `validate_*()` checks. See DESIGN.md §"Profile schema".
 //!
 //! The division of labour follows grey's validation philosophy: serde and the
-//! type system validate everything they possibly can *at load time* (phrases
-//! parse, key names resolve, durations parse, unknown fields are refused), and
-//! the handful of invariants which span fields live in explicit `validate_*()`
-//! methods whose messages always name the offending command.
+//! type system validate everything they possibly can *at load time* (the
+//! grammar parses and analyzes, durations parse, unknown fields are refused),
+//! and the handful of invariants which span fields live in explicit
+//! `validate_*()` methods whose messages always name the offending piece.
+//! Compiling the grammar's automaton is deliberately *not* part of
+//! deserialization: it runs in the command assembly (`run`, `test`,
+//! `validate`), where its errors can name the profile's source.
 
-pub mod command;
 pub mod duration;
 pub mod hotkey;
 pub mod loader;
@@ -20,20 +22,16 @@ use std::time::Duration;
 
 use tracing_batteries::prelude::*;
 
-pub use command::CommandConfig;
 // `ResolvedHotkey` is what everything downstream of `ResolvedSettings` actually
 // holds, even where it is never named.
 #[allow(unused_imports)]
 pub use hotkey::{HotkeyConfig, ResolvedHotkey};
 pub use loader::LoadedProfile;
+pub use output::OutputDefaults;
 pub use recognition::RecognitionConfig;
 pub use system::{ResolvedSettings, SystemConfig};
-// `Chord`, `KeyName` and `RawEvent` are the vocabulary the `run` assembly and
-// the docs generator speak; nothing in the binary reaches them until that lands.
-#[allow(unused_imports)]
-pub use output::{Chord, KeyName, OutputDefaults, RawEvent};
 
-use crate::grammar::expansion;
+use crate::grammar::Grammar;
 
 /// Default values for the schema, in one place so that the documentation, the
 /// `new` scaffold and the code cannot disagree about them.
@@ -65,7 +63,7 @@ mod default {
 }
 
 /// A complete profile: the model to recognize with, how to listen, and the
-/// commands to act on.
+/// grammar of commands to act on.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -108,12 +106,16 @@ pub struct Profile {
     #[serde(default)]
     pub recognition: RecognitionConfig,
 
-    /// Timing shared by every command which uses the `keys:` shorthand.
+    /// The pacing applied to every assembled key plan: how long a press is
+    /// held, and the gap between consecutive presses.
     #[serde(default)]
     pub defaults: OutputDefaults,
 
-    /// The commands this profile listens for.
-    pub commands: Vec<CommandConfig>,
+    /// The command grammar, written inline so a profile stays a single,
+    /// URL-shareable file. Parsed and statically analyzed during
+    /// deserialization — a bad grammar is a config-load error carrying its
+    /// rendered diagnostics, never a runtime surprise.
+    pub grammar: Grammar,
 }
 
 /// Which microphone to capture from.
@@ -140,7 +142,7 @@ impl Profile {
                 e,
                 format!("We could not read the profile at '{source}'."),
                 &[
-                    "Check the profile against the error above — it names the field which we could not understand.",
+                    "Check the profile against the error above — it names the field (or the place in the grammar) we could not understand.",
                     "The option reference in the documentation lists every field a profile may set, and `voice-orders new` writes a fully commented starting point.",
                 ],
             )
@@ -149,7 +151,7 @@ impl Profile {
         profile.validate_structure()?;
 
         debug!(
-            commands = profile.commands.len(),
+            commands = profile.grammar.published().count(),
             "Loaded profile '{}' from {source}.",
             profile.display_name()
         );
@@ -166,51 +168,20 @@ impl Profile {
     }
 
     /// The cross-field invariants which serde cannot express.
-    ///
-    /// Every message names the command it is about, so a profile with fifty
-    /// commands still tells you which one to go and fix.
     pub fn validate_structure(&self) -> Result<(), crate::Error> {
-        if self.commands.is_empty() {
+        if self.grammar.published().next().is_none() {
             return Err(human_errors::user(
-                "This profile does not define any commands, so there would be nothing to listen for.",
+                "This profile's grammar does not publish any commands, so there would be nothing to listen for.",
                 &[
-                    "Add at least one entry under 'commands:', each with a 'phrase:' and either a 'keys:' or an 'events:' list.",
-                    "Run `voice-orders new <path>` to write a profile with worked examples of both output forms.",
+                    "Publish at least one rule by giving it a TitleCase name, e.g. 'Map = \"map\" { m }' — lowercase rules are private building blocks.",
+                    "Run `voice-orders new <path>` to write a profile with a worked example grammar.",
                 ],
             ));
         }
 
         self.recognition.validate()?;
 
-        for command in &self.commands {
-            command.validate_output()?;
-            self.validate_expansion_volume(command)?;
-        }
-
         Ok(())
-    }
-
-    /// Rejects a command whose phrase would expand past the grammar cap.
-    ///
-    /// The count is multiplicative and never materializes the phrases, so an
-    /// explosive phrase fails fast (DESIGN.md §"Expansion and grammar
-    /// compilation").
-    fn validate_expansion_volume(&self, command: &CommandConfig) -> Result<(), crate::Error> {
-        let count = expansion::count(command.phrase.expr());
-        if count <= expansion::MAX_EXPANSIONS_PER_COMMAND {
-            return Ok(());
-        }
-
-        let name = command.display_name();
-        let max = expansion::MAX_EXPANSIONS_PER_COMMAND;
-        Err(human_errors::user(
-            format!(
-                "The command '{name}' expands into {count} concrete phrases, which is more than the {max} a single command may use."
-            ),
-            &[
-                "Split the command into several smaller commands, or remove some of its '[optional]' and '{alternate, choices}' groups.",
-            ],
-        ))
     }
 }
 
@@ -305,8 +276,10 @@ fn resolve_model_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grammar::{Automaton, feed};
     use crate::hotkey::ListenMode;
-    use crate::output::{CompiledOutput, KeyEvent, keys};
+    use crate::output::assembly::ActionItem;
+    use crate::output::keys;
     use rstest::rstest;
 
     /// The canonical example profile, loaded through the real parse path so
@@ -314,6 +287,13 @@ mod tests {
     const EXAMPLE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/profile.yaml"
+    ));
+
+    /// The two shipped game profiles, pinned by the same trick.
+    const ARMA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma3.yaml"));
+    const HELLDIVERS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/profiles/helldivers2.yaml"
     ));
 
     pub(crate) fn loaded(content: &str) -> LoadedProfile {
@@ -327,8 +307,37 @@ mod tests {
         Profile::parse(&loaded(content))
     }
 
+    /// A minimal loadable profile body around one command.
+    fn minimal(extra: &str) -> String {
+        format!("model: /models/en\n{extra}grammar: |\n  Salute = \"salute\" {{ x }}\n")
+    }
+
     fn key(name: &str) -> crate::output::KeyCode {
         keys::from_name(name).expect("a known key")
+    }
+
+    /// A press per `+`-joined chord, for asserting walked action programs.
+    fn presses(chords: &[&str]) -> Vec<ActionItem> {
+        chords
+            .iter()
+            .map(|chord| ActionItem::Press(chord.split('+').map(key).collect()))
+            .collect()
+    }
+
+    /// Walks `phrase` through a compiled profile grammar and returns the one
+    /// accepting reading's action program.
+    fn walk_actions(automaton: &Automaton, phrase: &str) -> Vec<ActionItem> {
+        let mut walk = automaton.walk();
+        for word in phrase.split_whitespace() {
+            walk.step(word);
+        }
+        let accepts = walk.accepts();
+        assert_eq!(
+            accepts.len(),
+            1,
+            "expected exactly one reading of {phrase:?}: {accepts:?}"
+        );
+        accepts.into_iter().next().expect("just asserted").actions
     }
 
     #[test]
@@ -369,59 +378,115 @@ mod tests {
         assert_eq!(hotkey.key.code(), key("rightctrl"));
         assert_eq!(hotkey.mode, ListenMode::Toggle);
 
-        let phrases: Vec<&str> = profile.commands.iter().map(|c| c.phrase.source()).collect();
+        let published: Vec<&str> = profile
+            .grammar
+            .published()
+            .map(|rule| rule.name.as_str())
+            .collect();
+        assert_eq!(published, vec!["Autocannon", "Terminal", "Salute"]);
+
+        // The grammar compiles, and the three commands exercise a plain press,
+        // a chord, and the hold/wait/release forms.
+        let automaton = Automaton::compile(&profile.grammar).expect("the grammar should compile");
         assert_eq!(
-            phrases,
+            walk_actions(&automaton, "deploy the autocannon"),
+            presses(&["4"])
+        );
+        assert_eq!(
+            walk_actions(&automaton, "auto cannon sentry"),
+            presses(&["4"])
+        );
+        assert_eq!(
+            walk_actions(&automaton, "open terminal"),
+            presses(&["leftctrl+leftalt+t"])
+        );
+        assert_eq!(
+            walk_actions(&automaton, "salute"),
             vec![
-                "deploy [the] {autocannon, auto cannon} [sentry]",
-                "open [the] terminal",
-                "salute",
+                ActionItem::Hold(vec![key("x")]),
+                ActionItem::Wait(Duration::from_millis(750)),
+                ActionItem::Release(vec![key("x")]),
             ]
         );
+    }
 
-        // The three commands exercise both output forms, and every one of them
-        // compiles.
-        let compiled: Vec<CompiledOutput> = profile
-            .commands
-            .iter()
-            .map(|c| c.compile(&profile.defaults).expect("it should compile"))
-            .collect();
+    /// Every shipped profile loads, is lint-free, compiles to an automaton
+    /// with zero diagnostics, and produces a non-empty recognition feed — the
+    /// docs-can't-drift trick applied to all three.
+    #[rstest]
+    #[case::example("examples/profile.yaml", EXAMPLE)]
+    #[case::arma("profiles/arma3.yaml", ARMA)]
+    #[case::helldivers("profiles/helldivers2.yaml", HELLDIVERS)]
+    fn test_every_shipped_profile_compiles_cleanly(#[case] source: &str, #[case] content: &str) {
+        let profile = Profile::parse(&LoadedProfile {
+            source: source.to_string(),
+            content: content.to_string(),
+        })
+        .unwrap_or_else(|e| panic!("'{source}' should load: {e}"));
 
-        assert_eq!(
-            compiled[0],
-            CompiledOutput::Keyboard(vec![
-                KeyEvent::Down(key("4")),
-                KeyEvent::Wait(Duration::from_millis(30)),
-                KeyEvent::Up(key("4")),
-            ])
+        assert!(
+            profile.grammar.lints().is_empty(),
+            "'{source}' should be lint-free:\n{}",
+            profile
+                .grammar
+                .lints()
+                .iter()
+                .map(|lint| lint.render(profile.grammar.source()))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
-        assert_eq!(
-            compiled[1],
-            CompiledOutput::Keyboard(vec![
-                KeyEvent::Down(key("leftctrl")),
-                KeyEvent::Down(key("leftalt")),
-                KeyEvent::Down(key("t")),
-                KeyEvent::Wait(Duration::from_millis(30)),
-                KeyEvent::Up(key("t")),
-                KeyEvent::Up(key("leftalt")),
-                KeyEvent::Up(key("leftctrl")),
-            ])
+
+        let automaton = Automaton::compile(&profile.grammar).unwrap_or_else(|diagnostics| {
+            panic!(
+                "'{source}' should compile:\n{}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.render(profile.grammar.source()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+        assert!(!automaton.rule_sizes().is_empty());
+
+        let feed = feed(&profile.grammar);
+        assert!(
+            !feed.phrases.is_empty(),
+            "'{source}' should feed the recognizer something"
         );
-        assert_eq!(
-            compiled[2],
-            CompiledOutput::Keyboard(vec![
-                KeyEvent::Down(key("x")),
-                KeyEvent::Wait(Duration::from_millis(750)),
-                KeyEvent::Up(key("x")),
-            ])
-        );
+    }
+
+    /// Spot checks on the migrated Helldivers profile: an alternates group, an
+    /// optional word, and a plain multi-word phrase all walk to the exact
+    /// stratagem inputs the pre-migration profile compiled to.
+    #[rstest]
+    // `("reinforce" | "reinforcements")` — the alternates form.
+    #[case("reinforce", &["up", "down", "right", "left", "up"])]
+    #[case("reinforcements", &["up", "down", "right", "left", "up"])]
+    // `"eagle"? "rearm"` — the optional form, with and without the option.
+    #[case("eagle rearm", &["up", "up", "left", "up", "right"])]
+    #[case("rearm", &["up", "up", "left", "up", "right"])]
+    // A plain multi-word phrase.
+    #[case("orbital laser", &["right", "down", "up", "right", "down"])]
+    // The ambiguous-prefix pair the header commentary stakes its design on.
+    #[case("auto cannon", &["down", "left", "down", "up", "up", "right"])]
+    #[case("auto cannon sentry", &["down", "up", "right", "up", "left", "up"])]
+    fn test_helldivers_commands_walk_to_their_key_plans(
+        #[case] phrase: &str,
+        #[case] expected: &[&str],
+    ) {
+        let profile = Profile::parse(&LoadedProfile {
+            source: "profiles/helldivers2.yaml".to_string(),
+            content: HELLDIVERS.to_string(),
+        })
+        .expect("the profile should load");
+        let automaton = Automaton::compile(&profile.grammar).expect("the grammar should compile");
+
+        assert_eq!(walk_actions(&automaton, phrase), presses(expected));
     }
 
     #[test]
     fn test_defaults_apply_to_a_minimal_profile() {
-        let profile =
-            parse("model: /models/en\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n")
-                .expect("a minimal profile should load");
+        let profile = parse(&minimal("")).expect("a minimal profile should load");
 
         assert_eq!(profile.name, None);
         assert_eq!(profile.display_name(), "<unnamed profile>");
@@ -438,9 +503,9 @@ mod tests {
 
     #[test]
     fn test_the_recognition_block_loads_and_validates() {
-        let profile = parse(
-            "model: /models/en\nrecognition:\n  silence: 150ms\n  alternatives: 3\n  confidence_margin: 2.5\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n",
-        )
+        let profile = parse(&minimal(
+            "recognition:\n  silence: 150ms\n  alternatives: 3\n  confidence_margin: 2.5\n",
+        ))
         .expect("a profile with a recognition block should load");
 
         assert_eq!(profile.recognition.silence, Duration::from_millis(150));
@@ -451,10 +516,8 @@ mod tests {
         );
 
         // The impossible combination is refused with the reason spelled out.
-        let error = parse(
-            "model: /models/en\nrecognition:\n  eager: true\n  alternatives: 3\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n",
-        )
-        .expect_err("eager + alternatives cannot work together");
+        let error = parse(&minimal("recognition:\n  eager: true\n  alternatives: 3\n"))
+            .expect_err("eager + alternatives cannot work together");
         assert!(
             error.to_string().contains("finalized"),
             "unexpected error: {error}"
@@ -465,7 +528,7 @@ mod tests {
     fn test_the_model_is_optional() {
         // A shared profile may leave the model to whoever runs it, via
         // `--model` or $VOSK_MODEL_PATH — see `resolve_model`.
-        let profile = parse("commands:\n  - phrase: salute\n    keys: [\"x\"]\n")
+        let profile = parse("grammar: |\n  Salute = \"salute\" { x }\n")
             .expect("a profile without a model should still load");
 
         assert_eq!(profile.model, None);
@@ -473,11 +536,28 @@ mod tests {
 
     #[test]
     fn test_load_errors_name_the_source() {
-        let error = parse("model: /models/en\ncommands: not-a-list\n")
-            .expect_err("commands must be a list");
+        let error =
+            parse("model: /models/en\ngrammar: 42\n").expect_err("the grammar must be a string");
         assert!(
             error.to_string().contains("test-profile.yaml"),
             "unexpected error: {error}"
+        );
+        assert!(error.is(human_errors::Kind::User));
+    }
+
+    #[test]
+    fn test_a_bad_grammar_is_a_load_error_with_its_diagnostics() {
+        let error = parse("model: /models/en\ngrammar: |\n  Salute = \"salute\" { notakey }\n")
+            .expect_err("an unknown key should fail the load");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("test-profile.yaml"),
+            "the error should name the source, got: {message}"
+        );
+        assert!(
+            message.contains("notakey"),
+            "the error should carry the diagnostic, got: {message}"
         );
         assert!(error.is(human_errors::Kind::User));
     }
@@ -489,11 +569,25 @@ mod tests {
     // ...and one nested inside a block.
     #[case("model: /models/en\naudio:\n  devise: default\n", "devise")]
     fn test_unknown_fields_fail_loudly(#[case] prefix: &str, #[case] typo: &str) {
-        let yaml = format!("{prefix}commands:\n  - phrase: salute\n    keys: [\"x\"]\n");
+        let yaml = format!("{prefix}grammar: |\n  Salute = \"salute\" {{ x }}\n");
         let error = parse(&yaml).expect_err("a typo should be caught");
         assert!(
             error.to_string().contains(typo),
             "the error should name the unknown field, got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_the_removed_commands_list_is_refused_by_name() {
+        // The old schema's `commands:` list is gone; a profile still carrying
+        // one must hear that it is not silently ignored.
+        let error = parse(
+            "model: /models/en\ncommands:\n  - phrase: salute\ngrammar: |\n  Salute = \"salute\" { x }\n",
+        )
+        .expect_err("the old commands list should be rejected");
+        assert!(
+            error.to_string().contains("commands"),
+            "the error should name the removed field, got: {error}"
         );
     }
 
@@ -503,9 +597,8 @@ mod tests {
             return;
         };
 
-        let profile =
-            parse("model: ~/models/en\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n")
-                .expect("the profile should load");
+        let profile = parse("model: ~/models/en\ngrammar: |\n  Salute = \"salute\" { x }\n")
+            .expect("the profile should load");
         assert_eq!(
             profile.model,
             Some(PathBuf::from(format!("{home}/models/en")))
@@ -514,9 +607,7 @@ mod tests {
 
     #[test]
     fn test_the_command_line_model_wins() {
-        let profile =
-            parse("model: /profile/model\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n")
-                .expect("the profile should load");
+        let profile = parse(&minimal("")).expect("the profile should load");
 
         let resolved = resolve_model_from(
             Some(Path::new("/cli/model")),
@@ -531,9 +622,7 @@ mod tests {
 
     #[test]
     fn test_the_profile_model_beats_the_environment() {
-        let profile =
-            parse("model: /profile/model\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n")
-                .expect("the profile should load");
+        let profile = parse(&minimal("")).expect("the profile should load");
 
         let resolved = resolve_model_from(
             None,
@@ -543,13 +632,13 @@ mod tests {
         )
         .expect("the profile should resolve");
 
-        assert_eq!(resolved, PathBuf::from("/profile/model"));
+        assert_eq!(resolved, PathBuf::from("/models/en"));
     }
 
     #[test]
     fn test_the_environment_is_the_last_resort() {
-        let profile = parse("commands:\n  - phrase: salute\n    keys: [\"x\"]\n")
-            .expect("the profile should load");
+        let profile =
+            parse("grammar: |\n  Salute = \"salute\" { x }\n").expect("the profile should load");
 
         let resolved = resolve_model_from(
             None,
@@ -564,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_no_model_anywhere_names_every_mechanism() {
-        let profile = parse("name: Deep Rock\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n")
+        let profile = parse("name: Deep Rock\ngrammar: |\n  Salute = \"salute\" { x }\n")
             .expect("the profile should load");
 
         let error = resolve_model_from(None, &profile, &SystemConfig::default(), None)
@@ -596,57 +685,14 @@ mod tests {
     }
 
     #[test]
-    fn test_a_profile_needs_commands() {
-        let error =
-            parse("model: /models/en\ncommands: []\n").expect_err("an empty profile is useless");
+    fn test_a_profile_needs_published_commands() {
+        // A grammar of nothing but private building blocks listens for
+        // nothing — the grammar-schema shape of the old empty-commands error.
+        let error = parse("model: /models/en\ngrammar: |\n  salute = \"salute\" { x }\n")
+            .expect_err("a profile with no published rules is useless");
         assert!(
-            error.to_string().contains("does not define any commands"),
+            error.to_string().contains("does not publish any commands"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn test_structural_errors_name_the_command() {
-        let error = parse(
-            "model: /models/en\ncommands:\n  - name: Salute\n    phrase: salute\n    keys: [\"x\"]\n    events:\n      - down: x\n",
-        )
-        .expect_err("both output forms at once should be rejected");
-
-        let message = error.to_string();
-        assert!(
-            message.contains("'Salute'"),
-            "the error must name the command, got: {message}"
-        );
-        assert!(
-            message.contains("only use one output form"),
-            "unexpected error: {message}"
-        );
-    }
-
-    #[test]
-    fn test_an_explosive_phrase_is_rejected_by_name() {
-        // Ten chained four-way alternates would expand to 4^10 phrases.
-        let phrase = ["{a, b, c, d}"; 10].join(" ");
-        let error = parse(&format!(
-            "model: /models/en\ncommands:\n  - name: Explosive\n    phrase: \"{phrase}\"\n    keys: [\"x\"]\n"
-        ))
-        .expect_err("the expansion cap should reject this");
-
-        let message = error.to_string();
-        assert!(
-            message.contains("'Explosive'") && message.contains("1048576"),
-            "unexpected error: {message}"
-        );
-        assert!(message.contains("512"), "unexpected error: {message}");
-    }
-
-    #[test]
-    fn test_a_phrase_at_the_cap_is_accepted() {
-        // Nine chained two-way alternates expand to exactly 512.
-        let phrase = ["{a, b}"; 9].join(" ");
-        parse(&format!(
-            "model: /models/en\ncommands:\n  - phrase: \"{phrase}\"\n    keys: [\"x\"]\n"
-        ))
-        .expect("512 phrases is within the cap");
     }
 }

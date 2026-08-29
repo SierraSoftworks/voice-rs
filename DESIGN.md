@@ -21,7 +21,8 @@ command phrase, it presses keys in a game (or any application) for you. It is bu
 
 - Vosk-based recognition using a compiled per-profile grammar (never transcription mode).
 - A small phrase DSL supporting required words, `[optional]` words, `{alternate, choices}`, and
-  arbitrary nesting of the two.
+  arbitrary nesting of the two. (Since superseded by the composable rule grammar — see
+  [Composable command grammars](#composable-command-grammars).)
 - Ambiguous-prefix commands ("autocannon" vs "autocannon sentry") resolved by a configurable
   statement-completion timeout.
 - Low-latency recognition: a configurable endpointer, partial-driven ("eager") command firing, and
@@ -95,32 +96,33 @@ voice-orders/
     ├── telemetry.rs               # tracing-batteries session helpers
     ├── commands/
     │   ├── mod.rs                 # Command enum (clap Subcommand) + dispatch
-    │   ├── new.rs                 # scaffold a commented profile
-    │   ├── validate.rs            # structure + vocabulary + lints
+    │   ├── new.rs                 # scaffold a commented profile with a worked grammar
+    │   ├── validate.rs            # structure + grammar analysis + vocabulary
     │   └── run.rs                 # pipeline assembly + child process supervision
     ├── config/
     │   ├── mod.rs                 # Profile (serde), cross-field validate_*() methods
-    │   ├── command.rs             # CommandConfig: phrase + output (both YAML forms)
     │   ├── hotkey.rs              # HotkeyConfig { device, key, mode }
-    │   ├── output.rs              # OutputConfig → compiled KeyEvent plans
+    │   ├── output.rs              # KeyName resolution + OutputDefaults pacing
     │   ├── duration.rs            # humantime deserialize_with helpers
     │   └── loader.rs              # path-vs-https detection, reqwest fetch, gist raw rewrite
     ├── grammar/
-    │   ├── mod.rs                 # CommandPhrase owner type (Pin<Box<String>> + 'static AST)
-    │   ├── location.rs            # Loc { line, column } + Display "line X, column Y"
-    │   ├── token.rs               # Token<'a> variants, all carrying Loc
-    │   ├── lexer.rs               # Scanner<'a>: Iterator<Item = Result<Token<'a>, Error>>
-    │   ├── parser.rs              # recursive descent, Peekable<I>, nested() depth guard
-    │   ├── expr.rs                # Node<'a> / PhraseExpr<'a> AST + round-trip Display
-    │   └── expansion.rs           # AST → deduped concrete phrase list + linear word set
+    │   ├── mod.rs                 # Grammar: parse-and-analyze entry point, word set, serde
+    │   ├── token.rs               # the token vocabulary
+    │   ├── lexer.rs               # chumsky lexer → spanned token stream
+    │   ├── parser.rs              # chumsky parser → spanned rule list
+    │   ├── ast.rs                 # owned, spanned AST (rules/branches/terms/actions)
+    │   ├── analysis.rs            # static analysis: errors + lints
+    │   ├── diagnostic.rs          # Diagnostic + ariadne rendering + user_error
+    │   ├── automaton.rs           # NFA transducer compiler + hypothesis Walk
+    │   └── feed.rs                # recognition feed: expansion or rule-boundary decomposition
     ├── audio/
     │   └── mod.rs                 # cpal capture: device selection, format conversion, frame channel
     ├── recognition/
     │   ├── mod.rs                 # Recognition/Vocabulary traits (mockable), RecognitionEvent
     │   └── vosk.rs                # Vosk Model/Recognizer wrapper + dedicated thread loop
     ├── matcher/
-    │   ├── mod.rs                 # matcher task: event loop + completion-timeout state machine
-    │   └── trie.rs                # word trie phrase table
+    │   ├── mod.rs                 # MatcherOptions/CommandAction: the engine's shared vocabulary
+    │   └── engine.rs              # engine task: hypothesis walk + completion-timeout state machine
     ├── hotkey/
     │   ├── mod.rs                 # ListenMode logic + the platform-neutral watch() seam
     │   ├── discovery.rs           # evdev device discovery and ranking          [linux]
@@ -151,6 +153,8 @@ uinput-tokio = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs", features = ["opentelemetry"] }
 strsim = "0.11"                       # did-you-mean suggestions
+chumsky = "0.13"                      # the grammar's lexer + parser
+ariadne = "0.6"                       # grammar diagnostics with source excerpts
 
 [dev-dependencies]
 rstest = "0.23"
@@ -195,7 +199,7 @@ Verified API facts this design relies on (`vosk` 0.3.1):
                  │                 Partial / Final / Muted                      │
                  │                             │                                │
                  │                             ▼                                │
-                 │      matcher task: trie walk + completion-timeout            │
+                 │      matcher task: hypothesis walk + completion-timeout      │
                  │      state machine (select! on events / sleep_until)         │
                  │                             │                                │
                  │              mpsc<CommandAction> (cap 32)  ← the command queue
@@ -278,167 +282,15 @@ voice-orders has five concurrent tasks that all need to *wake up* on shutdown, w
 threads (cpal callback, recognizer) exit via channel closure instead, so no atomics are needed for
 shutdown. `main()` stays thin per house style.
 
-## Grammar DSL
+## Composable command grammars
 
-Command phrases are written in a small DSL:
+> **Status: implemented.** This is the grammar the crate ships (the work plan at the end of this
+> section records how it landed). It was a **breaking profile change**: the original single-phrase
+> DSL, the `keys:`/`events:` output forms and the `commands:` list were removed rather than
+> maintained alongside it. `profiles/arma3.yaml` is the canonical example, and every shipped
+> profile is loaded and compiled by unit tests so the examples cannot drift from the code.
 
-```
-deploy [the] {autocannon, auto cannon} [sentry]
-```
-
-- plain words are required, in order;
-- `[optional]` groups may be omitted;
-- `{alternate, choices}` groups require exactly one branch;
-- the two nest freely: `[{optional, elective}] combinations`.
-
-### EBNF
-
-```
-phrase     = term , { term } ;
-term       = word | optional | alternates ;
-optional   = "[" , phrase , "]" ;
-alternates = "{" , phrase , { "," , phrase } , "}" ;
-word       = word-char , { word-char } ;
-word-char  = letter | digit | "'" | "-" ;
-```
-
-Whitespace separates words and is otherwise insignificant. Nesting is capped at
-`MAX_NESTING_DEPTH = 8` — deeper phrases are almost certainly a mistake, and the cap bounds parser
-recursion.
-
-### Lexer and parser (filt-rs style)
-
-The lexer is a zero-copy scanner over the source string, and it *is* the token stream — errors are
-items, so a lex error surfaces at exactly the point the parser demands the bad token:
-
-```rust
-// grammar/token.rs
-#[derive(Debug, PartialEq)]
-pub enum Token<'a> {
-    Word(Loc, &'a str),
-    LeftBracket(Loc), RightBracket(Loc),
-    LeftBrace(Loc), RightBrace(Loc),
-    Comma(Loc),
-}
-
-// grammar/lexer.rs
-pub struct Scanner<'a> {
-    source: &'a str,
-    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
-    line: usize,
-    line_start: usize,     // byte offset of the current line; column = 1 + idx - line_start
-}
-
-impl<'a> Iterator for Scanner<'a> {
-    type Item = Result<Token<'a>, crate::Error>;
-    // ...
-}
-```
-
-`Loc { line, column }` is computed on demand — no span table. Every token variant carries its `Loc`;
-word payloads are `&'a str` slices of the source (no allocation in the lexer).
-
-The parser is recursive descent over `Peekable<I>` where `I: Iterator<Item = Result<Token<'a>, Error>>`
-(generic so tests can drive it directly), with one method per production and a `nested()` wrapper
-guarding the two recursion points (`[`, `{`) against depth abuse:
-
-```rust
-// grammar/expr.rs
-#[derive(Debug, PartialEq, Clone)]
-pub enum Node<'a> {
-    Word(Loc, &'a str),
-    Optional(Loc, Vec<Node<'a>>),          // [ ... ] — the whole sequence is optional
-    Alternates(Loc, Vec<Vec<Node<'a>>>),   // { seq, seq, ... }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct PhraseExpr<'a>(pub Vec<Node<'a>>);
-```
-
-The AST borrows from the source. So that parsed phrases can live inside config structs, an owner type
-pairs the pinned source string with a `'static`-lifetime AST — the same self-referential pattern as
-`filt_rs::Filter`, and the only `unsafe` in the crate:
-
-```rust
-// grammar/mod.rs
-pub struct CommandPhrase {
-    source: std::pin::Pin<Box<String>>,
-    expr: PhraseExpr<'static>,             // borrows from `source`; narrowed on access
-}
-
-impl CommandPhrase {
-    pub fn parse(source: String) -> Result<Self, crate::Error>;
-    pub fn source(&self) -> &str;
-    pub fn expr(&self) -> &PhraseExpr<'_>;
-}
-
-impl Clone for CommandPhrase { /* re-parses source, like filt-rs */ }
-impl std::fmt::Display for CommandPhrase { /* round-trips via the AST */ }
-impl<'de> serde::Deserialize<'de> for CommandPhrase { /* parse during load */ }
-```
-
-Because `Deserialize` parses immediately, a bad phrase is a **config-load error** with a precise
-location — never a runtime surprise.
-
-### Error messages
-
-Errors follow the filt-rs voice: second person, the location interpolated into the message (advice
-arrays must be `&'static`, so all dynamic detail lives in the message), and a worked example wherever
-it helps. Representative set:
-
-| Situation | Message | Advice |
-|---|---|---|
-| Unclosed `[` | `You have an unclosed '[' at line 1, column 8 — every optional group needs a matching ']'.` | `Close the optional group, e.g. 'deploy [the] sentry'.` |
-| Stray `]` | `We found a ']' at line 1, column 3 without a matching '[' before it.` | `Remove the stray ']' or add a '[' where the optional words begin.` |
-| Empty alternate branch | `The alternates group starting at line 1, column 8 has an empty branch (a ',' with nothing before or after it).` | `Every branch in an '{a, b}' group needs at least one word, e.g. '{autocannon, auto cannon}'.` |
-| Empty optional | `The optional group at line 1, column 8 is empty.` | `Put at least one word inside '[...]', or remove the brackets entirely.` |
-| Depth limit | `You've nested groups more than 8 levels deep at line 1, column 41.` | `Simplify the phrase — deeply nested '[{...}]' groups usually read better as several separate commands.` |
-| Invalid character | `We found an unexpected character '(' at line 1, column 12.` | `Phrases may only contain words, '[optional]' groups and '{alternate, choices}' groups.` |
-
-Tests assert these by substring, including the exact `line X, column Y`, so location regressions are
-loud.
-
-### Expansion and grammar compilation
-
-`grammar/expansion.rs` turns an AST into the concrete phrases Vosk will hear:
-
-```rust
-pub const MAX_EXPANSIONS_PER_COMMAND: usize = 512;
-
-pub struct Expansion {
-    pub phrases: Vec<Vec<String>>,   // deduped, insertion-ordered, lowercased word sequences
-}
-
-pub fn count(expr: &PhraseExpr<'_>) -> usize;                 // multiplicative, no materialization
-pub fn expand(expr: &PhraseExpr<'_>) -> Result<Expansion, crate::Error>;
-pub fn word_set(expr: &PhraseExpr<'_>) -> BTreeSet<String>;   // linear in AST size, for validate
-```
-
-Expansion is a cartesian product: `Optional` contributes the branches `{[], inner}`, `Alternates`
-contributes its branches, and results are deduped with an insertion-ordered set (so phrases like
-`[a] [a]` or `{a, a}` collapse their duplicates). A phrase whose terms are all optional expands to
-include the *empty* phrase, which cannot be spoken — grammar compilation must reject such commands
-(and `validate` lints them). The count is computed *multiplicatively before materializing*, so an
-explosive phrase fails fast instead of allocating; exceeding `MAX_EXPANSIONS_PER_COMMAND` is a hard
-error in both `validate` and `run` — silently truncating a grammar would silently break commands.
-`word_set` walks the AST linearly, so vocabulary checking never needs the full expansion.
-
-The grammar handed to `Recognizer::new_with_grammar` is: every expanded phrase of every command,
-space-joined, globally deduped — **plus the special `"[unk]"` entry**. Without `[unk]`, Vosk
-force-aligns *any* speech (including unrelated chatter on voice comms) onto the nearest grammar
-phrase, causing false triggers; with it, out-of-grammar audio decodes as `[unk]` and the matcher
-discards it.
-
-## Grammar v2: composable command grammars
-
-> **Status: the standing design.** This section supersedes the phrase DSL above, the trie phrase
-> table below, and the `commands:` profile schema — each superseded section is updated or removed
-> as the implementation lands (the work plan is at the end of this section). Grammar v2 is a
-> **breaking profile change**: the phrase DSL, `keys:`/`events:` forms and the `commands:` list are
-> removed rather than maintained alongside it. `profiles/arma3.yaml` is the canonical example and
-> must load once the engine lands.
-
-The phrase DSL describes single phrases; it cannot share structure between commands. Articulate-
+The original phrase DSL described single phrases; it could not share structure between commands. Articulate-
 style grammars need exactly that: forty commands which all start with the same *subject* rule
 ("two and three fall back"), direct objects whose keys depend on context, and repetition. Grammar
 v2 is a rule-based grammar language in which commands compose:
@@ -483,8 +335,9 @@ action     = chord | "wait" , "(" , duration , ")"
   construction; `validate` reports per-rule automaton size so a `*` at the cap is visible.
 - **No recursion.** A rule-reference cycle is a load error advising a bounded repetition instead.
 - **Rule termination.** The action block ends a rule when present; a rule without one ends at the
-  next `ident =` at the start of a line, and **implicitly propagates** its accumulated commands
-  (equivalent to `{ ... }`).
+  next `ident =` (a word followed by `=` is never a rule reference, so the grammar stays
+  whitespace-insensitive), and **implicitly propagates** its accumulated commands (equivalent to
+  `{ ... }`).
 
 ### Command semantics
 
@@ -515,8 +368,8 @@ that point.
 
 ### Parsing: chumsky + ariadne
 
-The v1 lexer/parser (and the `Pin<Box<String>>` self-referential owner, the only unsafe in the
-crate) are replaced by the pattern proven in
+The original zero-copy lexer/parser (and the `Pin<Box<String>>` self-referential owner, once the
+only unsafe in the crate) gave way to the pattern proven in
 [optimist's squiggle module](https://github.com/SierraSoftworks/optimist/blob/main/src/squiggle/mod.rs):
 **chumsky 0.13** for a two-stage parse (lexer → spanned token stream → parser over
 `Stream::from_iter`, `into_output_errors()` accumulating rather than aborting) and **ariadne 0.6**
@@ -524,29 +377,31 @@ for rendering. The AST is owned (`String` words, byte-offset `Span`s) — no bor
 unsafe. Errors are collected as `Diagnostic { kind, message, span, help }` values (syntax /
 analysis / lint), rendered by ariadne with the source excerpt into plain UTF-8 text and carried to
 the user inside a `human_errors::user` error, so `crate::Error` remains the only error type and
-the advice-array convention is untouched. Every diagnostic keeps the second-person voice and
-worked examples of the v1 error table.
+the advice-array convention is untouched. Every diagnostic keeps the second-person voice and a
+worked example (`You have an unclosed '(' …` / `Close the group, e.g. ("fall back" | "regroup")`),
+and the profile parses its grammar during deserialization, so a bad grammar is a config-load error
+naming the profile's source — never a runtime surprise.
 
 ### Static analysis (load-time, all reported in one pass)
 
 Errors: reference to an undefined rule; duplicate rule definition; rule-reference cycles; a
 published rule that can match the empty word sequence; two published rules accepting the same word
-sequence with different assembled outputs (the v1 duplicate-phrase error, now checked on the
-automaton — identical outputs may silently collapse); automaton size above `MAX_AUTOMATON_STATES`;
+sequence with different assembled outputs (checked on the automaton with a bounded subset
+sweep — identical outputs may silently collapse, which is how deliberate synonyms are written); automaton size above `MAX_AUTOMATON_STATES`;
 unknown key names or malformed chords in actions. Lints (warnings): a private rule referenced by
 nothing; bare `...` alongside `name...` in one block; a `hold` with no `release` on some accepting
 path (path-sensitive — checked per rule, with `release(*)` discharging it); prefix-relation notes
 naming the completion-timeout cost ("saying \"two\" waits 350ms in case you continue"); adjacent-
 slot homophone confusability ("to"/"two", "four"/"for") where both are valid continuations of the
-same state. Vocabulary checking walks the rule graph's literal set linearly, exactly as
-`word_set` does today.
+same state. Vocabulary checking walks the rule graph's literal set linearly
+(`Grammar::word_set`), so it never needs an expansion.
 
 ### Compilation: a word-level transducer
 
 The rule graph compiles into a single NFA whose transitions consume one word and carry **output
 ops** (`Emit(fragment)`, `OpenCapture(name)`/`CloseCapture`), with published rules marked on
 accepting states alongside their action program (`Press`/`Hold`/`Release`/`ReleaseAll`/`Wait`/
-`SpliceAll`/`SpliceCapture(name)` items). The v1 trie is the degenerate case of this automaton.
+`SpliceAll`/`SpliceCapture(name)` items). A word-level trie is the degenerate case of this automaton.
 Determinization is deliberately **not** attempted (the same word can carry different outputs by
 context — "red" is shift+F1 as a subject, plain 1 as an assign object): the matcher instead walks
 a small **set of alive hypotheses**, each carrying its state, accumulated vector and captures.
@@ -554,20 +409,21 @@ Utterances are short and the grammar word-branching is low, so the alive set sta
 practice; a `MAX_HYPOTHESES` guard turns pathological grammars into a load-time error rather than
 a runtime stall.
 
-The matcher's semantics are unchanged, restated over hypothesis sets: *ambiguous* now means "some
-alive hypothesis is accepting while any hypothesis can consume more words"; greedy longest-match
-segmentation, re-sync from the root, `Pending` + completion timeout, eager partial-driven firing
-and reconciliation, and confidence gating all port — with `CommandId` comparisons becoming
-comparisons of assembled action vectors, which is what the n-best gating design already specifies.
-`CommandAction` gains the per-match assembled plan and a synthesized display name
-(`Watch(two three, north)`); the executor is untouched apart from `release(*)` (a `ReleaseAll`
-`KeyEvent` played from the already-tracked pressed-key set).
+The matcher's semantics are the original trie machine's, restated over hypothesis sets:
+*ambiguous* means "some alive hypothesis is accepting while any hypothesis can consume more
+words"; greedy longest-match segmentation, re-sync from the root, `Pending` + completion timeout,
+eager partial-driven firing and reconciliation, and confidence gating all carry over — with
+command-identity comparisons being comparisons of assembled action vectors, which is what the
+n-best gating design specifies. `CommandAction` carries the per-match assembled plan and a
+synthesized display name (`Watch(two three, north)`); the executor knows nothing of any of this
+apart from `release(*)` (a `ReleaseAll` `KeyEvent` played from the already-tracked pressed-key
+set).
 
 ### Feeding Vosk
 
 Full per-command expansion is impossible under composition (`squad_selection` alone admits
 thousands of subject forms). The recognizer grammar is instead built per **published rule**: rules
-whose concrete expansion fits under `MAX_EXPANSIONS_PER_COMMAND` contribute whole phrases (best
+whose concrete expansion fits under `MAX_EXPANSIONS_PER_RULE` contribute whole phrases (best
 recognition — Vosk sees complete utterances); larger rules are **decomposed at referenced-rule
 boundaries** into fragment phrase lists (each private rule's own expansions), relying on the
 verified fact that Vosk chains grammar entries within one utterance — which is already how
@@ -591,45 +447,43 @@ grammar: |
 ```
 
 `grammar:` is an **inline block** — profiles stay single, URL-shareable files. The `commands:`
-list, `phrase:`/`keys:`/`events:` forms and the v1 phrase DSL are removed. The grammar parses
-during profile deserialization (the parse-during-load rule is unchanged: a bad grammar is a
-config-load error with an ariadne-rendered excerpt). `voice-orders new` scaffolds a commented
-grammar; `validate` runs the static analysis above plus vocabulary checks.
+list, its `phrase:`/`keys:`/`events:` forms and the original phrase DSL are gone. The grammar
+parses during profile deserialization (the parse-during-load rule is unchanged: a bad grammar is a
+config-load error with an ariadne-rendered excerpt), while the automaton compiles in the command
+assembly (`run`/`test`/`validate`), where its errors can name the profile's source.
+`voice-orders new` scaffolds a commented grammar; `validate` runs the static analysis above plus
+vocabulary checks — see [`validate`](#validate).
 
 ### Work plan
 
-| # | Branch | Contents | Depends on |
+| # | Branch | Contents | Status |
 |---|---|---|---|
-| G1 | `grammar-v2-design` | This design section; `profiles/arma3.yaml`. | — |
-| G2 | `grammar-v2-core` | `src/grammar/v2/`: token/lexer/parser/AST/diagnostics (chumsky + ariadne), static analysis, rule-graph word set. | — |
-| G3 | `grammar-v2-output` | `KeyEvent::ReleaseAll` + executor handling; assembly pacing helper (flatten + duration/interval/wait rules). | — |
-| G4 | `grammar-v2-automaton` | NFA transducer compiler, accepting-state action programs, expansion/decomposition for the Vosk feed, automaton-level duplicate detection. | G2 |
-| G5 | `grammar-v2-matcher` | Multi-hypothesis matcher walk; pending/eager/confidence gating over hypothesis sets; assembled `CommandAction`s. | G3, G4 |
-| G6 | `grammar-v2-profile` | Profile schema v2, wiring in `run`/`test`/`validate`/`new`, migrate `profiles/*.yaml` + `examples/profile.yaml`, delete the v1 DSL and flatten `grammar/v2/` → `grammar/`. | G5 |
-| G7 | `grammar-v2-docs` | VuePress grammar reference rewrite. | G6 |
+| G1 | `grammar-v2-design` | This design section; `profiles/arma3.yaml`. | done |
+| G2 | `grammar-v2-core` | Token/lexer/parser/AST/diagnostics (chumsky + ariadne), static analysis, rule-graph word set. | done |
+| G3 | `grammar-v2-output` | `KeyEvent::ReleaseAll` + executor handling; assembly pacing helper (flatten + duration/interval/wait rules). | done |
+| G4 | `grammar-v2-automaton` | NFA transducer compiler, accepting-state action programs, expansion/decomposition for the Vosk feed, automaton-level duplicate detection. | done |
+| G5 | `grammar-v2-matcher` | Multi-hypothesis matcher walk; pending/eager/confidence gating over hypothesis sets; assembled `CommandAction`s. | done |
+| G6 | `grammar-v2-profile` | Profile schema v2, wiring in `run`/`test`/`validate`/`new`, migrated `profiles/*.yaml` + `examples/profile.yaml`, deleted the original DSL and flattened `grammar/v2/` → `grammar/`. | done |
+| G7 | `grammar-v2-docs` | VuePress grammar reference rewrite. | not started |
 
-## Matcher: trie + completion timeout
+## Matcher: the hypothesis walk + completion timeout
 
-### Phrase table
+### The walk
 
-All expanded phrases are loaded into a word-level trie (arena-allocated, indices instead of boxes):
+The matcher engine (`matcher/engine.rs`) walks utterances over the grammar's compiled
+[automaton](#compilation-a-word-level-transducer) with a `Walk` — a set of alive hypotheses, each
+carrying its state and accumulated output. Between words the engine asks the walk what the words
+so far mean:
 
-```rust
-// matcher/trie.rs
-pub struct PhraseTrie { nodes: Vec<TrieNode> }        // index 0 = root
+- `accepts()` — the readings which form a complete published command right now, each with its
+  evaluated action program and display name (an `Accept`);
+- `can_extend()` — whether any reading could consume another word;
+- `is_ambiguous()` — some reading accepts **and** some can extend, which is the
+  completion-timeout condition. Ambiguity is a property of the *walk position*, regardless of
+  which commands are involved — a word-level trie's terminal-with-children node, generalized.
 
-struct TrieNode {
-    children: HashMap<String, usize>,                 // word → node index
-    terminal: Option<CommandId>,                      // a command's full phrase ends here
-}
-
-pub struct CommandId(pub usize);                      // index into Vec<CompiledCommand>
-```
-
-Because one command expands to many phrases, many leaves map to the same `CommandId`. Ambiguity is a
-*node* property: a node that is terminal **and** has children marks an utterance that is also a
-strict prefix of some longer phrase — regardless of which commands are involved. Building the trie
-detects duplicate phrases across commands (an error in `run`, a warning in `validate`).
+Duplicate commands (the same word sequence, different assembled outputs) are detected when the
+automaton compiles, before any walk runs — an error in `run`, `test` and `validate` alike.
 
 ### The completion-timeout state machine
 
@@ -637,15 +491,15 @@ The matcher consumes `RecognitionEvent`s and produces `CommandAction`s onto the 
 
 ```rust
 pub struct CommandAction {
-    pub command: String,             // display name, for logging
-    pub output: CompiledOutput,      // pre-compiled at load time
+    pub command: String,             // display name: rule + captures, e.g. Watch(two, east)
+    pub output: CompiledOutput,      // assembled from the action program at fire time
 }
 
 enum MatchState {
     Idle,
     Pending {
-        command: CommandId,          // matched and ready to fire
-        node: usize,                 // trie position to continue from
+        accept: Accept,              // matched and ready to fire
+        walk: Walk,                  // the resting walk, to continue from
         deadline: tokio::time::Instant,   // now + profile.completion_timeout
     },
 }
@@ -658,20 +512,20 @@ hatch), commands fire on **Final** results only; partials are used solely to hol
 open, never to fire. Transitions:
 
 - **Idle + Final(words):** strip `[unk]` tokens, then walk the words from the root with greedy
-  longest-match segmentation — when a word has no child but the path passed a terminal, emit that
-  terminal's command and re-sync the remaining words from the root; with no terminal on the path,
+  longest-match segmentation — when a word kills the walk but the path passed an accept, emit that
+  accept's command and re-sync the remaining words from the root; with no accept on the path,
   drop up to the current word and re-sync (logged at debug). At the end of the words:
-  - resting on an **unambiguous terminal** → fire immediately, go Idle;
-  - resting on an **ambiguous terminal** → go `Pending { command, node, deadline: now + timeout }`;
-  - resting mid-trie with no terminal → incomplete phrase, drop, go Idle.
+  - resting on an **unambiguous accept** → fire immediately, go Idle;
+  - resting on an **ambiguous accept** → go `Pending { accept, walk, deadline: now + timeout }`;
+  - resting mid-phrase with no accept → incomplete phrase, drop, go Idle.
 - **Pending + timer fires:** fire the pending command, go Idle.
-- **Pending + Final(words):** continue the walk from `node`. If the continuation reaches a longer
-  terminal, the longer command *supersedes* the pending one (only the longer fires). If the first
-  word does not extend from `node`, fire the pending command first, then match the new words from the
+- **Pending + Final(words):** continue from the pending `walk`. If the continuation reaches a longer
+  accept, the longer command *supersedes* the pending one (only the longer fires). If the first
+  word does not extend the walk, fire the pending command first, then match the new words from the
   root.
-- **Pending + Partial(text):** if the partial's next word extends from `node`, push the deadline out
-  to `now + timeout` — the speaker is mid-way through the longer phrase; don't fire the short command
-  under them. Otherwise ignore.
+- **Pending + Partial(text):** if the partial's next word extends the pending walk (probed on a
+  fork), push the deadline out to `now + timeout` — the speaker is mid-way through the longer
+  phrase; don't fire the short command under them. Otherwise ignore.
 - **Any + Muted:** clear everything, including a pending command — a half-confirmed command must not
   fire when listening resumes.
 
@@ -682,23 +536,23 @@ and an utterance-scoped `EagerContext` tracks what may fire before the endpointe
 
 ```rust
 struct EagerContext {                       // Some(_) from an utterance's first partial to its Final
-    start: usize,                           // walk origin: the pending node, or the root
-    passed: Option<CommandId>,              // pending command absorbed from the previous utterance
-    fired: Vec<(usize, CommandId)>,         // (position, command) already fired from partials
-    resting: Option<EagerResting>,          // the armed deadline, if the walk rests on a terminal
+    origin: Walk,                           // walk origin: the pending walk, or a fresh root walk
+    passed: Option<Accept>,                 // pending command absorbed from the previous utterance
+    fired: Vec<Match>,                      // (position, accept) already fired from partials
+    resting: Option<EagerResting>,          // the armed deadline, if the walk rests on an accept
 }
 ```
 
 - **Certain fires.** A command the greedy walk has *passed and resynced beyond* ended strictly
   before the partial's last word — no revision of the words still being spoken can take it back —
   so it fires **immediately**, recorded in `fired`.
-- **Resting on an unambiguous terminal** arms `now + eager_delay`, re-armed on every changed
+- **Resting on an unambiguous accept** arms `now + eager_delay`, re-armed on every changed
   partial: the hypothesis must hold still before it is trusted. The deadline firing fires the
   command, records it, and keeps the context open.
-- **Resting on an ambiguous terminal** arms the **completion timeout from the partial** — the wait
+- **Resting on an ambiguous accept** arms the **completion timeout from the partial** — the wait
   no longer starts at finalization, which is the big win for prefix commands. A later partial which
   does not move the resting point keeps the armed deadline.
-- **Resting mid-trie** (including past an uncommitted crossed terminal) arms nothing: the trailing
+- **Resting mid-phrase** (including past an uncommitted crossed accept) arms nothing: the trailing
   words may still grow into the longer phrase.
 - **Final(utterance):** *reconciliation*. The full walk runs as usual and its `(position, command)`
   sequence is compared against `fired`: a matching prefix means the remainder fires and an
@@ -709,7 +563,7 @@ struct EagerContext {                       // Some(_) from an utterance's first
   of the utterance is dropped and a warning is emitted through the session's event sink
   (`warning:` line / yellow TUI entry). The context is cleared at every Final.
 - **A new utterance's partial while a command is Pending** absorbs the pending command into the
-  context (`start`/`passed`) and disarms its timer: the continuation logic itself now decides its
+  context (`origin`/`passed`) and disarms its timer: the continuation logic itself now decides its
   fate — an extending hypothesis supersedes it, a non-extending one flushes it immediately. This
   subsumes the eager-off rule where an extending partial merely pushed the deadline.
 - **Muted / cancellation** clear the context without firing, exactly as they clear `Pending`. The
@@ -722,8 +576,8 @@ When `recognition.alternatives > 0`, finalized utterances carry Vosk's n-best li
 **unnormalized** path scores (measured: ~150–240 for five-word utterances; homophones return
 byte-identical scores; acoustically distinct competitors gap by a few units), so only the *margin*
 between alternatives of one utterance is meaningful. At each Final, every alternative's text is
-resolved through the trie (from the same walk origin the utterance itself will use) to the command
-sequence it would run; if any alternative within `confidence_margin` of the 1-best resolves to a
+resolved through the automaton (from the same walk origin the utterance itself will use) to the
+assembled key plans it would run; if any alternative within `confidence_margin` of the 1-best resolves to a
 **different non-empty** sequence, the whole utterance is suppressed and a warning names both
 readings (`ambiguous: "mortar sentry" vs "rocket sentry" (margin 1.2)`). Alternatives resolving to
 the same sequence (homophone phrases of one command) or to nothing are ignored. A suppressed
@@ -743,7 +597,7 @@ loop {
         _ = cancel.cancelled() => break,
         _ = sleep_until_deadline(&state) => fire_pending(&mut state, &queue).await,
         ev = events.recv() => match ev {
-            Some(ev) => transition(&mut state, ev, &trie, &queue).await,
+            Some(ev) => transition(&mut state, ev, &automaton, &queue).await,
             None => break,
         },
     }
@@ -798,9 +652,10 @@ session's event path so the user sees exactly what fired.
 
 ## Profile schema
 
-Profiles are standalone YAML files. serde does all structural validation at load (phrases parse
-during deserialization, key names resolve during deserialization, durations parse via humantime);
-explicit `validate_*()` methods cover cross-field invariants and always name the offending command.
+Profiles are standalone YAML files. serde does all structural validation at load (the grammar
+parses and analyzes during deserialization, key names resolve during deserialization, durations
+parse via humantime); explicit `validate_*()` methods cover cross-field invariants. The automaton
+compiles in the command assembly rather than at load, so its errors can name the profile's source.
 
 ```yaml
 # examples/profile.yaml
@@ -825,23 +680,16 @@ recognition:               # the latency levers (all optional; block absent = th
   alternatives: 0          # >0 requests an n-best list and enables confidence gating
   confidence_margin: 3.0   # suppress when a different-command alternative is this close to the winner
 
-defaults:                  # applies to the `keys:` shorthand form
-  duration: 30ms           # how long each chord is held down
-  interval: 25ms           # gap between chords
+defaults:                  # pacing for assembled key plans
+  duration: 30ms           # how long each press is held down
+  interval: 25ms           # gap between consecutive presses
 
-commands:
-  - phrase: deploy [the] {autocannon, auto cannon} [sentry]
-    keys: ["4"]                        # shorthand: press sequence
-
-  - phrase: open [the] terminal
-    keys: ["leftctrl+leftalt+t"]       # chord: all down in listed order, all up in reverse
-
-  - name: Salute                       # optional display name (defaults to the phrase)
-    phrase: salute
-    events:                            # explicit form: full control
-      - down: x
-      - wait: 750ms
-      - up: x
+# TitleCase rules are published as speakable commands; lowercase rules are
+# private building blocks (see "Composable command grammars" above).
+grammar: |
+  Autocannon = "deploy"? "the"? ("autocannon" | "auto cannon") "sentry"? { 4 }
+  Terminal = "open" "the"? "terminal" { leftctrl+leftalt+t }
+  Salute = "salute" { hold(x), wait(750ms), release(x) }
 ```
 
 `hotkey.interrupt` is the output-side half of a mute. Muting always resets the recognizer and clears
@@ -903,10 +751,11 @@ disagree about which microphone or hotkey you meant:
 reports the *merged* values: check 4 resolves the microphone the run would actually open, and check
 6 names the merged hotkey.
 
-### Output forms
+### Output plans
 
-`keys` and `events` are mutually exclusive per command (validated with an error naming the command).
-Both compile at load time into a flat event plan:
+What a command presses is written in its grammar rule's action block (see
+[Command semantics](#command-semantics)); the matched program is assembled into a flat event plan
+at fire time:
 
 ```rust
 // output/mod.rs
@@ -915,15 +764,16 @@ pub enum CompiledOutput {
     // future: Mouse(..), Exec(..), Audio(..)
 }
 
-pub enum KeyEvent { Down(KeyCode), Up(KeyCode), Wait(std::time::Duration) }
+pub enum KeyEvent { Down(KeyCode), Up(KeyCode), ReleaseAll, Wait(std::time::Duration) }
 ```
 
-- **`keys` (shorthand):** each entry is a chord like `"leftctrl+shift+p"` or a single key `"4"`.
-  Compilation per chord: `Down` each key in listed order → `Wait(duration)` → `Up` each key in
-  reverse order → `Wait(interval)` before the next chord. `duration`/`interval` come from
-  `defaults`, overridable per command.
-- **`events` (explicit):** 1:1 with `KeyEvent`. An unmatched `Down` is legal (hold-style macros) but
-  linted by `validate`, as is an `Up` without a prior `Down`.
+`output/assembly.rs` applies the profile's `defaults` pacing: a press puts every key of its chord
+`Down` in written order, holds it for `duration`, lifts in reverse order, and consecutive presses
+are separated by `interval` (an explicit `wait(..)` *replaces* that interval); `hold`/`release`
+carry no implicit pacing, and `release(*)` becomes `ReleaseAll`, played from the executor's
+tracked pressed-key set. A `hold` with no `release` later in the same action block is legal
+(hold-style macros) but linted at load; the lint is per block, so a hold deliberately spanning
+rules is not flagged.
 
 ### Key naming
 
@@ -1023,8 +873,9 @@ pub enum Command {
 }
 ```
 
-`new` writes a scaffold with every option present-but-commented plus two example commands, and
-refuses to overwrite an existing file (user error with advice).
+`new` writes a scaffold with every option present-but-commented plus a small worked grammar (two
+published rules, a private rule and a capture), and refuses to overwrite an existing file (user
+error with advice).
 
 ### `devices`: what this machine has to listen with
 
@@ -1147,8 +998,8 @@ next login and suggests `voice-orders doctor` to verify.
 Assembly order in `commands/run.rs` — each step fails early with a human error:
 
 1. Load and validate the profile (path or URL via `config/loader.rs`).
-2. Expand grammars; build the `PhraseTrie` and `Vec<CompiledCommand>`; duplicate phrases and
-   expansion-cap violations are errors here.
+2. Compile the grammar's automaton and build the recognition feed — duplicate commands and
+   state-cap violations are errors here, naming the profile's source.
 3. **Create the uinput device first** — this fails fast on missing permissions before any audio
    machinery spins up. The virtual device is named `voice-orders` and registers the *full* key
    capability set from `keys.rs`, which makes it look like a real keyboard to SDL and games.
@@ -1218,10 +1069,12 @@ XDG-cache offline fallback is noted as future work.
 
 ## `validate`
 
-Pipeline: load the profile (serde already validated structure, phrases, key names, and durations) →
-cross-field `validate_*()` checks → grammar lints → vocabulary check. Output is one section per
-command; failures render as `human_errors::pretty` user errors, lints as `warning:`/`note:` lines.
-All problems are reported in a single pass; the exit code is 1 iff any error occurred.
+Pipeline: load the profile (serde already validated structure and parsed the grammar) → the
+grammar's load-time **lints** (reported as `warning:` lines) → the automaton's **compile
+diagnostics** (duplicate commands, the state cap — errors, each rendered with its ariadne source
+excerpt) → the **vocabulary check** over `Grammar::word_set` → the behavioural **notes**. Output is
+one section per published rule plus a profile-wide list; failures render as `human_errors::pretty`
+user errors. All problems are reported in a single pass; the exit code is 1 iff any error occurred.
 
 ### Vocabulary checking
 
@@ -1230,7 +1083,7 @@ fake). For each unique word from `word_set` (linear — no expansion blow-up), c
 misses, suggest in order:
 
 1. **Normalization** — lowercase and strip punctuation (`.,!?'"`); if the normalized form is known,
-   suggest it. (Expansion already lowercases; this catches punctuation pasted into phrases.)
+   suggest it. (Literals already lowercase; this catches punctuation pasted into a grammar.)
 2. **Compound decomposition** — for every split point `i`, if both `word[..i]` and `word[i..]` are in
    the vocabulary, suggest the split (e.g. `autocannon` → `"auto cannon"`). Report at most two
    splits, most-balanced first.
@@ -1238,15 +1091,22 @@ misses, suggest in order:
    candidates by `strsim` Levenshtein distance (≤ 2, preferring a shared first letter) and report the
    top three. Models without a word list get a note that nearest-word suggestions are unavailable.
 
-### Lints
+### Warnings and notes
 
-- **Duplicate phrase across commands** (from trie construction): warning here, error in `run` — so a
-  single `validate` run shows every problem at once.
-- **Prefix relations:** for every ambiguous trie node, a note such as
-  `note: saying "autocannon" will wait 350ms in case you continue with "autocannon sentry"` — making
-  the completion-timeout behavior discoverable per profile.
-- **Expansion volume:** per-command counts; warning above 128, error above 512.
-- **Output lints:** `down` without a matching `up`, `up` without a prior `down`, empty `keys` lists.
+- **Grammar lints** from static analysis (an unreferenced private rule, a `hold` with no `release`
+  later in its action block, `...` alongside a `name...` splice) surface as warnings; they never
+  fail validation on their own.
+- **Automaton size:** each published rule gets a `note: compiles into N automaton states`, so a
+  repetition at the cap is visible per rule.
+- **Decompositions:** each rule the recognition feed could not expand whole gets a note naming its
+  concrete expansion count and saying it is decomposed into fragment phrases for recognition (see
+  [Feeding Vosk](#feeding-vosk)) — the accuracy trade should be discoverable, not silent.
+- **Prefix relations:** a bounded breadth-first sweep of the automaton finds the points where a
+  command is complete while a longer one is still possible, and reports one witness per rule:
+  `note: saying "autocannon" will wait 350ms in case you continue with "autocannon sentry"` —
+  making the completion-timeout behavior discoverable per profile. (Bounded like duplicate
+  detection: shortest phrases are swept first, and a grammar too large to sweep exhaustively is
+  covered to the budget's depth.)
 
 ## Self-update
 
@@ -1524,13 +1384,10 @@ hardware, in a real game. Until they have been, the documentation calls the Wind
 
 ## Testing strategy
 
-- **Lexer:** a filt-rs-style `assert_sequence!` macro matching token streams by pattern (eliding
-  `Loc` with `..`); rstest tables; invalid-character errors asserted with exact line/column.
-- **Parser:** whole-AST equality tables (`PhraseExpr: PartialEq`); every error-message row from the
-  table above asserted by substring; a 9-deep nesting rejection test and a 500-word long-phrase
-  test; `Display` round-trip and Clone-reparses tests for `CommandPhrase`.
-- **Expansion:** phrase → expected-list tables; the `[a] {a, b}` dedupe case; a cap short-circuit
-  test proving an explosive phrase errors fast without materializing.
+- **Grammar:** lexer/parser/AST tables over the chumsky pipeline; every diagnostic asserted by
+  substring with its span; static-analysis error and lint tables; automaton walks asserted against
+  expected action programs and display names; feed expansion/decomposition tables; the canonical
+  Arma grammar loaded, compiled and swept as a fixture shared across the suites.
 - **Matcher:** `#[tokio::test(start_paused = true)]` + `tokio::time::advance`, feeding synthetic
   `RecognitionEvent`s through the real task and asserting `CommandAction` order and timing:
   unambiguous immediate fire; ambiguous → timeout fire; ambiguous → superseding continuation;
@@ -1539,9 +1396,10 @@ hardware, in a real game. Until they have been, the documentation calls the Wind
 - **Executor:** a `KeySink` trait over the uinput wrapper; a fake sink records `(event, instant)`
   under paused time to assert duration/interval timing, plus the pressed-keys-released-on-cancel
   guarantee.
-- **Config:** `examples/profile.yaml` loaded in a unit test (the docs-can't-drift trick from grey
-  and github-backup); bad DSL inside YAML surfaces a located load error; both output forms compile
-  to the expected `Vec<KeyEvent>`; mutual-exclusion errors name the command.
+- **Config:** every shipped profile (`examples/profile.yaml`, `profiles/arma3.yaml`,
+  `profiles/helldivers2.yaml`) loaded and compiled in unit tests (the docs-can't-drift trick from
+  grey and github-backup); a bad grammar inside YAML surfaces its rendered diagnostics as a load
+  error; migrated Helldivers commands walk to the exact key plans the old schema compiled.
 - **Keys table:** every name round-trips name → code → uinput/evdev; suggestion quality spot checks.
 - **Validate:** fake `Vocabulary` covering normalization, compound splits, and nearest-word ranking
   with an injected word list; lint output assertions.
@@ -1600,6 +1458,6 @@ highlighting, deployed with `actions/upload-pages-artifact` + `actions/deploy-pa
   Steam integration.
 - **Profiles** — the full option reference (each option an `###` heading with a required/default
   Badge), the two output forms, hotkey modes.
-- **Grammar** — the phrase DSL with worked examples, ambiguity and the completion timeout, how
+- **Grammar** — the rule language with worked examples, ambiguity and the completion timeout, how
   validation suggestions work.
 - **Keys** — the key-name reference, generated from `keys::all_names()` so it cannot drift.

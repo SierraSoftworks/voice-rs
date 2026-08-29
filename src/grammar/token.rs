@@ -1,79 +1,78 @@
-use std::fmt::Display;
+//! The token vocabulary of the command grammar language.
+//!
+//! The lexer produces a flat stream of these; the parser gives them meaning.
+//! One deliberate simplification: [`Token::Word`] covers rule names, key
+//! names, repetition bounds and duration blobs alike (`subject`, `f1`, `9`,
+//! `20ms` are all words). Which of those a word *is* depends entirely on where
+//! it appears, so the parser decides — the lexer never has to.
 
-use super::location::Loc;
+use std::fmt;
 
-/// A lexical token produced by the phrase scanner.
+/// One lexical token of a grammar source, without its span.
 ///
-/// Every variant carries the source [`Loc`] at which it was found. Word
-/// payloads are `&'a str` slices of the phrase source itself — the lexer never
-/// allocates.
-#[derive(Debug, PartialEq)]
-pub enum Token<'a> {
-    /// A plain word, carrying its text.
-    Word(Loc, &'a str),
-    /// An opening bracket `[` (start of an optional group).
-    LeftBracket(Loc),
-    /// A closing bracket `]` (end of an optional group).
-    RightBracket(Loc),
-    /// An opening brace `{` (start of an alternates group).
-    LeftBrace(Loc),
-    /// A closing brace `}` (end of an alternates group).
-    RightBrace(Loc),
-    /// A comma `,` separating alternate branches.
-    Comma(Loc),
+/// Spans travel beside tokens as `(Token, SimpleSpan)` pairs so that this type
+/// stays comparable with `just(...)` in the parser.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Token {
+    /// A bare word: a rule name, key name, number or duration, depending on
+    /// context. Words are runs of ASCII letters, digits and underscores.
+    Word(String),
+    /// A double-quoted spoken literal, already split on whitespace into its
+    /// lowercased word tokens (`"toggle map"` becomes `["toggle", "map"]`).
+    Literal(Vec<String>),
+    /// `=`, introducing a rule definition.
+    Eq,
+    /// `|`, separating alternation branches.
+    Pipe,
+    /// `(`, opening a group or an action argument list.
+    LParen,
+    /// `)`.
+    RParen,
+    /// `{`, opening an action block.
+    LBrace,
+    /// `}`.
+    RBrace,
+    /// `[`, opening a repetition bound.
+    LBracket,
+    /// `]`.
+    RBracket,
+    /// `?`, sugar for `[0..1]`.
+    Question,
+    /// `*`, sugar for `[0..MAX_REPETITION]`.
+    Star,
+    /// `+`: repetition sugar for `[1..MAX_REPETITION]` after a term, or the
+    /// chord separator inside an action block (`shift+f1`).
+    Plus,
+    /// `:`, naming a capture.
+    Colon,
+    /// `,`, separating actions in a block.
+    Comma,
+    /// `..`, the range separator in a repetition bound.
+    DotDot,
+    /// `...`, the splice-all action (also the tail of a capture splice).
+    Ellipsis,
 }
 
-impl Token<'_> {
-    /// Returns the textual lexeme this token was parsed from (e.g. `"["` for
-    /// [`Token::LeftBracket`], or the word itself for [`Token::Word`]).
-    pub fn lexeme(&self) -> &str {
+impl fmt::Display for Token {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Token::Word(.., word) => word,
-            Token::LeftBracket(..) => "[",
-            Token::RightBracket(..) => "]",
-            Token::LeftBrace(..) => "{",
-            Token::RightBrace(..) => "}",
-            Token::Comma(..) => ",",
+            Self::Word(word) => formatter.write_str(word),
+            Self::Literal(words) => write!(formatter, "\"{}\"", words.join(" ")),
+            Self::Eq => formatter.write_str("="),
+            Self::Pipe => formatter.write_str("|"),
+            Self::LParen => formatter.write_str("("),
+            Self::RParen => formatter.write_str(")"),
+            Self::LBrace => formatter.write_str("{"),
+            Self::RBrace => formatter.write_str("}"),
+            Self::LBracket => formatter.write_str("["),
+            Self::RBracket => formatter.write_str("]"),
+            Self::Question => formatter.write_str("?"),
+            Self::Star => formatter.write_str("*"),
+            Self::Plus => formatter.write_str("+"),
+            Self::Colon => formatter.write_str(":"),
+            Self::Comma => formatter.write_str(","),
+            Self::DotDot => formatter.write_str(".."),
+            Self::Ellipsis => formatter.write_str("..."),
         }
-    }
-
-    /// Returns the source [`Loc`] at which this token appears.
-    pub fn location(&self) -> Loc {
-        match self {
-            Token::Word(loc, ..) => *loc,
-            Token::LeftBracket(loc) => *loc,
-            Token::RightBracket(loc) => *loc,
-            Token::LeftBrace(loc) => *loc,
-            Token::RightBrace(loc) => *loc,
-            Token::Comma(loc) => *loc,
-        }
-    }
-}
-
-impl Display for Token<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.lexeme())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-
-    use super::*;
-
-    const LOC: Loc = Loc { line: 3, column: 7 };
-
-    #[rstest]
-    #[case(Token::Word(LOC, "deploy"), "deploy")]
-    #[case(Token::LeftBracket(LOC), "[")]
-    #[case(Token::RightBracket(LOC), "]")]
-    #[case(Token::LeftBrace(LOC), "{")]
-    #[case(Token::RightBrace(LOC), "}")]
-    #[case(Token::Comma(LOC), ",")]
-    fn lexemes_and_locations(#[case] token: Token<'_>, #[case] lexeme: &str) {
-        assert_eq!(token.lexeme(), lexeme);
-        assert_eq!(token.location(), LOC);
-        assert_eq!(token.to_string(), lexeme);
     }
 }

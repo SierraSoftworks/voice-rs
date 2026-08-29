@@ -1,22 +1,19 @@
-//! The grammar v2 matcher engine: the v1 state machine restated over the
+//! The matcher engine: the completion-timeout state machine restated over the
 //! automaton's hypothesis walk. See DESIGN.md §"Compilation: a word-level
-//! transducer" for how the trie semantics generalize.
+//! transducer".
 //!
-//! Everything the v1 matcher promised still holds, word for word — greedy
-//! longest-match segmentation with re-sync, the `Pending` completion-timeout
-//! machine, eager partial-driven firing, and confidence gating — but the walk
-//! position is a [`Walk`] (a set of alive hypotheses) instead of a trie node,
-//! *ambiguous* means "some hypothesis accepts while any can still consume a
-//! word", and a fired command's output is assembled from its evaluated action
-//! program at fire time rather than pre-compiled per command.
-//!
-//! The v1 matcher in the parent module stays untouched until G6 swaps `run`
-//! over to this engine and deletes it; the small helpers duplicated from it
-//! (`words_of`, `deadline_elapsed`, `quoted_list`) go with it then.
+//! Everything the original trie-based matcher promised still holds, word for
+//! word — greedy longest-match segmentation with re-sync, the `Pending`
+//! completion-timeout machine, eager partial-driven firing, and confidence
+//! gating — but the walk position is a [`Walk`] (a set of alive hypotheses)
+//! instead of a trie node, *ambiguous* means "some hypothesis accepts while
+//! any can still consume a word", and a fired command's output is assembled
+//! from its evaluated action program at fire time rather than pre-compiled per
+//! command.
 
 use std::collections::HashMap;
 
-use crate::grammar::v2::{Accept, Automaton, Walk};
+use crate::grammar::{Accept, Automaton, Walk};
 use crate::output::assembly::{Pacing, assemble};
 use crate::output::{CompiledOutput, KeyEvent};
 use crate::recognition::{RecognitionEvent, Utterance};
@@ -124,7 +121,7 @@ struct EagerContext<'a> {
     fired: Vec<Match>,
     /// The accept the latest partial's walk rests on, with its armed
     /// deadline. `None` when the walk rests mid-phrase or at the root.
-    resting: Option<EagerResting<'a>>,
+    resting: Option<EagerResting>,
     /// Walk warnings (hypothesis overflows, runtime-ambiguous accepts)
     /// already reported for this utterance. Every changed partial re-walks
     /// the same growing hypothesis, so without this the same overflow would
@@ -133,11 +130,13 @@ struct EagerContext<'a> {
 }
 
 /// An accept a partial hypothesis is resting on, waiting out a deadline.
+///
+/// The resting *walk* is not kept: a `Final` which pends here re-walks the
+/// utterance from the context's own origin, so only the accept's identity and
+/// its armed deadline matter.
 #[derive(Debug)]
-struct EagerResting<'a> {
+struct EagerResting {
     accept: Accept,
-    /// The resting walk, kept so a `Final` which pends here can continue it.
-    walk: Walk<'a>,
     /// The index just past the accept's last word in the partial.
     position: usize,
     /// Whether the resting walk is ambiguous. Ambiguous rests wait out the
@@ -441,7 +440,7 @@ impl<'a> Engine<'a> {
     ) -> bool {
         // The walk origin: an open eager context pins it (this utterance's
         // partials already walked from there, and may have fired), otherwise
-        // the pending state decides exactly as v1 did. Either way the
+        // the pending state decides, exactly as the eager-off machine does.
         // utterance is resolved by this Final, so the context ends here.
         let context = eager.take();
         let (origin, passed) = match &context {
@@ -556,7 +555,7 @@ impl<'a> Engine<'a> {
     /// finalizing it.
     fn pending_deadline(
         &self,
-        resting: Option<&EagerResting<'a>>,
+        resting: Option<&EagerResting>,
         accept: &Accept,
         position: usize,
     ) -> Instant {
@@ -612,7 +611,7 @@ impl<'a> Engine<'a> {
     /// origin the real utterance will use: the full walk's fires plus a
     /// resting pending command, each assembled under the profile's pacing,
     /// positions ignored — two texts which would press the same keys in the
-    /// same order are the same interpretation. (Where v1 compared
+    /// same order are the same interpretation. (Where the trie matcher compared
     /// `CommandId`s, the grammar has no per-command identity to compare, so
     /// the assembled plans themselves are the identity — which is what the
     /// n-best gating design specifies.)
@@ -757,7 +756,6 @@ impl<'a> Engine<'a> {
                         };
                         Some(EagerResting {
                             accept,
-                            walk,
                             position,
                             ambiguous,
                             deadline,
@@ -772,8 +770,7 @@ impl<'a> Engine<'a> {
 }
 
 /// Consumes [`RecognitionEvent`]s and produces [`CommandAction`]s onto the
-/// command queue, resolving ambiguous prefixes with the completion timeout —
-/// the grammar v2 replacement for [`super::matcher_task`].
+/// command queue, resolving ambiguous prefixes with the completion timeout.
 ///
 /// Runs until `cancel` fires, the events channel closes (the recognizer shut
 /// down), or the command queue closes (the executor shut down) — all of which
@@ -970,7 +967,7 @@ fn quoted_list(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::v2::Grammar;
+    use crate::grammar::Grammar;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1007,7 +1004,7 @@ mod tests {
         })
     }
 
-    /// The standard test arsenal, matching the v1 suite's shape: "autocannon"
+    /// The standard test arsenal: "autocannon"
     /// is an ambiguous prefix of "autocannon sentry" *via a different rule*,
     /// "deploy sentry" and "reload" are unambiguous.
     fn arsenal() -> Automaton {
@@ -2005,6 +2002,192 @@ mod tests {
         // And the pending state is gone for good.
         h.advance(TIMEOUT * 2).await;
         h.nothing_fired();
+        h.shutdown().await;
+    }
+
+    // --- Grammar-language specifics ---------------------------------------
+    //
+    // Everything above re-proves the trie matcher's contract; these cover what the
+    // trie never could — captures, splices, shared subject rules, and the
+    // hypothesis-set failure modes.
+
+    use crate::output::assembly::ActionItem;
+    use crate::output::keys;
+
+    /// A chord press: `press("leftshift+f1")`.
+    fn press(chord: &str) -> ActionItem {
+        ActionItem::Press(
+            chord
+                .split('+')
+                .map(|name| keys::from_name(name).expect("a known key"))
+                .collect(),
+        )
+    }
+
+    /// The plan `items` assemble to under the test pacing.
+    fn keyboard(items: &[ActionItem]) -> CompiledOutput {
+        CompiledOutput::Keyboard(assemble(items, &pacing()))
+    }
+
+    /// The canonical Arma automaton, compiled once — the fixture the design
+    /// says must load.
+    fn arma() -> Automaton {
+        use std::sync::OnceLock;
+        static ARMA: OnceLock<Automaton> = OnceLock::new();
+        ARMA.get_or_init(|| compile(&crate::grammar::fixtures::arma_source()))
+            .clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn captures_assemble_different_outputs_for_different_spoken_words() {
+        // The assign_colour pattern: one command whose keys depend on which
+        // word was spoken, assembled at fire time — there is no per-command
+        // pre-compiled output a trie could have carried.
+        let mut h = Harness::start(compile(
+            r#"
+            colour = ( "red" { 1 } | "blue" { 3 } )
+            Assign = "assign" ("team"? colour):c { 9, c... }
+            "#,
+        ));
+
+        h.hear_final("assign red").await;
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Assign(red)");
+        assert_eq!(actions[0].output, keyboard(&[press("9"), press("1")]));
+
+        // The same command, a different object, a different plan — and the
+        // optional "team" contributes words to the display but no presses.
+        h.hear_final("assign team blue").await;
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Assign(team blue)");
+        assert_eq!(actions[0].output, keyboard(&[press("9"), press("3")]));
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arma_subject_led_command_splices_the_subject_first() {
+        // "two three advance": the shared subject rule's presses (F2, F3)
+        // land before the menu presses the action block adds.
+        let mut h = Harness::start(arma());
+
+        h.hear_final("two three advance").await;
+
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Advance");
+        assert_eq!(
+            actions[0].output,
+            keyboard(&[press("f2"), press("f3"), press("1"), press("2")])
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arma_watch_splices_captures_around_the_menu_presses() {
+        // Watch's block reorders its captures — subject, menu, a beat for the
+        // menu to open, then the direction — which spoken order alone could
+        // never produce.
+        let mut h = Harness::start(arma());
+
+        h.hear_final("two watch east").await;
+
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Watch(two, east)");
+        assert_eq!(
+            actions[0].output,
+            keyboard(&[
+                press("f2"),
+                press("3"),
+                press("8"),
+                ActionItem::Wait(Duration::from_millis(20)),
+                press("3"),
+            ])
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arma_select_bare_subject_fires_only_via_the_completion_timeout() {
+        // Every subject is an ambiguous prefix of every subject-led command,
+        // so a bare "two" only ever fires Select by waiting out the timeout.
+        let mut h = Harness::start(arma());
+
+        h.hear_final("two").await;
+        h.nothing_fired();
+
+        h.advance(TIMEOUT - Duration::from_millis(1)).await;
+        h.nothing_fired();
+        h.advance(Duration::from_millis(1)).await;
+
+        let actions = h.fired_actions();
+        assert_eq!(actions.len(), 1, "one command fires: {actions:?}");
+        assert_eq!(actions[0].command, "Select");
+        assert_eq!(actions[0].output, keyboard(&[press("f2")]));
+
+        // Continued in time, the subject-led command supersedes Select
+        // entirely.
+        h.hear_final("two").await;
+        h.hear_final("advance").await;
+        assert_eq!(h.fired(), vec!["Advance"]);
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synonym_rules_with_identical_keys_fire_the_first_defined_silently() {
+        // Two published rules accepting the same words with the same keys are
+        // deliberate synonyms — load-time duplicate detection lets them
+        // collapse, and the engine fires the first-defined one without
+        // warning anybody.
+        let mut h = Harness::start(compile(
+            r#"
+            Alpha = "go" { 1 }
+            Beta = "go" { 1 }
+            "#,
+        ));
+
+        h.hear_final("go").await;
+
+        assert_eq!(h.fired(), vec!["Alpha"]);
+        h.no_warnings();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hypothesis_overflow_warns_once_and_drops_the_utterance() {
+        // Ten "x"s multiply into over 2^10 readings — past MAX_HYPOTHESES —
+        // without any pair of them colliding on an accepted phrase, so the
+        // grammar loads and the overflow only exists at runtime. The walk
+        // goes dead, the utterance drops, and the user hears about it once.
+        let mut h = Harness::start(compile(
+            r#"
+            first = "x" { 1 }
+            second = "x" { 2 }
+            seg = ( first | second )
+            TenOne = seg[10] "one" { f1 }
+            TenTwo = seg[10] "two" { f2 }
+            "#,
+        ));
+
+        let utterance = format!("{} one", ["x"; 10].join(" "));
+        h.hear_final(&utterance).await;
+
+        h.nothing_fired();
+        let warnings = h.warnings();
+        assert_eq!(warnings.len(), 1, "one overflow, one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("possible readings"),
+            "the warning should explain the overflow: {}",
+            warnings[0]
+        );
+
+        // The engine is still healthy: a small utterance matches normally.
+        h.hear_final("x one").await;
+        h.nothing_fired(); // too few x's — an incomplete phrase, dropped
         h.shutdown().await;
     }
 }

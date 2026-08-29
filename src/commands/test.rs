@@ -69,7 +69,7 @@ pub async fn run(args: TestArgs) -> Result<i32, crate::Error> {
     // whole point of the command.
     let system = SystemConfig::load()?;
     let settings = ResolvedSettings::resolve(&profile, &system)?;
-    let parts = build_pipeline_parts(&profile)?;
+    let parts = build_pipeline_parts(&profile, &loaded.source)?;
     let model = resolve_model(args.model.as_deref(), &profile, &system)?;
 
     let (events, ui) = ReportMode::of(std::io::stdout().is_terminal()).sink();
@@ -285,22 +285,27 @@ fn plan_duration(output: &CompiledOutput) -> Duration {
 mod tests {
     use super::*;
     use crate::config::LoadedProfile;
+    use crate::grammar::Automaton;
+    use crate::output::assembly::assemble;
     use rstest::rstest;
     use std::time::Duration;
 
-    /// Compiles one command's `keys:`/`events:` YAML the way the pipeline does,
-    /// so the rendering is asserted against real compiled plans rather than
-    /// hand-built ones.
-    fn plan(command: &str) -> CompiledOutput {
+    /// Compiles one command's action block the way the pipeline does — grammar
+    /// → automaton → walk → assemble — so the timing is asserted against real
+    /// assembled plans rather than hand-built ones.
+    fn plan(actions: &str) -> CompiledOutput {
         let profile = Profile::parse(&LoadedProfile {
             source: "test-profile.yaml".to_string(),
-            content: format!("model: /models/en\ncommands:\n  - phrase: salute\n{command}"),
+            content: format!("model: /models/en\ngrammar: |\n  Salute = \"salute\" {actions}\n"),
         })
         .expect("the profile should load");
 
-        profile.commands[0]
-            .compile(&profile.defaults)
-            .expect("the command should compile")
+        let automaton = Automaton::compile(&profile.grammar).expect("the grammar should compile");
+        let mut walk = automaton.walk();
+        walk.step("salute");
+        let accepts = walk.accepts();
+        assert_eq!(accepts.len(), 1, "one reading expected: {accepts:?}");
+        CompiledOutput::Keyboard(assemble(&accepts[0].actions, &profile.defaults))
     }
 
     #[tokio::test]
@@ -317,7 +322,7 @@ mod tests {
         queue_tx
             .send(CommandAction {
                 command: "Salute".to_string(),
-                output: plan("    keys: [\"x\"]\n"),
+                output: plan("{ x }"),
             })
             .await
             .expect("the reporter should be listening");
@@ -357,19 +362,16 @@ mod tests {
     // --- Interrupting a rehearsal ----------------------------------------
 
     #[rstest]
-    // The `keys:` shorthand: one hold, and no interval after the last chord.
-    #[case("    keys: [\"x\"]\n", Duration::from_millis(30))]
-    // Two chords: hold, interval, hold.
-    #[case("    keys: [\"a\", \"b\"]\n", Duration::from_millis(85))]
-    // The explicit form times exactly what it says.
-    #[case(
-        "    events:\n      - down: x\n      - wait: 750ms\n      - up: x\n",
-        Duration::from_millis(750)
-    )]
+    // A bare chord: one hold, and no interval after the last press.
+    #[case("{ x }", Duration::from_millis(30))]
+    // Two presses: hold, interval, hold.
+    #[case("{ a, b }", Duration::from_millis(85))]
+    // Explicit hold/wait/release times exactly what it says.
+    #[case("{ hold(x), wait(750ms), release(x) }", Duration::from_millis(750))]
     // A hold-style macro takes no time at all to *start*.
-    #[case("    events:\n      - down: w\n", Duration::ZERO)]
-    fn test_plan_duration(#[case] command: &str, #[case] expected: Duration) {
-        assert_eq!(plan_duration(&plan(command)), expected);
+    #[case("{ hold(w) }", Duration::ZERO)]
+    fn test_plan_duration(#[case] actions: &str, #[case] expected: Duration) {
+        assert_eq!(plan_duration(&plan(actions)), expected);
     }
 
     #[tokio::test(start_paused = true)]
@@ -389,7 +391,7 @@ mod tests {
             queue_tx
                 .send(CommandAction {
                     command: command.to_string(),
-                    output: plan("    events:\n      - down: w\n      - wait: 1h\n      - up: w\n"),
+                    output: plan("{ hold(w), wait(1h), release(w) }"),
                 })
                 .await
                 .expect("the reporter should be listening");

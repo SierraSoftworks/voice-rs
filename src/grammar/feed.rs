@@ -12,14 +12,14 @@
 //! re-sync path.
 //!
 //! Counting is multiplicative and saturating — nothing is materialized until
-//! the count says it fits — which is the same trick the v1 expansion module
-//! uses to reject explosive phrases before allocating.
+//! the count says it fits — the same trick the original expansion machinery
+//! used to reject explosive phrases before allocating.
 
 use std::collections::{HashMap, HashSet};
 
 use super::{Alternation, Atom, Grammar, Term};
 
-/// The most concrete phrases one rule may contribute whole. Kept at the v1
+/// The most concrete phrases one rule may contribute whole. Kept at the old
 /// per-command expansion cap so the recognizer sees grammars of the same
 /// scale it always has.
 pub const MAX_EXPANSIONS_PER_RULE: usize = 512;

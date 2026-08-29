@@ -1,31 +1,32 @@
-//! `voice-orders validate <profile>`: structure, grammar lints, and every word
-//! checked against the model's vocabulary. See DESIGN.md §"`validate`".
+//! `voice-orders validate <profile>`: structure, grammar analysis, and every
+//! word checked against the model's vocabulary. See DESIGN.md §"`validate`".
 //!
 //! The guiding rule is **one pass, everything reported**: a run tells you about
 //! every problem in the profile at once, rather than making you fix them one
 //! reload at a time. That is why the model is opened *alongside* the other
 //! checks rather than before them — a missing model must not hide a broken
-//! phrase — and why the exit code is derived from the finished report instead
+//! grammar — and why the exit code is derived from the finished report instead
 //! of from the first thing which went wrong.
+//!
+//! The checks, in report order: the lints static analysis attached at load,
+//! the automaton's compile diagnostics (duplicate commands, the state cap),
+//! the vocabulary sweep over the grammar's word set, and then the behavioural
+//! notes — per-rule automaton sizes, which rules the recognition feed had to
+//! decompose, and where the completion timeout will actually be paid.
 //!
 //! The vocabulary itself reaches the checks as a `&mut dyn Vocabulary`, so the
 //! whole pipeline runs against a `HashSet`-backed fake in tests and only the
 //! thin wrapper in [`run`] ever touches libvosk.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
 use tracing_batteries::prelude::*;
 
 use crate::config::{Profile, SystemConfig, duration, loader, resolve_model};
-use crate::grammar::expansion;
-use crate::output::{CompiledOutput, KeyCode, KeyEvent};
+use crate::grammar::{Automaton, MAX_EXPANSIONS_PER_RULE, feed, user_error};
 use crate::recognition::{Vocabulary, vosk::VoskVocabulary};
-
-/// Above this many concrete phrases a command still works, but is worth a
-/// second look; [`expansion::MAX_EXPANSIONS_PER_COMMAND`] is the hard limit.
-const EXPANSION_WARNING_THRESHOLD: usize = 128;
 
 /// The largest edit distance we will still call a plausible mis-hearing.
 const MAX_SUGGESTION_DISTANCE: usize = 2;
@@ -36,7 +37,7 @@ const MAX_NEAREST_SUGGESTIONS: usize = 3;
 /// How many compound decompositions to offer for an unknown word.
 const MAX_SPLIT_SUGGESTIONS: usize = 2;
 
-/// Punctuation which people paste into phrases and which the recognizer never
+/// Punctuation which people paste into grammars and which the recognizer never
 /// sees.
 const STRIPPED_PUNCTUATION: &[char] = &['.', ',', '!', '?', '\'', '"'];
 
@@ -55,17 +56,17 @@ pub struct ValidateArgs {
 pub async fn run(args: ValidateArgs) -> Result<i32, crate::Error> {
     let loaded = loader::load(&args.profile).await?;
 
-    // Structural problems (a phrase which does not parse, a key name which
-    // does not resolve, both output forms at once) stop us here: there is no
-    // profile to lint if it did not load.
+    // Structural problems (YAML which does not parse, a grammar with syntax or
+    // analysis errors) stop us here: there is no profile to lint if it did not
+    // load.
     let profile = Profile::parse(&loaded)?;
 
     // The model is the one dependency we cannot fake away. Neither working out
     // *which* model to use nor opening it is allowed to stop the rest: a
-    // missing model must not hide a broken phrase, so both failures travel into
-    // `check` as the reason we have no vocabulary rather than as early returns.
-    // The machine's configuration only matters here for the model: a `model:`
-    // written as a bare name is resolved inside its models directory.
+    // missing model must not hide a broken grammar, so both failures travel
+    // into `check` as the reason we have no vocabulary rather than as early
+    // returns. The machine's configuration only matters here for the model: a
+    // `model:` written as a bare name is resolved inside its models directory.
     let system = SystemConfig::load()?;
 
     let report = match resolve_model(args.model.as_deref(), &profile, &system) {
@@ -100,14 +101,14 @@ enum Finding {
     Note(String),
 }
 
-/// The findings for one command, under the name it will be reported by.
+/// The findings for one published rule, under the name it will be reported by.
 struct Section {
     title: String,
     findings: Vec<Finding>,
 }
 
 /// A complete validation report: profile-wide findings, then one section per
-/// command, then the summary.
+/// published rule, then the summary.
 struct Report {
     header: String,
     profile: Vec<Finding>,
@@ -251,57 +252,95 @@ fn check(
         None => source.to_string(),
     };
 
+    let grammar = &profile.grammar;
     let mut profile_findings = Vec::new();
-    let mut sections: Vec<Section> = profile
-        .commands
-        .iter()
-        .map(|command| Section {
-            title: command.display_name().to_string(),
+    let mut sections: Vec<Section> = grammar
+        .published()
+        .map(|rule| Section {
+            title: rule.name.clone(),
             findings: Vec::new(),
         })
         .collect();
 
-    // Output: every command compiles, and the plan it compiles to makes sense.
-    for (index, command) in profile.commands.iter().enumerate() {
-        match command.compile(&profile.defaults) {
-            Ok(CompiledOutput::Keyboard(plan)) => {
-                lint_output(&plan, &mut sections[index].findings);
-            }
-            Err(e) => sections[index].findings.push(Finding::Error(e)),
+    /// The section a rule's finding belongs under, or the profile-wide list
+    /// for a private rule (which has no section of its own).
+    fn findings_for<'r>(
+        sections: &'r mut [Section],
+        profile_findings: &'r mut Vec<Finding>,
+        rule: &str,
+    ) -> &'r mut Vec<Finding> {
+        match sections.iter_mut().find(|section| section.title == rule) {
+            Some(section) => &mut section.findings,
+            None => profile_findings,
         }
     }
 
-    // Grammar: expansions per command, then the relations between them.
-    let mut expansions: Vec<Vec<Vec<String>>> = Vec::new();
-    for (index, command) in profile.commands.iter().enumerate() {
-        match expansion::expand(command.phrase.expr()) {
-            Ok(expanded) => {
-                lint_expansion(
-                    command.display_name(),
-                    &expanded.phrases,
-                    &mut sections[index].findings,
-                );
-                expansions.push(expanded.phrases);
+    // The lints static analysis attached when the grammar loaded. They carry
+    // spans, not rule attributions, so they are reported profile-wide.
+    for lint in grammar.lints() {
+        profile_findings.push(Finding::Warning(lint.message.clone()));
+    }
+
+    // The automaton: compiling is what detects two commands accepting the same
+    // words with different keys, and a grammar past the state cap — and a
+    // compiled automaton is also where the behavioural notes come from.
+    match Automaton::compile(grammar) {
+        Ok(automaton) => {
+            for (rule, states) in automaton.rule_sizes() {
+                findings_for(&mut sections, &mut profile_findings, rule).push(Finding::Note(
+                    format!("compiles into {states} automaton states"),
+                ));
             }
-            Err(e) => {
-                sections[index].findings.push(Finding::Error(e));
-                expansions.push(Vec::new());
+
+            // Where the completion timeout is paid: an ambiguous prefix makes
+            // the matcher wait to see whether the longer command is coming.
+            let timeout = duration::render(profile.completion_timeout);
+            for ambiguity in automaton.prefix_ambiguities() {
+                let note = match &ambiguity.continuation {
+                    Some((_, longer)) => format!(
+                        "saying \"{}\" will wait {timeout} in case you continue with \"{longer}\"",
+                        ambiguity.phrase
+                    ),
+                    None => format!(
+                        "saying \"{}\" will wait {timeout} in case you continue with a longer command",
+                        ambiguity.phrase
+                    ),
+                };
+                findings_for(&mut sections, &mut profile_findings, &ambiguity.rule)
+                    .push(Finding::Note(note));
+            }
+        }
+        Err(diagnostics) => {
+            for diagnostic in diagnostics {
+                profile_findings.push(Finding::Error(user_error(
+                    std::slice::from_ref(&diagnostic),
+                    grammar.source(),
+                )));
             }
         }
     }
 
-    lint_phrase_relations(profile, &expansions, &mut sections);
+    // The recognition feed: a rule too large to expand whole is decomposed at
+    // rule boundaries, which trades recognition accuracy for feasibility —
+    // exactly the kind of thing a profile author should get to see.
+    for decomposition in feed(grammar).decompositions {
+        let expansions = if decomposition.expansions == usize::MAX {
+            "more concrete phrases than we can count".to_string()
+        } else {
+            format!("{} concrete phrases", decomposition.expansions)
+        };
+        findings_for(&mut sections, &mut profile_findings, &decomposition.rule).push(
+            Finding::Note(format!(
+                "the rule '{}' expands into {expansions} (more than the {MAX_EXPANSIONS_PER_RULE} the recognizer is fed whole), so it is decomposed into fragment phrases for recognition",
+                decomposition.rule
+            )),
+        );
+    }
 
-    // Vocabulary: every word the profile listens for must be a word the model
-    // can hear.
+    // Vocabulary: every word the grammar listens for must be a word the model
+    // can hear. The word set is a linear walk of the rule list — no expansion.
     match vocabulary {
-        Ok(vocabulary) => check_vocabulary(
-            profile,
-            model,
-            vocabulary,
-            &mut sections,
-            &mut profile_findings,
-        ),
+        Ok(vocabulary) => check_vocabulary(profile, model, vocabulary, &mut profile_findings),
         Err(e) => profile_findings.push(Finding::Error(e)),
     }
 
@@ -312,173 +351,20 @@ fn check(
     }
 }
 
-/// Lints a compiled key plan: unbalanced `down`/`up` steps.
-///
-/// A `down` with no matching `up` is *legal* — that is exactly how a hold-style
-/// macro is written — so it is only a note. An `up` with no preceding `down` is
-/// a warning: it will be emitted at a keyboard which is not holding that key,
-/// which is almost always a copy-paste slip.
-fn lint_output(plan: &[KeyEvent], findings: &mut Vec<Finding>) {
-    let mut held: Vec<KeyCode> = Vec::new();
-
-    for event in plan {
-        match *event {
-            KeyEvent::Down(key) => {
-                if !held.contains(&key) {
-                    held.push(key);
-                }
-            }
-            KeyEvent::Up(key) => match held.iter().position(|held| *held == key) {
-                Some(position) => {
-                    held.remove(position);
-                }
-                None => findings.push(Finding::Warning(format!(
-                    "this command releases '{key}' without ever pressing it — check the 'events:' list for a missing 'down: {key}'"
-                ))),
-            },
-            // `release(*)` discharges every outstanding hold, so nothing which
-            // went down before it is left dangling.
-            KeyEvent::ReleaseAll => held.clear(),
-            KeyEvent::Wait(_) => {}
-        }
-    }
-
-    for key in held {
-        findings.push(Finding::Note(format!(
-            "this command holds '{key}' down and never releases it; that is how a hold-style macro is written, but nothing will let the key go until another command releases it or voice-orders shuts down"
-        )));
-    }
-}
-
-/// Lints one command's expansion: the unspeakable empty phrase, and volume.
-fn lint_expansion(name: &str, phrases: &[Vec<String>], findings: &mut Vec<Finding>) {
-    if phrases.iter().any(Vec::is_empty) {
-        findings.push(Finding::Error(human_errors::user(
-            format!(
-                "Every term in the phrase for '{name}' is optional, so it expands to include the empty phrase — which nobody can say."
-            ),
-            &[
-                "At least one word must be required: move it outside its '[...]' group, e.g. 'deploy [the] sentry' rather than '[deploy] [the] [sentry]'.",
-            ],
-        )));
-    }
-
-    if phrases.len() > EXPANSION_WARNING_THRESHOLD {
-        findings.push(Finding::Warning(format!(
-            "this command expands into {} concrete phrases (more than {EXPANSION_WARNING_THRESHOLD}), which makes the recognition grammar large and the command easier to trigger by accident",
-            phrases.len()
-        )));
-    }
-}
-
-/// Lints the relations *between* commands: duplicated phrases and prefixes.
-///
-/// Both are computed from the expansions with plain set logic rather than from
-/// the matcher's trie, so `validate` stays a pure function of the profile.
-fn lint_phrase_relations(
-    profile: &Profile,
-    expansions: &[Vec<Vec<String>>],
-    sections: &mut [Section],
-) {
-    let mut owner: HashMap<&[String], usize> = HashMap::new();
-    let mut duplicates: Vec<(usize, usize, String)> = Vec::new();
-
-    for (index, phrases) in expansions.iter().enumerate() {
-        for phrase in phrases {
-            match owner.get(phrase.as_slice()) {
-                // A command's own expansion is already deduplicated, so a
-                // repeat here is always a clash between two commands.
-                Some(&first) => duplicates.push((first, index, phrase.join(" "))),
-                None => {
-                    owner.insert(phrase.as_slice(), index);
-                }
-            }
-        }
-    }
-
-    for (first, second, phrase) in duplicates {
-        let (a, b) = (
-            profile.commands[first].display_name(),
-            profile.commands[second].display_name(),
-        );
-        sections[second].findings.push(Finding::Warning(format!(
-            "the phrase \"{phrase}\" is used by both '{a}' and '{b}', so only one of them can ever fire"
-        )));
-    }
-
-    // A command whose full phrase is a strict word-prefix of another command's
-    // phrase cannot fire immediately: the matcher has to wait and see whether
-    // the longer phrase is still coming. Surfacing that here is what makes the
-    // completion timeout discoverable per profile.
-    let timeout = duration::render(profile.completion_timeout);
-    let mut notes: Vec<(usize, String, String)> = Vec::new();
-    let mut seen = HashSet::new();
-
-    for phrases in expansions.iter() {
-        for phrase in phrases {
-            for length in 1..phrase.len() {
-                let prefix = &phrase[..length];
-                let Some(&short) = owner.get(prefix) else {
-                    continue;
-                };
-                if owner.get(phrase.as_slice()) == Some(&short) {
-                    // Two phrases of the same command: whichever wins, the
-                    // same command fires, so there is nothing to warn about.
-                    continue;
-                }
-
-                let (short_phrase, long_phrase) = (prefix.join(" "), phrase.join(" "));
-                if seen.insert((short, short_phrase.clone(), long_phrase.clone())) {
-                    notes.push((short, short_phrase, long_phrase));
-                }
-            }
-        }
-    }
-
-    notes.sort();
-    for (index, short, long) in notes {
-        sections[index].findings.push(Finding::Note(format!(
-            "saying \"{short}\" will wait {timeout} in case you continue with \"{long}\""
-        )));
-    }
-}
-
-/// Checks every word the profile listens for against the model's vocabulary.
-///
-/// Words are collected with [`expansion::word_set`] — a linear walk of the AST
-/// — so a command with 512 expansions still only costs one lookup per distinct
-/// word, and lookups are memoized across commands.
+/// Checks every distinct word in the grammar against the model's vocabulary.
 fn check_vocabulary(
     profile: &Profile,
     model: &Path,
     vocabulary: &mut dyn Vocabulary,
-    sections: &mut [Section],
     profile_findings: &mut Vec<Finding>,
 ) {
     let candidates = vocabulary.words().map(|words| nearest_candidates(&words));
-    let mut known: HashMap<String, bool> = HashMap::new();
     let mut saw_unknown = false;
 
-    for (index, command) in profile.commands.iter().enumerate() {
-        for word in expansion::word_set(command.phrase.expr()) {
-            // Memoized across commands: a word shared by twenty commands costs
-            // one lookup, but is still reported under each of them, because the
-            // report is read one command at a time.
-            let recognized = match known.get(&word) {
-                Some(&recognized) => recognized,
-                None => {
-                    let recognized = vocabulary.contains(&word);
-                    known.insert(word.clone(), recognized);
-                    recognized
-                }
-            };
-
-            if !recognized {
-                saw_unknown = true;
-                sections[index]
-                    .findings
-                    .push(unknown_word(model, &word, vocabulary, &candidates));
-            }
+    for word in profile.grammar.word_set() {
+        if !vocabulary.contains(&word) {
+            saw_unknown = true;
+            profile_findings.push(unknown_word(model, &word, vocabulary, &candidates));
         }
     }
 
@@ -498,7 +384,7 @@ fn unknown_word(
 ) -> Finding {
     let mut suggestions = Vec::new();
 
-    // 1. Normalization: punctuation pasted into a phrase never reaches the
+    // 1. Normalization: punctuation pasted into a literal never reaches the
     //    recognizer, so a word which is only unknown *because* of it is really
     //    a spelling problem.
     let normalized: String = word
@@ -529,11 +415,11 @@ fn unknown_word(
     let model = model.display();
     let message = if suggestions.is_empty() {
         format!(
-            "The model at '{model}' does not know the word '{word}', so this command can never be recognized."
+            "The model at '{model}' does not know the word '{word}', so no command using it can ever be recognized."
         )
     } else {
         format!(
-            "The model at '{model}' does not know the word '{word}', so this command can never be recognized. Did you mean {}?",
+            "The model at '{model}' does not know the word '{word}', so no command using it can ever be recognized. Did you mean {}?",
             suggestions.join(", ")
         )
     };
@@ -541,7 +427,7 @@ fn unknown_word(
     Finding::Error(human_errors::user(
         message,
         &[
-            "Replace the word with one the model knows, or offer both spellings with an '{alternate, choices}' group, e.g. '{autocannon, auto cannon}'.",
+            "Replace the word with one the model knows, or offer both spellings as alternatives, e.g. (\"autocannon\" | \"auto cannon\").",
             "A larger model knows more words — the model list at https://alphacephei.com/vosk/models shows what is available.",
         ],
     ))
@@ -675,12 +561,12 @@ mod tests {
         }
     }
 
-    /// Every word the example-shaped profiles below use, so that a test which
-    /// is not about the vocabulary never trips over it.
+    /// Every word the test grammars below use, so that a test which is not
+    /// about the vocabulary never trips over it.
     fn full_vocabulary() -> FakeVocabulary {
         FakeVocabulary::new(&[
             "deploy", "the", "auto", "cannon", "sentry", "open", "terminal", "salute", "reload",
-            "weapon", "a", "b", "c", "d", "x", "hold", "forward",
+            "weapon", "a", "b", "c", "d", "x", "go", "now", "hold", "forward",
         ])
     }
 
@@ -701,16 +587,17 @@ mod tests {
         check("test-profile.yaml", &profile, &model, Ok(vocabulary))
     }
 
-    /// A profile with `model:` and `commands:` wrapped around `commands`.
-    fn with_commands(commands: &str) -> String {
-        format!("model: /models/en\ncommands:\n{commands}")
+    /// A profile with `model:` wrapped around a grammar block. Rules are
+    /// passed indented under `grammar: |`.
+    fn with_grammar(rules: &str) -> String {
+        format!("model: /models/en\ngrammar: |\n{rules}")
     }
 
     #[test]
-    fn test_a_clean_profile_reports_nothing() {
+    fn test_a_clean_profile_reports_no_problems() {
         let report = validate(
-            &with_commands(
-                "  - phrase: open [the] terminal\n    keys: [\"leftctrl+leftalt+t\"]\n  - phrase: salute\n    events:\n      - down: x\n      - wait: 750ms\n      - up: x\n",
+            &with_grammar(
+                "  Terminal = \"open\" \"the\"? \"terminal\" { leftctrl+leftalt+t }\n  Salute = \"salute\" { hold(x), wait(750ms), release(x) }\n",
             ),
             &mut full_vocabulary(),
         );
@@ -721,7 +608,7 @@ mod tests {
         assert_eq!(report.exit_code(), 0);
 
         assert!(
-            rendered.contains("open [the] terminal"),
+            rendered.contains("Terminal"),
             "every command gets a section:\n{rendered}"
         );
         assert!(
@@ -735,7 +622,7 @@ mod tests {
         let report = validate(
             &format!(
                 "name: Deep Rock Galactic\n{}",
-                with_commands("  - phrase: salute\n    keys: [\"x\"]\n")
+                with_grammar("  Salute = \"salute\" { x }\n")
             ),
             &mut full_vocabulary(),
         );
@@ -750,12 +637,106 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_words_are_errors_under_their_command() {
+    fn test_grammar_lints_are_reported_as_warnings() {
+        // A hold with no release loads fine, but validate must say so.
+        let report = validate(
+            &with_grammar("  HoldForward = \"hold\" \"forward\" { hold(w) }\n"),
+            &mut full_vocabulary(),
+        );
+
+        let rendered = report.render();
+        assert!(
+            rendered.contains("warning:") && rendered.contains("never release"),
+            "the load-time lint should surface here:\n{rendered}"
+        );
+        assert_eq!(report.warnings(), 1);
+        assert_eq!(report.exit_code(), 0, "lints do not fail validation");
+    }
+
+    #[test]
+    fn test_compile_diagnostics_are_errors_naming_both_rules() {
+        // Two commands accepting the same words with different keys is only
+        // detectable on the automaton, so it lands here rather than at load.
+        let report = validate(
+            &with_grammar("  First = \"salute\" { x }\n  Second = \"the\"? \"salute\" { a }\n"),
+            &mut full_vocabulary(),
+        );
+
+        assert_eq!(report.exit_code(), 1);
+        let messages = report.error_messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("'First'") && m.contains("'Second'")),
+            "the error should name both rules: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_rule_sizes_are_noted_per_command() {
+        let report = validate(
+            &with_grammar("  Salute = \"salute\" { x }\n"),
+            &mut full_vocabulary(),
+        );
+
+        assert!(
+            report.render().contains("note: compiles into")
+                && report.render().contains("automaton states"),
+            "unexpected report:\n{}",
+            report.render()
+        );
+    }
+
+    #[test]
+    fn test_decomposed_rules_are_noted() {
+        // Five chained four-way groups expand to 4^5 = 1024 phrases, past the
+        // 512 the recognizer is fed whole.
+        let big = "(\"a\"|\"b\"|\"c\"|\"d\") (\"a\"|\"b\"|\"c\"|\"d\") (\"a\"|\"b\"|\"c\"|\"d\") (\"a\"|\"b\"|\"c\"|\"d\") (\"a\"|\"b\"|\"c\"|\"d\")";
+        let report = validate(
+            &with_grammar(&format!(
+                "  big = {big}\n  Use = \"go\" big \"now\" {{ x }}\n"
+            )),
+            &mut full_vocabulary(),
+        );
+
+        let rendered = report.render();
+        assert!(
+            rendered.contains("note: the rule 'Use' expands into 1024 concrete phrases")
+                && rendered.contains("decomposed into fragment phrases for recognition"),
+            "unexpected report:\n{rendered}"
+        );
+        // The private rule has no section of its own, so its note is
+        // profile-wide — but still present.
+        assert!(
+            rendered.contains("the rule 'big' expands into 1024 concrete phrases"),
+            "unexpected report:\n{rendered}"
+        );
+        assert_eq!(report.errors(), 0, "decomposition is a note, not an error");
+    }
+
+    #[test]
+    fn test_prefix_relations_are_noted_with_the_timeout() {
+        let report = validate(
+            "model: /models/en\ncompletion_timeout: 350ms\ngrammar: |\n  Reload = \"reload\" { x }\n  ReloadWeapon = \"reload weapon\" { a }\n",
+            &mut full_vocabulary(),
+        );
+
+        let rendered = report.render();
+        assert!(
+            rendered.contains(
+                "note: saying \"reload\" will wait 350ms in case you continue with \"reload weapon\""
+            ),
+            "unexpected report:\n{rendered}"
+        );
+        assert_eq!(report.errors(), 0);
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[test]
+    fn test_unknown_words_are_errors() {
         let mut vocabulary = FakeVocabulary::new(&["deploy", "the", "sentry"]);
         let report = validate(
-            &with_commands(
-                "  - name: Deploy\n    phrase: deploy [the] autocannon\n    keys: [\"4\"]\n",
-            ),
+            &with_grammar("  Deploy = \"deploy\" \"the\"? \"autocannon\" { x }\n"),
             &mut vocabulary,
         );
 
@@ -767,11 +748,6 @@ mod tests {
             "unexpected error: {}",
             messages[0]
         );
-        assert!(
-            report.render().contains("Deploy"),
-            "the finding belongs to its command's section:\n{}",
-            report.render()
-        );
     }
 
     #[test]
@@ -781,7 +757,7 @@ mod tests {
         let mut vocabulary = FakeVocabulary::new(&["deploy", "auto", "cannon", "a", "utocannon"])
             .without_word_list();
         let report = validate(
-            &with_commands("  - phrase: deploy autocannon\n    keys: [\"4\"]\n"),
+            &with_grammar("  Deploy = \"deploy autocannon\" { x }\n"),
             &mut vocabulary,
         );
 
@@ -801,10 +777,7 @@ mod tests {
         // "abcd" splits three ways; the model knows the halves of two of them.
         let mut vocabulary =
             FakeVocabulary::new(&["a", "b", "c", "d", "ab", "cd", "abc"]).without_word_list();
-        let report = validate(
-            &with_commands("  - phrase: abcd\n    keys: [\"x\"]\n"),
-            &mut vocabulary,
-        );
+        let report = validate(&with_grammar("  Abcd = \"abcd\" { x }\n"), &mut vocabulary);
 
         let message = report.error_messages().remove(0);
         assert!(
@@ -816,10 +789,10 @@ mod tests {
     #[test]
     fn test_punctuation_is_normalized_away() {
         let mut vocabulary = FakeVocabulary::new(&["dont", "deploy"]);
-        // The DSL allows apostrophes inside words, so this reaches the
-        // vocabulary check intact.
+        // The grammar allows apostrophes inside literal words, so this reaches
+        // the vocabulary check intact.
         let report = validate(
-            &with_commands("  - phrase: deploy don't\n    keys: [\"x\"]\n"),
+            &with_grammar("  Deploy = \"deploy don't\" { x }\n"),
             &mut vocabulary,
         );
 
@@ -836,10 +809,7 @@ mod tests {
         // nothing to go on but the shared first letter and the alphabet — and
         // only three of the six may be offered.
         let mut vocabulary = FakeVocabulary::new(&["cat", "bad", "bar", "bag", "bit", "hat"]);
-        let report = validate(
-            &with_commands("  - phrase: bat\n    keys: [\"x\"]\n"),
-            &mut vocabulary,
-        );
+        let report = validate(&with_grammar("  Bat = \"bat\" { x }\n"), &mut vocabulary);
 
         let message = report.error_messages().remove(0);
         assert!(
@@ -852,7 +822,7 @@ mod tests {
     fn test_distant_words_are_never_suggested() {
         let mut vocabulary = FakeVocabulary::new(&["deploy", "sentry"]);
         let report = validate(
-            &with_commands("  - phrase: gubbins\n    keys: [\"x\"]\n"),
+            &with_grammar("  Gubbins = \"gubbins\" { x }\n"),
             &mut vocabulary,
         );
 
@@ -868,7 +838,7 @@ mod tests {
         let mut vocabulary = FakeVocabulary::new(&["deploy", "sentry"])
             .listing_symbols(&["<eps>", "<unk>", "#0", "!SIL", "1234"]);
         let report = validate(
-            &with_commands("  - phrase: deploy sentrz\n    keys: [\"x\"]\n"),
+            &with_grammar("  Deploy = \"deploy sentrz\" { x }\n"),
             &mut vocabulary,
         );
 
@@ -886,8 +856,8 @@ mod tests {
     fn test_a_model_without_a_word_list_says_so_once() {
         let mut vocabulary = FakeVocabulary::new(&["deploy"]).without_word_list();
         let report = validate(
-            &with_commands(
-                "  - phrase: deploy sentrz\n    keys: [\"x\"]\n  - phrase: deploy gubbins\n    keys: [\"y\"]\n",
+            &with_grammar(
+                "  First = \"deploy sentrz\" { x }\n  Second = \"deploy gubbins\" { a }\n",
             ),
             &mut vocabulary,
         );
@@ -906,7 +876,7 @@ mod tests {
     #[test]
     fn test_a_known_profile_never_mentions_the_missing_word_list() {
         let report = validate(
-            &with_commands("  - phrase: salute\n    keys: [\"x\"]\n"),
+            &with_grammar("  Salute = \"salute\" { x }\n"),
             &mut full_vocabulary().without_word_list(),
         );
 
@@ -917,9 +887,9 @@ mod tests {
     }
 
     #[test]
-    fn test_a_missing_model_does_not_hide_the_grammar_lints() {
-        let profile = profile(&with_commands(
-            "  - name: Broken\n    phrase: \"[deploy] [the] [sentry]\"\n    keys: [\"x\"]\n",
+    fn test_a_missing_model_does_not_hide_the_grammar_findings() {
+        let profile = profile(&with_grammar(
+            "  HoldForward = \"hold forward\" { hold(w) }\n",
         ));
         let report = check(
             "test-profile.yaml",
@@ -937,194 +907,32 @@ mod tests {
             "the model failure is reported:\n{rendered}"
         );
         assert!(
-            rendered.contains("Every term in the phrase for 'Broken' is optional"),
+            rendered.contains("never release"),
             "and so is everything it could have hidden:\n{rendered}"
         );
-        assert_eq!(report.errors(), 2);
+        assert_eq!(report.errors(), 1);
+        assert_eq!(report.warnings(), 1);
         assert_eq!(report.exit_code(), 1);
-    }
-
-    #[test]
-    fn test_an_all_optional_phrase_is_an_error() {
-        let report = validate(
-            &with_commands("  - name: Ghost\n    phrase: \"[deploy] [the]\"\n    keys: [\"x\"]\n"),
-            &mut full_vocabulary(),
-        );
-
-        let message = report.error_messages().remove(0);
-        assert!(
-            message.contains("'Ghost'") && message.contains("empty phrase"),
-            "unexpected error: {message}"
-        );
-        assert_eq!(report.exit_code(), 1);
-    }
-
-    #[test]
-    fn test_duplicate_phrases_warn_and_name_both_commands() {
-        let report = validate(
-            &with_commands(
-                "  - name: First\n    phrase: salute\n    keys: [\"x\"]\n  - name: Second\n    phrase: \"[the] salute\"\n    keys: [\"a\"]\n",
-            ),
-            &mut full_vocabulary(),
-        );
-
-        let rendered = report.render();
-        assert!(
-            rendered.contains("the phrase \"salute\" is used by both 'First' and 'Second'"),
-            "unexpected report:\n{rendered}"
-        );
-        assert_eq!(report.warnings(), 1);
-        assert_eq!(
-            report.exit_code(),
-            0,
-            "a duplicate is a warning here and an error in `run`"
-        );
-    }
-
-    #[test]
-    fn test_prefix_relations_are_noted_with_the_timeout() {
-        let report = validate(
-            "model: /models/en\ncompletion_timeout: 350ms\ncommands:\n  - name: Reload\n    phrase: reload\n    keys: [\"x\"]\n  - name: Reload weapon\n    phrase: reload weapon\n    keys: [\"a\"]\n",
-            &mut full_vocabulary(),
-        );
-
-        let rendered = report.render();
-        assert!(
-            rendered.contains(
-                "note: saying \"reload\" will wait 350ms in case you continue with \"reload weapon\""
-            ),
-            "unexpected report:\n{rendered}"
-        );
-        assert_eq!(report.errors(), 0);
-        assert_eq!(report.exit_code(), 0);
-    }
-
-    #[test]
-    fn test_prefixes_within_one_command_are_not_noted() {
-        // "deploy the sentry" is a prefix of nothing else, but "deploy" is a
-        // prefix of "deploy the sentry" *within the same command* — whichever
-        // wins, the same keys are pressed.
-        let report = validate(
-            &with_commands("  - phrase: deploy [the sentry]\n    keys: [\"x\"]\n"),
-            &mut full_vocabulary(),
-        );
-
-        assert!(
-            !report.render().contains("will wait"),
-            "unexpected report:\n{}",
-            report.render()
-        );
-    }
-
-    #[test]
-    fn test_a_large_expansion_warns() {
-        // Eight chained two-way alternates expand to 256 phrases: within the
-        // hard cap of 512, but past the warning threshold of 128.
-        let phrase = ["{a, b}"; 8].join(" ");
-        let report = validate(
-            &with_commands(&format!(
-                "  - name: Sprawling\n    phrase: \"{phrase}\"\n    keys: [\"x\"]\n"
-            )),
-            &mut full_vocabulary(),
-        );
-
-        let rendered = report.render();
-        assert!(
-            rendered.contains("expands into 256 concrete phrases"),
-            "unexpected report:\n{rendered}"
-        );
-        assert_eq!(report.warnings(), 1);
-        assert_eq!(report.exit_code(), 0, "a large phrase still works");
-    }
-
-    #[test]
-    fn test_an_expansion_below_the_threshold_is_quiet() {
-        let phrase = ["{a, b}"; 7].join(" ");
-        let report = validate(
-            &with_commands(&format!("  - phrase: \"{phrase}\"\n    keys: [\"x\"]\n")),
-            &mut full_vocabulary(),
-        );
-
-        assert_eq!(
-            report.warnings(),
-            0,
-            "128 phrases is fine:\n{}",
-            report.render()
-        );
-    }
-
-    #[test]
-    fn test_an_unreleased_key_is_a_note() {
-        let report = validate(
-            &with_commands(
-                "  - name: Hold forward\n    phrase: hold forward\n    events:\n      - down: w\n",
-            ),
-            &mut FakeVocabulary::new(&["hold", "forward"]),
-        );
-
-        let rendered = report.render();
-        assert!(
-            rendered.contains("note: this command holds 'w' down and never releases it"),
-            "unexpected report:\n{rendered}"
-        );
-        assert_eq!(report.errors(), 0);
-        assert_eq!(report.warnings(), 0, "hold macros are legal");
-        assert_eq!(report.exit_code(), 0);
-    }
-
-    #[test]
-    fn test_an_unmatched_release_is_a_warning() {
-        let report = validate(
-            &with_commands(
-                "  - name: Slip\n    phrase: salute\n    events:\n      - up: w\n      - down: x\n      - up: x\n",
-            ),
-            &mut full_vocabulary(),
-        );
-
-        let rendered = report.render();
-        assert!(
-            rendered.contains("warning: this command releases 'w' without ever pressing it"),
-            "unexpected report:\n{rendered}"
-        );
-        assert_eq!(report.warnings(), 1);
-        assert_eq!(report.exit_code(), 0);
-    }
-
-    #[test]
-    fn test_the_keys_shorthand_is_always_balanced() {
-        let report = validate(
-            &with_commands("  - phrase: salute\n    keys: [\"leftctrl+x\"]\n"),
-            &mut full_vocabulary(),
-        );
-
-        assert_eq!(
-            report.warnings() + report.errors(),
-            0,
-            "the shorthand cannot be unbalanced:\n{}",
-            report.render()
-        );
-        assert!(!report.render().contains("note:"));
     }
 
     #[test]
     fn test_everything_is_reported_in_one_pass() {
+        // A lint, an unknown word, and a prefix note all appear together.
         let report = validate(
-            &with_commands(
-                "  - name: Ghost\n    phrase: \"[deploy] [the]\"\n    keys: [\"x\"]\n  - name: Slip\n    phrase: gubbins\n    events:\n      - up: w\n",
+            &with_grammar(
+                "  HoldForward = \"hold forward\" { hold(w) }\n  Gubbins = \"gubbins\" { x }\n  GubbinsNow = \"gubbins now\" { a }\n",
             ),
             &mut full_vocabulary(),
         );
 
         let rendered = report.render();
-        // The empty-phrase error, the unknown word, and the unmatched release
-        // all appear together.
-        assert!(rendered.contains("empty phrase"), "{rendered}");
+        assert!(rendered.contains("never release"), "{rendered}");
         assert!(rendered.contains("'gubbins'"), "{rendered}");
-        assert!(rendered.contains("without ever pressing it"), "{rendered}");
-        assert_eq!(report.errors(), 2);
+        assert!(rendered.contains("will wait"), "{rendered}");
+        assert_eq!(report.errors(), 1);
         assert_eq!(report.warnings(), 1);
         assert!(
-            rendered.contains("2 commands checked — 2 errors, 1 warning."),
+            rendered.contains("3 commands checked — 1 error, 1 warning."),
             "unexpected summary:\n{rendered}"
         );
     }
@@ -1159,20 +967,6 @@ mod tests {
         assert_eq!(report.errors(), errors);
         assert_eq!(report.warnings(), warnings);
         assert_eq!(report.exit_code(), expected);
-    }
-
-    #[test]
-    fn test_clean_commands_render_as_ok() {
-        let report = validate(
-            &with_commands("  - phrase: salute\n    keys: [\"x\"]\n"),
-            &mut full_vocabulary(),
-        );
-
-        assert!(
-            report.render().contains("salute\n  ok\n"),
-            "unexpected report:\n{}",
-            report.render()
-        );
     }
 
     fn model_path() -> std::path::PathBuf {
@@ -1222,17 +1016,16 @@ mod tests {
         );
         let rendered = report.render();
 
-        for command in &profile.commands {
+        for rule in profile.grammar.published() {
             assert!(
-                rendered.contains(command.display_name()),
+                rendered.contains(&rule.name),
                 "'{}' should have a section:\n{rendered}",
-                command.display_name()
+                rule.name
             );
         }
 
-        // Nothing structural, nothing about the grammar, and no unbalanced
-        // output: the small English model's vocabulary is the only thing which
-        // may have something to say.
+        // Nothing structural and nothing about the grammar: the small English
+        // model's vocabulary is the only thing which may have something to say.
         for message in report.error_messages() {
             assert!(
                 message.contains("does not know the word"),

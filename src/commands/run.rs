@@ -12,10 +12,10 @@
 //! `voice-orders test`, and lives here in [`Pipeline`]: the two commands differ
 //! only in who consumes the command queue (a uinput keyboard or the terminal),
 //! whether a virtual keyboard is created at all, and whether a child process is
-//! supervised. The pure part of the assembly — profile in, compiled commands +
-//! trie + grammar out — is [`build_pipeline_parts`], so it can be tested with no
-//! hardware at all, and the supervisor's signal handling is [`supervise`], which
-//! takes its triggers as futures for the same reason.
+//! supervised. The pure part of the assembly — profile in, compiled automaton +
+//! recognition feed out — is [`build_pipeline_parts`], so it can be tested with
+//! no hardware at all, and the supervisor's signal handling is [`supervise`],
+//! which takes its triggers as futures for the same reason.
 //!
 //! **Two faces.** On an interactive terminal `run` renders the same full-screen
 //! UI as `test` (`super::ui`); with stdout piped — a Steam launch, a CI job,
@@ -26,7 +26,6 @@
 //! the alternate screen) and raw mode turns Ctrl-C into a keystroke we have to
 //! forward as a signal ourselves ([`Shutdown`]).
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -46,9 +45,9 @@ use tracing_batteries::prelude::*;
 
 use crate::audio;
 use crate::config::{Profile, ResolvedSettings, SystemConfig, loader, resolve_model};
-use crate::grammar::expansion;
+use crate::grammar::{Automaton, Feed, feed, user_error};
 use crate::hotkey::{self, ListenMode};
-use crate::matcher::{CommandAction, CompiledCommand, MatcherOptions, PhraseTrie, matcher_task};
+use crate::matcher::{CommandAction, MatcherOptions, engine::engine_task};
 use crate::output::{Interrupt, PlatformSink, executor};
 use crate::recognition::{AudioMsg, RecognitionEvent, vosk};
 
@@ -111,9 +110,9 @@ pub async fn run(args: RunArgs) -> Result<i32, crate::Error> {
     let system = SystemConfig::load()?;
     let settings = ResolvedSettings::resolve(&profile, &system)?;
 
-    // 2. The grammar: every command compiled, every phrase expanded, and the
-    //    trie built — which is where duplicate phrases become an error.
-    let parts = build_pipeline_parts(&profile)?;
+    // 2. The grammar: the automaton compiled (which is where duplicate
+    //    commands become an error) and the recognition feed built.
+    let parts = build_pipeline_parts(&profile, &loaded.source)?;
 
     // 3. The virtual keyboard, *first*: creating it is what fails when
     //    /dev/uinput is missing or unreadable, and finding that out after
@@ -405,10 +404,11 @@ impl Pipeline {
         profile: &Profile,
         settings: &ResolvedSettings,
         model: PathBuf,
-        parts: (Vec<CompiledCommand>, PhraseTrie, Vec<String>),
+        parts: (Automaton, Feed),
         options: PipelineOptions,
     ) -> Result<(Self, mpsc::Receiver<CommandAction>), crate::Error> {
-        let (commands, trie, grammar) = parts;
+        let (automaton, feed) = parts;
+        let grammar = feed.phrases;
 
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
@@ -473,9 +473,9 @@ impl Pipeline {
 
         let mut tasks = vec![(
             "matcher",
-            tokio::spawn(matcher_task(
-                trie,
-                commands,
+            tokio::spawn(engine_task(
+                automaton,
+                profile.defaults,
                 matcher_options,
                 matcher_events,
                 queue_tx,
@@ -518,7 +518,7 @@ impl Pipeline {
         let summary = PipelineSummary {
             device: capture.device_name().to_string(),
             model,
-            commands: profile.commands.len(),
+            commands: profile.grammar.published().count(),
             phrases: grammar.len(),
             mode,
             listening,
@@ -636,64 +636,38 @@ fn interrupt_for(settings: &ResolvedSettings, listening: &watch::Sender<bool>) -
 }
 
 /// Compiles a profile into everything the runtime pipeline needs to match
-/// speech: the commands (with their output plans), the phrase trie, and the
-/// deduped grammar handed to the recognizer.
+/// speech: the grammar's automaton, and the recognition feed handed to the
+/// recognizer.
 ///
 /// This is the whole of the assembly which is a pure function of the profile,
 /// which is what makes it testable without a model, a microphone or
-/// `/dev/uinput`.
+/// `/dev/uinput`. The grammar itself parsed at profile load; compiling the
+/// automaton happens here so its failures — two commands accepting the same
+/// words with different keys, a grammar past the state cap — can name the
+/// profile's `source`.
 ///
-/// The grammar is the space-joined form of every expanded phrase, globally
-/// deduped. [`vosk::UNKNOWN_PHRASE`] is deliberately *not* added here — the
-/// recognizer appends it itself, and adding it twice would put a duplicate
-/// entry into the compiled grammar.
+/// The feed's phrases are lowercased, space-joined and globally deduped.
+/// [`vosk::UNKNOWN_PHRASE`] is deliberately *not* added here — the recognizer
+/// appends it itself, and adding it twice would put a duplicate entry into the
+/// compiled grammar.
 pub(super) fn build_pipeline_parts(
     profile: &Profile,
-) -> Result<(Vec<CompiledCommand>, PhraseTrie, Vec<String>), crate::Error> {
-    let mut commands = Vec::with_capacity(profile.commands.len());
-    let mut grammar = Vec::new();
-    let mut seen = HashSet::new();
+    source: &str,
+) -> Result<(Automaton, Feed), crate::Error> {
+    let automaton = Automaton::compile(&profile.grammar).map_err(|diagnostics| {
+        human_errors::wrap_user(
+            user_error(&diagnostics, profile.grammar.source()),
+            format!(
+                "We could not compile the grammar of the profile at '{source}' into something we can listen for."
+            ),
+            &[
+                "Each report above points at the exact place in the grammar it describes.",
+                "Run `voice-orders validate` on the profile to see every problem — and every warning — in one pass.",
+            ],
+        )
+    })?;
 
-    for command in &profile.commands {
-        let name = command.display_name().to_string();
-        let output = command.compile(&profile.defaults)?;
-
-        let expanded = expansion::expand(command.phrase.expr()).map_err(|e| {
-            human_errors::wrap_user(
-                e,
-                format!("We could not work out what the command '{name}' listens for."),
-                &[
-                    "Simplify the command's phrase, or split it into several commands with shorter phrases.",
-                ],
-            )
-        })?;
-
-        for phrase in &expanded.phrases {
-            // An empty expansion is an all-optional phrase nobody can say; the
-            // trie rejects it below with a message naming the command, so it
-            // must not reach the grammar in the meantime.
-            if phrase.is_empty() {
-                continue;
-            }
-
-            let joined = phrase.join(" ");
-            if seen.insert(joined.clone()) {
-                grammar.push(joined);
-            }
-        }
-
-        commands.push(CompiledCommand {
-            name,
-            output,
-            phrases: expanded.phrases,
-        });
-    }
-
-    // Duplicate phrases across commands are an error here; they are only a
-    // warning in `validate`, so that one run reports every problem at once.
-    let trie = PhraseTrie::build(&commands)?;
-
-    Ok((commands, trie, grammar))
+    Ok((automaton, feed(&profile.grammar)))
 }
 
 /// Keeps the audio callback's `AtomicBool` and the recognizer in step with the
@@ -1585,16 +1559,18 @@ mod tests {
     }
 
     #[test]
-    fn test_the_grammar_is_every_phrase_of_every_command() {
-        let (commands, _trie, grammar) = build_pipeline_parts(&profile(
-            "model: /models/en\ncommands:\n  - name: Deploy\n    phrase: deploy [the] {autocannon, auto cannon}\n    keys: [\"4\"]\n  - phrase: salute\n    events:\n      - down: x\n",
-        ))
+    fn test_the_feed_is_every_phrase_of_the_grammar() {
+        let (_automaton, feed) = build_pipeline_parts(
+            &profile(
+                "model: /models/en\ngrammar: |\n  Deploy = \"deploy\" \"the\"? (\"autocannon\" | \"auto cannon\") { 4 }\n  Salute = \"salute\" { hold(x) }\n",
+            ),
+            "test-profile.yaml",
+        )
         .expect("the profile should assemble");
 
         assert_eq!(
-            grammar,
+            feed.phrases,
             vec![
-                // The omitted branch of an '[optional]' group comes first.
                 "deploy autocannon",
                 "deploy auto cannon",
                 "deploy the autocannon",
@@ -1602,79 +1578,134 @@ mod tests {
                 "salute",
             ]
         );
-
-        // Names come from `display_name`, so the named command reports its name
-        // and the unnamed one reports its phrase source.
-        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["Deploy", "salute"]);
-
-        assert_eq!(
-            commands[1].output,
-            CompiledOutput::Keyboard(vec![KeyEvent::Down(
-                keys::from_name("x").expect("a known key")
-            )])
-        );
+        assert!(feed.decompositions.is_empty());
     }
 
     #[test]
-    fn test_the_grammar_never_carries_the_unknown_phrase() {
+    fn test_the_feed_never_carries_the_unknown_phrase() {
         // The recognizer appends "[unk]" itself; adding it here as well would
         // put a duplicate into the compiled grammar.
-        let (_commands, _trie, grammar) = build_pipeline_parts(&profile(
-            "model: /models/en\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n",
-        ))
+        let (_automaton, feed) = build_pipeline_parts(
+            &profile("model: /models/en\ngrammar: |\n  Salute = \"salute\" { x }\n"),
+            "test-profile.yaml",
+        )
         .expect("the profile should assemble");
 
         assert!(
-            !grammar.iter().any(|p| p == vosk::UNKNOWN_PHRASE),
-            "unexpected grammar: {grammar:?}"
+            !feed.phrases.iter().any(|p| p == vosk::UNKNOWN_PHRASE),
+            "unexpected feed: {:?}",
+            feed.phrases
         );
     }
 
     #[test]
-    fn test_a_shared_phrase_appears_in_the_grammar_once() {
-        // Both commands expand to include "the salute", but the grammar is
-        // globally deduped, so the recognizer is told about it once.
-        let (_commands, _trie, grammar) = build_pipeline_parts(&profile(
-            "model: /models/en\ncommands:\n  - phrase: \"{the, a} salute\"\n    keys: [\"x\"]\n  - phrase: the salute now\n    keys: [\"y\"]\n",
-        ))
+    fn test_a_shared_phrase_reaches_the_recognizer_once() {
+        // Both commands accept "the salute", but the feed is globally deduped,
+        // so the recognizer is told about it once.
+        let (_automaton, feed) = build_pipeline_parts(
+            &profile(
+                "model: /models/en\ngrammar: |\n  Salute = (\"the\" | \"a\") \"salute\" { x }\n  SaluteNow = \"the\" \"salute\" \"now\" { y }\n",
+            ),
+            "test-profile.yaml",
+        )
         .expect("the profile should assemble");
 
         assert_eq!(
-            grammar.iter().filter(|p| *p == "the salute").count(),
-            1,
-            "unexpected grammar: {grammar:?}"
+            feed.phrases,
+            vec!["the salute", "a salute", "the salute now"]
         );
-        assert_eq!(grammar, vec!["the salute", "a salute", "the salute now"]);
     }
 
     #[test]
-    fn test_a_duplicate_phrase_is_an_error_naming_both_commands() {
-        let error = build_pipeline_parts(&profile(
-            "model: /models/en\ncommands:\n  - name: First\n    phrase: salute\n    keys: [\"x\"]\n  - name: Second\n    phrase: \"[the] salute\"\n    keys: [\"y\"]\n",
-        ))
-        .expect_err("two commands cannot share a phrase");
+    fn test_a_duplicate_command_is_an_error_naming_the_profile_and_both_rules() {
+        // The grammar itself loads — accepting the same words twice is only
+        // detected on the automaton — so the failure lands here, where it can
+        // name the profile's source.
+        let error = build_pipeline_parts(
+            &profile(
+                "model: /models/en\ngrammar: |\n  First = \"salute\" { x }\n  Second = \"the\"? \"salute\" { y }\n",
+            ),
+            "test-profile.yaml",
+        )
+        .expect_err("two commands cannot share a phrase with different keys");
 
         let message = error.to_string();
+        assert!(
+            message.contains("test-profile.yaml"),
+            "the error should name the profile source, got: {message}"
+        );
         assert!(
             message.contains("'First'") && message.contains("'Second'"),
             "the error should name both commands, got: {message}"
         );
     }
 
-    #[test]
-    fn test_an_unspeakable_command_is_an_error_naming_it() {
-        // Every term optional, so the phrase expands to include the empty
-        // phrase — which the trie rejects by name.
-        let error = build_pipeline_parts(&profile(
-            "model: /models/en\ncommands:\n  - name: Ghost\n    phrase: \"[deploy] [the]\"\n    keys: [\"x\"]\n",
-        ))
-        .expect_err("an all-optional phrase cannot be spoken");
+    // --- The engine, end to end over the canonical profile -----------------
 
+    /// The full grammar path over a real shipped profile: `profiles/arma3.yaml`
+    /// loads as a Profile, compiles, and a synthetic utterance walks through
+    /// the engine to the command queue with its assembled key plan.
+    #[tokio::test]
+    async fn test_an_arma_command_fires_through_the_engine() {
+        use crate::output::assembly::{ActionItem, assemble};
+
+        let arma = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma3.yaml"));
+        let profile = Profile::parse(&LoadedProfile {
+            source: "profiles/arma3.yaml".to_string(),
+            content: arma.to_string(),
+        })
+        .expect("the shipped profile should load");
+
+        let (automaton, feed) = build_pipeline_parts(&profile, "profiles/arma3.yaml")
+            .expect("the shipped profile should assemble");
         assert!(
-            error.to_string().contains("'Ghost'"),
-            "the error should name the command, got: {error}"
+            feed.phrases.iter().any(|phrase| phrase == "advance"),
+            "the feed should carry the fragment the utterance needs"
         );
+
+        let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
+        let (queue_tx, mut queue_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let cancel = CancellationToken::new();
+        let options = MatcherOptions::from_profile(&profile, Arc::new(|_| {}));
+        let engine = tokio::spawn(engine_task(
+            automaton,
+            profile.defaults,
+            options,
+            events_rx,
+            queue_tx,
+            cancel.clone(),
+        ));
+
+        events_tx
+            .send(RecognitionEvent::Final(Utterance::plain("two advance")))
+            .await
+            .expect("the engine should be listening");
+
+        let action = tokio::time::timeout(Duration::from_secs(5), queue_rx.recv())
+            .await
+            .expect("the command should fire promptly")
+            .expect("the queue should carry the command");
+        assert_eq!(action.command, "Advance");
+
+        // `Advance = subject ("advance" | "move up") { ..., 1, 2 }`: the
+        // subject's F2 spliced ahead of the move-menu presses, paced by the
+        // profile's defaults.
+        let key = |name: &str| keys::from_name(name).expect("a known key");
+        let expected = assemble(
+            &[
+                ActionItem::Press(vec![key("f2")]),
+                ActionItem::Press(vec![key("1")]),
+                ActionItem::Press(vec![key("2")]),
+            ],
+            &profile.defaults,
+        );
+        assert_eq!(action.output, CompiledOutput::Keyboard(expected));
+
+        cancel.cancel();
+        engine
+            .await
+            .expect("the engine should not panic")
+            .expect("the engine should stop cleanly");
     }
 
     // --- Interrupting the executor ---------------------------------------
@@ -1697,7 +1728,7 @@ mod tests {
     )]
     fn test_only_an_interrupting_hotkey_subscribes(#[case] yaml: &str, #[case] expected: bool) {
         let profile = profile(&format!(
-            "{yaml}commands:\n  - phrase: salute\n    keys: [\"x\"]\n"
+            "{yaml}grammar: |\n  Salute = \"salute\" {{ x }}\n"
         ));
         let settings = ResolvedSettings::resolve(&profile, &SystemConfig::default())
             .expect("the settings should resolve");
@@ -1727,8 +1758,7 @@ mod tests {
         )
         .expect("the system configuration should load");
 
-        let profile =
-            profile("model: /models/en\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n");
+        let profile = profile("model: /models/en\ngrammar: |\n  Salute = \"salute\" { x }\n");
         let settings =
             ResolvedSettings::resolve(&profile, &system).expect("the settings should resolve");
         let (listening, _rx) = watch::channel(false);
@@ -1851,12 +1881,16 @@ mod tests {
             EventSink::Channel(events_tx),
         ));
 
-        let profile = profile(
-            "model: /models/en\ncommands:\n  - name: Autocannon\n    phrase: autocannon\n    keys: [\"leftctrl+4\"]\n",
-        );
-        let output = profile.commands[0]
-            .compile(&profile.defaults)
-            .expect("the command should compile");
+        // The plan a real match assembles for `{ leftctrl+4 }` under the
+        // default pacing.
+        let key = |name: &str| keys::from_name(name).expect("a known key");
+        let output = CompiledOutput::Keyboard(vec![
+            KeyEvent::Down(key("leftctrl")),
+            KeyEvent::Down(key("4")),
+            KeyEvent::Wait(Duration::from_millis(30)),
+            KeyEvent::Up(key("4")),
+            KeyEvent::Up(key("leftctrl")),
+        ]);
         queue_tx
             .send(CommandAction {
                 command: "Autocannon".to_string(),
@@ -2264,19 +2298,17 @@ mod tests {
     /// which fired, through the real matcher built from a real profile.
     #[tokio::test]
     async fn test_a_matched_utterance_reaches_the_command_queue() {
-        let profile = profile(
-            "model: /models/en\ncommands:\n  - name: Salute\n    phrase: salute\n    keys: [\"x\"]\n",
-        );
-        let (commands, trie, _grammar) =
-            build_pipeline_parts(&profile).expect("the profile should assemble");
+        let profile = profile("model: /models/en\ngrammar: |\n  Salute = \"salute\" { x }\n");
+        let (automaton, _feed) = build_pipeline_parts(&profile, "test-profile.yaml")
+            .expect("the profile should assemble");
 
         let cancel = CancellationToken::new();
         let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
         let (queue_tx, mut queue_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
 
-        let matcher = tokio::spawn(matcher_task(
-            trie,
-            commands,
+        let matcher = tokio::spawn(engine_task(
+            automaton,
+            profile.defaults,
             MatcherOptions::with_timeout(profile.completion_timeout),
             events_rx,
             queue_tx,
@@ -2357,10 +2389,11 @@ mod tests {
         );
 
         let profile = profile(
-            "commands:\n  - name: Salute\n    phrase: salute\n    keys: [\"x\"]\n  - name: Open terminal\n    phrase: open [the] terminal\n    keys: [\"leftctrl+leftalt+t\"]\n",
+            "grammar: |\n  Salute = \"salute\" { x }\n  Terminal = \"open\" \"the\"? \"terminal\" { leftctrl+leftalt+t }\n",
         );
-        let (commands, trie, grammar) =
-            build_pipeline_parts(&profile).expect("the profile should assemble");
+        let (automaton, feed) = build_pipeline_parts(&profile, "test-profile.yaml")
+            .expect("the profile should assemble");
+        let grammar = feed.phrases;
 
         // The grammar this profile produces really does compile against a real
         // model, which is the half of assembly no fake can stand in for.
@@ -2379,9 +2412,9 @@ mod tests {
         let (queue_tx, queue_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let sink = FakeSink::default();
 
-        let matcher = tokio::spawn(matcher_task(
-            trie,
-            commands,
+        let matcher = tokio::spawn(engine_task(
+            automaton,
+            profile.defaults,
             MatcherOptions::with_timeout(profile.completion_timeout),
             events_rx,
             queue_tx,
@@ -2459,16 +2492,21 @@ mod tests {
         );
 
         // The digits the fixture speaks, each its own unambiguous command.
+        // Rule names are the digits themselves — published TitleCase names in
+        // the grammar, but matched case-insensitively when asserted below.
         let digits = ["one", "zero", "nine", "oh", "two", "eight", "three"];
-        let commands: Vec<CompiledCommand> = digits
+        let source: String = digits
             .iter()
-            .map(|word| CompiledCommand {
-                name: (*word).to_string(),
-                output: CompiledOutput::Keyboard(Vec::new()),
-                phrases: vec![vec![(*word).to_string()]],
+            .map(|word| {
+                let mut name = word.to_string();
+                name[..1].make_ascii_uppercase();
+                format!("{name} = \"{word}\" {{ x }}\n")
             })
             .collect();
-        let trie = PhraseTrie::build(&commands).expect("the digit commands should build");
+        let grammar_source =
+            crate::grammar::Grammar::parse(&source).expect("the digit grammar should parse");
+        let automaton = crate::grammar::Automaton::compile(&grammar_source)
+            .expect("the digit grammar should compile");
         let grammar: Vec<String> = digits.iter().map(|word| (*word).to_string()).collect();
 
         // An endpointer that cannot fire behind our backs: 10s of trailing
@@ -2509,9 +2547,9 @@ mod tests {
         const EAGER_DELAY: Duration = Duration::from_millis(150);
         let cancel = CancellationToken::new();
         let (queue_tx, mut queue_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
-        let matcher = tokio::spawn(matcher_task(
-            trie,
-            commands,
+        let matcher = tokio::spawn(engine_task(
+            automaton,
+            crate::config::OutputDefaults::default(),
             crate::matcher::MatcherOptions {
                 eager: true,
                 eager_delay: EAGER_DELAY,
@@ -2559,7 +2597,7 @@ mod tests {
         assert!(
             fired
                 .iter()
-                .all(|(_, name)| digits.contains(&name.as_str())),
+                .all(|(_, name)| digits.contains(&name.to_lowercase().as_str())),
             "only digit commands may fire: {fired:?}"
         );
 

@@ -1,279 +1,208 @@
-use super::{location::Loc, token::Token};
+//! The chumsky lexer: grammar source → spanned [`Token`] stream.
+//!
+//! Errors do not abort the scan. A bad character or a malformed literal emits
+//! a [`Rich`] error and lexing continues, so one load of a grammar reports
+//! every lexical problem it has, not just the first.
 
-/// Returns whether `c` may appear within a word: letters, digits, apostrophes
-/// (`don't`), and hyphens (`auto-cannon`).
-fn is_word_char(c: char) -> bool {
+use chumsky::prelude::*;
+
+use super::token::Token;
+
+pub(super) type LexError<'src> = Rich<'src, char, SimpleSpan<usize>>;
+pub(super) type SpannedToken = (Token, SimpleSpan<usize>);
+
+/// Whether `c` may appear inside a spoken literal word: letters, digits,
+/// apostrophes (`don't`) and hyphens (`auto-cannon`), exactly as in the old
+/// phrase DSL.
+fn is_literal_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '\'' || c == '-'
 }
 
-/// A zero-copy scanner over a phrase source string.
-///
-/// The scanner *is* the token stream: it implements
-/// `Iterator<Item = Result<Token, Error>>`, with lexing errors surfacing as
-/// stream items at exactly the point the parser demands the bad token. Word
-/// payloads are slices of the source — no allocation happens while lexing.
-pub struct Scanner<'a> {
-    source: &'a str,
-    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
-    line: usize,
-    line_start: usize,
-}
+/// Builds the lexer for a whole grammar source.
+pub(super) fn lexer<'src>()
+-> impl Parser<'src, &'src str, Vec<SpannedToken>, extra::Err<LexError<'src>>> {
+    let word = any()
+        .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
+        .repeated()
+        .at_least(1)
+        .to_slice()
+        .map(|word: &str| Token::Word(word.to_owned()));
 
-impl<'a> Scanner<'a> {
-    pub fn new(source: &'a str) -> Self {
-        Self {
-            source,
-            chars: source.char_indices().peekable(),
-            line: 1,
-            line_start: 0,
-        }
-    }
+    // Literals are validated here rather than in the parser so the error can
+    // point at the quoted text itself; a bad word still yields a token, so the
+    // rest of the grammar keeps lexing and parsing.
+    let literal = none_of("\"\n")
+        .repeated()
+        .to_slice()
+        .delimited_by(just('"'), just('"'))
+        .validate(|content: &str, extra, emitter| {
+            let words: Vec<String> = content
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect();
 
-    /// Returns the byte offset of the next character to be consumed, or the
-    /// length of the source if the scanner has reached the end of its input.
-    fn position(&mut self) -> usize {
-        self.chars
-            .peek()
-            .map(|(idx, _)| *idx)
-            .unwrap_or(self.source.len())
-    }
+            if words.is_empty() {
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "You've written an empty literal — every literal needs at least one spoken word, e.g. \"fall back\".",
+                ));
+            }
 
-    /// Reads the remainder of a word whose first character (at byte offset
-    /// `start`) has already been consumed.
-    fn read_word(&mut self, start: usize) -> Token<'a> {
-        while matches!(self.chars.peek(), Some((_, c)) if is_word_char(*c)) {
-            self.chars.next();
-        }
-
-        Token::Word(
-            Loc::new(self.line, 1 + start - self.line_start),
-            &self.source[start..self.position()],
-        )
-    }
-}
-
-impl<'a> Iterator for Scanner<'a> {
-    type Item = Result<Token<'a>, crate::Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some((idx, c)) = self.chars.next() {
-            let location = Loc::new(self.line, 1 + idx - self.line_start);
-            match c {
-                '\n' => {
-                    self.line += 1;
-                    self.line_start = idx + 1;
-                }
-                c if c.is_whitespace() => {}
-                '[' => return Some(Ok(Token::LeftBracket(location))),
-                ']' => return Some(Ok(Token::RightBracket(location))),
-                '{' => return Some(Ok(Token::LeftBrace(location))),
-                '}' => return Some(Ok(Token::RightBrace(location))),
-                ',' => return Some(Ok(Token::Comma(location))),
-                c if is_word_char(c) => return Some(Ok(self.read_word(idx))),
-                c => {
-                    return Some(Err(human_errors::user(
-                        format!("We found an unexpected character '{c}' at {location}."),
-                        &[
-                            "Phrases may only contain words, '[optional]' groups and '{alternate, choices}' groups.",
-                        ],
-                    )));
+            for word in &words {
+                if let Some(bad) = word.chars().find(|c| !is_literal_word_char(*c)) {
+                    emitter.emit(Rich::custom(
+                        extra.span(),
+                        format!(
+                            "The word '{word}' contains '{bad}', which can't be spoken — literal words may only use letters, digits, apostrophes and hyphens."
+                        ),
+                    ));
                 }
             }
-        }
 
-        None
-    }
+            Token::Literal(words)
+        });
+
+    let structural = choice((
+        just("...").to(Token::Ellipsis),
+        just("..").to(Token::DotDot),
+        just('=').to(Token::Eq),
+        just('|').to(Token::Pipe),
+        just('(').to(Token::LParen),
+        just(')').to(Token::RParen),
+        just('{').to(Token::LBrace),
+        just('}').to(Token::RBrace),
+        just('[').to(Token::LBracket),
+        just(']').to(Token::RBracket),
+        just('?').to(Token::Question),
+        just('*').to(Token::Star),
+        just('+').to(Token::Plus),
+        just(':').to(Token::Colon),
+        just(',').to(Token::Comma),
+    ));
+
+    let line_comment = just("//").then(none_of("\n").repeated()).ignored();
+    let padding = any()
+        .filter(|c: &char| c.is_whitespace())
+        .ignored()
+        .or(line_comment)
+        .repeated();
+
+    let token = choice((literal, word, structural)).map(Some);
+
+    // Anything no token matched is reported and skipped, so a stray character
+    // costs one diagnostic instead of the rest of the grammar.
+    let unexpected = any()
+        .validate(|c: char, extra, emitter| {
+            let message = if c == '"' {
+                "You have an unclosed '\"' — every literal needs a closing quote on the same line.".to_owned()
+            } else {
+                format!(
+                    "We found an unexpected character '{c}' — grammars are made of rules like: name = \"spoken words\" {{ f1 }}."
+                )
+            };
+            emitter.emit(Rich::custom(extra.span(), message));
+        })
+        .to(None);
+
+    choice((token, unexpected))
+        .map_with(|token, extra| token.map(|token| (token, extra.span())))
+        .padded_by(padding)
+        .repeated()
+        .collect::<Vec<Option<SpannedToken>>>()
+        .map(|tokens| tokens.into_iter().flatten().collect())
+        .padded_by(padding)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use rstest::rstest;
 
-    use super::*;
-
-    macro_rules! assert_sequence {
-      ($phrase:expr $(, $item:pat)* $(,)?) => {
-        let mut scanner = Scanner::new($phrase);
-        $(
-          match scanner.next() {
-            Some(Ok($item)) => {},
-            Some(Ok(item)) => panic!("Expected '{}' but got '{:?}'", stringify!($item), item),
-            Some(Err(e)) => panic!("Error: {}", e),
-            None => panic!("Expected '{}' but got the end of the token sequence instead", stringify!($item)),
-          }
-        )*
-
-        assert!(scanner.next().is_none(), "expected end of sequence, but got an item");
-      };
+    fn lex(source: &str) -> Vec<Token> {
+        let (tokens, errors) = lexer().parse(source).into_output_errors();
+        assert!(errors.is_empty(), "unexpected lex errors: {errors:?}");
+        tokens
+            .expect("the source should lex")
+            .into_iter()
+            .map(|(token, _)| token)
+            .collect()
     }
 
-    #[test]
-    fn test_empty() {
-        assert_sequence!("");
-    }
-
-    #[test]
-    fn test_whitespace() {
-        assert_sequence!("  \t\r\n");
-    }
-
-    #[test]
-    fn test_words() {
-        assert_sequence!(
-            "deploy the sentry",
-            Token::Word(.., "deploy"),
-            Token::Word(.., "the"),
-            Token::Word(.., "sentry"),
-        );
-    }
-
-    #[test]
-    fn test_word_characters() {
-        // Apostrophes and hyphens are word characters, and digits are fine too.
-        assert_sequence!(
-            "don't auto-cannon mark2",
-            Token::Word(.., "don't"),
-            Token::Word(.., "auto-cannon"),
-            Token::Word(.., "mark2"),
-        );
-    }
-
-    #[test]
-    fn test_brackets_braces_and_commas() {
-        assert_sequence!(
-            "[] {,}",
-            Token::LeftBracket(..),
-            Token::RightBracket(..),
-            Token::LeftBrace(..),
-            Token::Comma(..),
-            Token::RightBrace(..),
-        );
-
-        // Groups need no whitespace around their delimiters.
-        assert_sequence!(
-            "[the]{a,b}",
-            Token::LeftBracket(..),
-            Token::Word(.., "the"),
-            Token::RightBracket(..),
-            Token::LeftBrace(..),
-            Token::Word(.., "a"),
-            Token::Comma(..),
-            Token::Word(.., "b"),
-            Token::RightBrace(..),
-        );
-    }
-
-    #[test]
-    fn test_full_phrase() {
-        assert_sequence!(
-            "deploy [the] {autocannon, auto cannon} [sentry]",
-            Token::Word(Loc { line: 1, column: 1 }, "deploy"),
-            Token::LeftBracket(Loc { line: 1, column: 8 }),
-            Token::Word(Loc { line: 1, column: 9 }, "the"),
-            Token::RightBracket(Loc {
-                line: 1,
-                column: 12
-            }),
-            Token::LeftBrace(Loc {
-                line: 1,
-                column: 14
-            }),
-            Token::Word(
-                Loc {
-                    line: 1,
-                    column: 15
-                },
-                "autocannon"
-            ),
-            Token::Comma(Loc {
-                line: 1,
-                column: 25
-            }),
-            Token::Word(
-                Loc {
-                    line: 1,
-                    column: 27
-                },
-                "auto"
-            ),
-            Token::Word(
-                Loc {
-                    line: 1,
-                    column: 32
-                },
-                "cannon"
-            ),
-            Token::RightBrace(Loc {
-                line: 1,
-                column: 38
-            }),
-            Token::LeftBracket(Loc {
-                line: 1,
-                column: 40
-            }),
-            Token::Word(
-                Loc {
-                    line: 1,
-                    column: 41
-                },
-                "sentry"
-            ),
-            Token::RightBracket(Loc {
-                line: 1,
-                column: 47
-            }),
-        );
-    }
-
-    #[test]
-    fn test_unicode_words_are_sliced_on_character_boundaries() {
-        assert_sequence!(
-            "café über łódź",
-            Token::Word(.., "café"),
-            Token::Word(.., "über"),
-            Token::Word(.., "łódź"),
-        );
-    }
-
-    #[test]
-    fn test_location_tracking_across_lines() {
-        assert_sequence!(
-            "deploy\n  [the]\nsentry",
-            Token::Word(Loc { line: 1, column: 1 }, "deploy"),
-            Token::LeftBracket(Loc { line: 2, column: 3 }),
-            Token::Word(Loc { line: 2, column: 4 }, "the"),
-            Token::RightBracket(Loc { line: 2, column: 7 }),
-            Token::Word(Loc { line: 3, column: 1 }, "sentry"),
-        );
+    fn lex_errors(source: &str) -> Vec<String> {
+        let (_, errors) = lexer().parse(source).into_output_errors();
+        errors.into_iter().map(|error| error.to_string()).collect()
     }
 
     #[rstest]
-    #[case("(", "We found an unexpected character '(' at line 1, column 1.")]
+    #[case("name", vec![Token::Word("name".into())])]
+    #[case("f1", vec![Token::Word("f1".into())])]
+    #[case("20ms", vec![Token::Word("20ms".into())])]
+    #[case("snake_case_9", vec![Token::Word("snake_case_9".into())])]
+    #[case("\"map\"", vec![Token::Literal(vec!["map".into()])])]
     #[case(
-        "deploy (now)",
-        "We found an unexpected character '(' at line 1, column 8."
+        "\"Toggle  MAP\"",
+        vec![Token::Literal(vec!["toggle".into(), "map".into()])]
     )]
-    #[case("fire!", "We found an unexpected character '!' at line 1, column 5.")]
-    #[case("a.b", "We found an unexpected character '.' at line 1, column 2.")]
     #[case(
-        "deploy\nfire (x)",
-        "We found an unexpected character '(' at line 2, column 6."
+        "\"don't auto-cannon\"",
+        vec![Token::Literal(vec!["don't".into(), "auto-cannon".into()])]
     )]
-    fn test_invalid_characters(#[case] input: &str, #[case] message: &str) {
-        let mut scanner = Scanner::new(input);
-        let error = loop {
-            match scanner.next() {
-                Some(Ok(..)) => continue,
-                Some(Err(e)) => break e,
-                None => panic!("Expected an error while scanning '{input}'"),
-            }
-        };
+    #[case("= | ( ) { } [ ]", vec![
+        Token::Eq, Token::Pipe, Token::LParen, Token::RParen,
+        Token::LBrace, Token::RBrace, Token::LBracket, Token::RBracket,
+    ])]
+    #[case("? * + : ,", vec![
+        Token::Question, Token::Star, Token::Plus, Token::Colon, Token::Comma,
+    ])]
+    #[case("0..9", vec![
+        Token::Word("0".into()), Token::DotDot, Token::Word("9".into()),
+    ])]
+    #[case("...", vec![Token::Ellipsis])]
+    #[case("sub...", vec![Token::Word("sub".into()), Token::Ellipsis])]
+    #[case("shift+f1", vec![
+        Token::Word("shift".into()), Token::Plus, Token::Word("f1".into()),
+    ])]
+    #[case("// just a comment", vec![])]
+    #[case("a // trailing\nb", vec![Token::Word("a".into()), Token::Word("b".into())])]
+    #[case("", vec![])]
+    #[case("  \n\t ", vec![])]
+    fn test_lexes(#[case] source: &str, #[case] expected: Vec<Token>) {
+        assert_eq!(lex(source), expected);
+    }
 
+    #[test]
+    fn test_spans_are_byte_offsets() {
+        let (tokens, _) = lexer().parse("ab = \"cd\"").into_output_errors();
+        let tokens = tokens.expect("the source should lex");
+        assert_eq!(tokens[0].1.start, 0);
+        assert_eq!(tokens[0].1.end, 2);
+        assert_eq!(tokens[1].1.start, 3);
+        assert_eq!(tokens[2].1.start, 5);
+        assert_eq!(tokens[2].1.end, 9);
+    }
+
+    #[rstest]
+    #[case("\"\"", "empty literal")]
+    #[case("\"   \"", "empty literal")]
+    #[case("\"team (red)\"", "can't be spoken")]
+    #[case("\"open map", "unclosed '\"'")]
+    #[case("a = b; c", "unexpected character ';'")]
+    fn test_reports_lexical_problems(#[case] source: &str, #[case] expected: &str) {
+        let errors = lex_errors(source);
         assert!(
-            error.to_string().contains(message),
-            "Expected error message to contain '{}', got '{}'",
-            message,
-            error
+            errors.iter().any(|error| error.contains(expected)),
+            "expected an error containing {expected:?}, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_errors_accumulate_and_lexing_continues() {
+        let (tokens, errors) = lexer().parse("a ; b ; c").into_output_errors();
+        assert_eq!(errors.len(), 2, "both stray characters should be reported");
+        assert_eq!(
+            tokens.expect("the good tokens should survive").len(),
+            3,
+            "the words around the bad characters should still lex"
         );
     }
 }

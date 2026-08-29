@@ -718,6 +718,214 @@ impl Automaton {
 }
 
 // ---------------------------------------------------------------------------
+// Prefix ambiguity: where the completion timeout will actually be paid.
+// ---------------------------------------------------------------------------
+
+/// The most subset states the prefix-ambiguity sweep explores — shared by the
+/// main sweep and each continuation search, and the same budget-shaped honesty
+/// as [`MAX_DUPLICATE_SUBSETS`]: breadth-first, so the short phrases people
+/// actually pause after are swept first.
+const MAX_PREFIX_SUBSETS: usize = 10_000;
+
+/// A spot where the completion timeout is paid: a word sequence at which one
+/// published command is already complete while a longer command is still
+/// possible, so the matcher has to wait in case the speaker continues.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixAmbiguity {
+    /// The published rule which is complete at `phrase`.
+    pub rule: String,
+    /// The witness word sequence, space-joined — the shortest one the sweep
+    /// found for this rule.
+    pub phrase: String,
+    /// One example of where continuing leads: the rule and full phrase of the
+    /// shortest longer command extending `phrase`, when the search budget
+    /// reached one.
+    pub continuation: Option<(String, String)>,
+}
+
+impl Automaton {
+    /// Every completion-timeout point the bounded sweep finds, at most one
+    /// witness per published rule — enough for `validate` to make the timeout
+    /// behaviour discoverable without drowning the report in every ambiguous
+    /// subject form.
+    ///
+    /// Bounded, like duplicate detection: nothing beyond [`MAX_PREFIX_SUBSETS`]
+    /// subset states is swept, so the absence of a note is not proof of
+    /// absence — but the sweep is breadth-first, so the short phrases where
+    /// the wait is actually felt are covered first.
+    pub fn prefix_ambiguities(&self) -> Vec<PrefixAmbiguity> {
+        use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+
+        let word_names: HashMap<u32, &str> = self
+            .words
+            .iter()
+            .map(|(word, id)| (*id, word.as_str()))
+            .collect();
+
+        struct Node {
+            members: Vec<usize>,
+            parent: Option<(usize, u32)>,
+        }
+
+        /// The witness words leading to `index`, rebuilt from the breadcrumbs.
+        fn witness(arena: &[Node], index: usize, word_names: &HashMap<u32, &str>) -> Vec<String> {
+            let mut words: Vec<String> = Vec::new();
+            let mut cursor = index;
+            while let Some((parent, word)) = arena[cursor].parent {
+                words.push(word_names[&word].to_owned());
+                cursor = parent;
+            }
+            words.reverse();
+            words
+        }
+
+        let mut results = Vec::new();
+        let mut reported: HashSet<usize> = HashSet::new();
+
+        let mut arena: Vec<Node> = vec![Node {
+            members: vec![0],
+            parent: None,
+        }];
+        let mut seen: HashSet<Vec<usize>> = HashSet::new();
+        seen.insert(vec![0]);
+        let mut queue: VecDeque<usize> = VecDeque::from([0]);
+        let mut processed = 0usize;
+
+        while let Some(index) = queue.pop_front() {
+            processed += 1;
+            if processed > MAX_PREFIX_SUBSETS {
+                break;
+            }
+
+            let members = arena[index].members.clone();
+            let mut accepting: Vec<usize> = members
+                .iter()
+                .flat_map(|&state| self.states[state].accepts.iter().map(|accept| accept.rule))
+                .collect();
+            accepting.sort_unstable();
+            accepting.dedup();
+            let extendable = members
+                .iter()
+                .any(|&state| !self.states[state].transitions.is_empty());
+
+            if !accepting.is_empty() && extendable {
+                let words = witness(&arena, index, &word_names);
+                let continuation = self.shortest_continuation(&members, &words, &word_names);
+                for rule in accepting {
+                    if reported.insert(rule) {
+                        results.push(PrefixAmbiguity {
+                            rule: self.rules[rule].name.clone(),
+                            phrase: words.join(" "),
+                            continuation: continuation.clone(),
+                        });
+                    }
+                }
+            }
+
+            let mut by_word: BTreeMap<u32, BTreeSet<usize>> = BTreeMap::new();
+            for &state in &members {
+                for transition in &self.states[state].transitions {
+                    by_word
+                        .entry(transition.word)
+                        .or_default()
+                        .insert(transition.target);
+                }
+            }
+            for (word, targets) in by_word {
+                let successor: Vec<usize> = targets.into_iter().collect();
+                if seen.insert(successor.clone()) {
+                    arena.push(Node {
+                        members: successor,
+                        parent: Some((index, word)),
+                    });
+                    queue.push_back(arena.len() - 1);
+                }
+            }
+        }
+
+        results
+    }
+
+    /// The shortest longer command reachable from `members`, as
+    /// `(rule, full phrase)` — a second bounded breadth-first sweep, seeded
+    /// with the ambiguous point's own words so the reconstructed phrase is
+    /// complete.
+    fn shortest_continuation(
+        &self,
+        members: &[usize],
+        prefix: &[String],
+        word_names: &HashMap<u32, &str>,
+    ) -> Option<(String, String)> {
+        use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+
+        struct Node {
+            members: Vec<usize>,
+            parent: Option<(usize, u32)>,
+        }
+
+        let mut arena: Vec<Node> = vec![Node {
+            members: members.to_vec(),
+            parent: None,
+        }];
+        let mut seen: HashSet<Vec<usize>> = HashSet::new();
+        seen.insert(members.to_vec());
+        let mut queue: VecDeque<usize> = VecDeque::from([0]);
+        let mut processed = 0usize;
+
+        while let Some(index) = queue.pop_front() {
+            processed += 1;
+            if processed > MAX_PREFIX_SUBSETS {
+                break;
+            }
+
+            // The seed subset is the ambiguous point itself; only a *longer*
+            // sequence counts as a continuation.
+            if index > 0
+                && let Some(&rule) = arena[index]
+                    .members
+                    .iter()
+                    .flat_map(|&state| self.states[state].accepts.iter().map(|accept| &accept.rule))
+                    .next()
+            {
+                let mut words: Vec<String> = Vec::new();
+                let mut cursor = index;
+                while let Some((parent, word)) = arena[cursor].parent {
+                    words.push(word_names[&word].to_owned());
+                    cursor = parent;
+                }
+                words.reverse();
+                let mut phrase: Vec<String> = prefix.to_vec();
+                phrase.extend(words);
+                return Some((self.rules[rule].name.clone(), phrase.join(" ")));
+            }
+
+            let members = arena[index].members.clone();
+            let mut by_word: BTreeMap<u32, BTreeSet<usize>> = BTreeMap::new();
+            for &state in &members {
+                for transition in &self.states[state].transitions {
+                    by_word
+                        .entry(transition.word)
+                        .or_default()
+                        .insert(transition.target);
+                }
+            }
+            for (word, targets) in by_word {
+                let successor: Vec<usize> = targets.into_iter().collect();
+                if seen.insert(successor.clone()) {
+                    arena.push(Node {
+                        members: successor,
+                        parent: Some((index, word)),
+                    });
+                    queue.push_back(arena.len() - 1);
+                }
+            }
+        }
+
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The hypothesis walk.
 // ---------------------------------------------------------------------------
 
@@ -1489,5 +1697,72 @@ mod tests {
             sizes.iter().all(|(_, count)| *count > 0),
             "every published rule contributes states"
         );
+    }
+
+    #[test]
+    fn test_prefix_ambiguities_name_the_short_rule_and_a_continuation() {
+        let automaton = compile(
+            r#"
+            Reload = "reload" { r }
+            ReloadWeapon = "reload weapon" { t }
+            "#,
+        );
+        assert_eq!(
+            automaton.prefix_ambiguities(),
+            vec![PrefixAmbiguity {
+                rule: "Reload".to_owned(),
+                phrase: "reload".to_owned(),
+                continuation: Some(("ReloadWeapon".to_owned(), "reload weapon".to_owned())),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_prefix_ambiguities_report_each_rule_once() {
+        // "north" is a prefix of "north east" *inside* one rule: the wait is
+        // just as real when both readings belong to the same command.
+        let automaton = compile(
+            r#"
+            Watch = "watch" ("north" { 1 } | "north east" { 2 })
+            "#,
+        );
+        let ambiguities = automaton.prefix_ambiguities();
+        assert_eq!(ambiguities.len(), 1, "got: {ambiguities:?}");
+        assert_eq!(ambiguities[0].rule, "Watch");
+        assert_eq!(ambiguities[0].phrase, "watch north");
+        assert_eq!(
+            ambiguities[0].continuation,
+            Some(("Watch".to_owned(), "watch north east".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_a_prefix_free_grammar_reports_no_ambiguities() {
+        let automaton = compile(
+            r#"
+            Map = "map" { m }
+            Inventory = "inventory" { i }
+            "#,
+        );
+        assert_eq!(automaton.prefix_ambiguities(), Vec::new());
+    }
+
+    #[test]
+    fn test_arma_prefix_ambiguities_cover_the_designed_timeout_points() {
+        let ambiguities = arma().prefix_ambiguities();
+        let rules: Vec<&str> = ambiguities
+            .iter()
+            .map(|ambiguity| ambiguity.rule.as_str())
+            .collect();
+        // The profile's own header commentary promises these completion-timeout
+        // points: a bare subject (Select), and "fire" under "fire at will".
+        for rule in ["Select", "Fire"] {
+            assert!(rules.contains(&rule), "'{rule}' should be noted: {rules:?}");
+        }
+        // One note per rule, never one per subject form.
+        let mut deduped = rules.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), rules.len(), "rules must be deduplicated");
     }
 }
