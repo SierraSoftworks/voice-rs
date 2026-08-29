@@ -19,7 +19,7 @@
 #
 # Play with: voice-orders run profiles/helldivers2.yaml -- %command%
 name: Helldivers 2
-model: vosk-model-en-us-0.22-lgraph
+model: vosk-model-small-en-us-zamia-0.5
 
 hotkey:
   device: auto
@@ -41,7 +41,7 @@ grammar: |
   Resupply = "resupply" | "supplies" { down, down, up, right }
   Rearm = "eagle"? "rearm" { up, up, left, up, right }
   SuperDestroyer = "call in"? "super destroyer" { up, up, down, down, left, right, left, right }
-  SosBeacon = "sos beacon" { up, down, right, up }
+  SosBeacon = "s o s beacon" | "s s beacon" { up, down, right, up }
 
   // ── Mission stratagems: objectives ────────────────────────────────────
   Hellbomb = "hell bomb" { down, up, left, down, up, right, down, up }
@@ -49,7 +49,7 @@ grammar: |
   ProspectingDrill = "prospecting drill" { down, down, left, right, down, down }
   SeafArtillery = "artillery" { right, up, up, down }
   SeismicProbe = "seismic probe" { up, up, left, right, down, down }
-  SssdDelivery = "ssd" | "hard drive" { down, down, down, down, down, up, up }
+  SssdDelivery = "s s d" | "hard drive" { down, down, down, down, down, up, up }
   Flag = "raise"? "super earth"? "flag" { down, up, down, up }
   TectonicDrill = "tectonic drill" { up, down, up, down, up, down }
   UploadData = "upload data" | "reinforcement pods" { left, right, up, up, up }
@@ -57,7 +57,7 @@ grammar: |
   DarkFluidVessel = "dark fluid vessel" { up, left, right, down, up, up }
   TacticalVideoCamera = "tactical video camera" { right, down, down, up, left, left, up }
   AquiferDrill = "aquifer drill" { left, left, left, up, down, right, down, down }
-  CommsRelay = "portable"? "comms relay" { up, up, down, down, left, left, down }
+  CommsRelay = "portable"? "com's relay" { up, up, down, down, left, left, down }
 
   // Mission-issued only: no permit buys this one.
   IlluminationFlare = "orbital"? "illumination flare" { right, right, left, left }
@@ -80,11 +80,11 @@ grammar: |
   Spear = "spear" { down, down, up, down, down }
   WaspLauncher = "wasp" "launcher"? { down, down, up, down, right }
   Commando = "commando" { down, left, up, down, right }
-  AirburstRocketLauncher = "airburst rocket launcher" { down, up, up, left, right }
+  AirburstRocketLauncher = "air burst rocket launcher" { down, up, up, left, right }
   GrenadeLauncher = "grenade launcher" { down, left, up, left, down }
   BeltFedGrenadeLauncher = "belt fed grenade launcher" { down, left, up, left, up, up }
   ArcThrower = "arc thrower" { down, right, down, up, left, left }
-  Speargun = "speargun" { down, right, down, left, up, right }
+  Speargun = "spear gun" { down, right, down, left, up, right }
   FlameThrower = "flame thrower" { down, left, up, down, up }
   Sterilizer = "sterilizer" { down, left, up, down, left }
   Cremator = "crema tor" | "cremate or" { down, down, right, down, up, up }
@@ -95,7 +95,7 @@ grammar: |
   SoloSilo = "solo silo" { down, up, right, down, down }
   OneTrueFlag = "one true flag" { down, left, right, right, up }
   BreachingHammer = "breaching hammer" { down, left, right, left, up }
-  DefoliationTool = "defoliation tool" { down, left, right, right, down }
+  DefoliationTool = "de foliation tool" { down, left, right, right, down }
 
   // ── Backpacks ─────────────────────────────────────────────────────────
   GuardDog = "guard dog" { down, up, left, up, right, down }
@@ -115,7 +115,7 @@ grammar: |
   // ── Vehicles ──────────────────────────────────────────────────────────
   Patriot = "patriot" "exo suit"? { left, down, right, up, left, down, down }
   Emancipator = "emancipator" "exo suit"? { left, down, right, up, left, down, up }
-  Lumberer = "lumberer" "exo suit"? { left, down, right, up, right, left, up }
+  Lumberer = ("lumber" | "lumber er" | "lumber uh") "exo suit"? { left, down, right, up, right, left, up }
   Breakthrough = "breakthrough" "exo suit"? { left, down, right, left, right, down, up }
   GunnerFrv = "gunner" ("f r v" | "buggy") { left, down, right, down, right, down, up }
   SupplyFrv = "supply" ("f r v" | "buggy") { left, down, left, left, down, up, right }

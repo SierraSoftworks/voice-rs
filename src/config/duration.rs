@@ -1,6 +1,7 @@
 //! `humantime`-backed duration parsing for the profile schema.
 //!
-//! Every duration in a profile (`completion_timeout`, `defaults.duration`,
+//! Every duration in a profile (`recognition.completion_timeout`,
+//! `defaults.duration`,
 //! `defaults.interval`, `wait:` steps) is written the way a person would say
 //! it — `300ms`, `1s`, `1s 500ms` — and is parsed *during deserialization*, so
 //! a typo is a config-load error rather than a runtime surprise.
@@ -35,6 +36,17 @@ pub fn render(duration: Duration) -> String {
 pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     let text = String::deserialize(deserializer)?;
     parse(&text).map_err(serde::de::Error::custom)
+}
+
+/// [`deserialize`] for an optional field: absent stays `None`, present is
+/// parsed the same way. Used by the fields kept only to report a rename.
+pub fn deserialize_optional<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error> {
+    let Some(text) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    parse(&text).map(Some).map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]

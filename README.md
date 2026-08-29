@@ -94,7 +94,8 @@ hotkey:
   key: rightctrl
   mode: toggle
 
-completion_timeout: 350ms
+recognition:
+  completion_timeout: 350ms
 
 defaults:
   duration: 30ms

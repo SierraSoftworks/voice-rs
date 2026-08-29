@@ -479,6 +479,7 @@ mod tests {
         CommandAction {
             command: command.to_string(),
             output: CompiledOutput::Keyboard(plan),
+            utterance: 1,
         }
     }
 

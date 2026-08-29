@@ -6,14 +6,19 @@
 //!
 //! With eager matching off ([`MatcherOptions::eager`]), commands fire on
 //! `Final` results only and partials are used solely to hold a pending timer
-//! open. With it on (the default), commands additionally fire from *stable
-//! partial hypotheses*: a command the greedy walk has resynced past fires
-//! immediately, an unambiguous resting match fires once the hypothesis holds
-//! still for `eager_delay`, and an ambiguous resting match starts its
-//! completion wait at the partial rather than at finalization. The eventual
-//! `Final` is reconciled against what already fired.
+//! open. With it on (the default), commands additionally fire from *settled
+//! partial hypotheses*: no eager match fires until the hypothesis it was read
+//! out of has stayed unchanged for [`MatcherOptions::debounce`], so a partial
+//! the recognizer rewrites or withdraws inside that window is re-parsed
+//! rather than pressed. Once settled, a command the greedy walk resynced past
+//! fires straight away, an unambiguous resting match fires, and an ambiguous
+//! resting match starts its completion wait at the partial rather than at
+//! finalization. The eventual `Final` is reconciled against what already
+//! fired.
 
 pub mod engine;
+#[cfg(test)]
+mod recorded;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,8 +42,9 @@ pub struct MatcherOptions {
     /// this off the matcher behaves exactly as it originally did: `Final`-only
     /// firing, partials only ever extending a pending deadline.
     pub eager: bool,
-    /// How long an unambiguous partial must hold still before it fires.
-    pub eager_delay: Duration,
+    /// The settling window: how long a partial hypothesis must stay unchanged
+    /// before any match read out of it may fire.
+    pub debounce: Duration,
     /// Suppress an utterance whose n-best list contains a different-command
     /// alternative within this confidence margin of the winner.
     pub confidence_margin: f32,
@@ -54,21 +60,20 @@ impl MatcherOptions {
         Self {
             completion_timeout,
             eager: false,
-            eager_delay: Duration::from_millis(100),
+            debounce: Duration::from_millis(100),
             confidence_margin: 3.0,
             warn: Arc::new(|_| {}),
         }
     }
 
-    /// The options a profile's `completion_timeout` and `recognition:` block
-    /// add up to.
+    /// The options a profile's `recognition:` block adds up to.
     pub fn from_profile(profile: &crate::config::Profile, warn: WarningSink) -> Self {
         Self {
             eager: profile.recognition.eager(),
-            eager_delay: profile.recognition.eager_delay,
+            debounce: profile.recognition.debounce,
             confidence_margin: profile.recognition.confidence_margin,
             warn,
-            ..Self::with_timeout(profile.completion_timeout)
+            ..Self::with_timeout(profile.recognition.completion_timeout)
         }
     }
 }
@@ -82,4 +87,12 @@ pub struct CommandAction {
     pub command: String,
     /// The assembled output plan to execute.
     pub output: CompiledOutput,
+    /// The sequence number of the utterance this command was heard in. The
+    /// engine numbers utterance slots as the recognition narrator does —
+    /// every `Final` and every `Muted` takes one — so a report can attach the
+    /// command to the transcript line it belongs to even when it fires before
+    /// that utterance's `Final` is narrated (an eager fire) or after a later
+    /// utterance has already been heard (a completion-timeout fire). The
+    /// executor ignores it.
+    pub utterance: u64,
 }

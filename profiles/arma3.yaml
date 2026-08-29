@@ -15,14 +15,15 @@
 #
 # Play with: voice-orders run profiles/arma3.yaml -- %command%
 name: Arma 3
-model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
+model: vosk-model-en-us-0.22-lgraph
 
 hotkey:
   device: auto
   key: leftctrl
   mode: push-to-talk
 
-completion_timeout: 500ms
+recognition:
+  completion_timeout: 750ms
 
 defaults:
   duration: 30ms

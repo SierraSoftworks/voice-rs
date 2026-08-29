@@ -294,7 +294,7 @@ fn check(
 
             // Where the completion timeout is paid: an ambiguous prefix makes
             // the matcher wait to see whether the longer command is coming.
-            let timeout = duration::render(profile.completion_timeout);
+            let timeout = duration::render(profile.recognition.completion_timeout);
             for ambiguity in automaton.prefix_ambiguities() {
                 let note = match &ambiguity.continuation {
                     Some((_, longer)) => format!(
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn test_prefix_relations_are_noted_with_the_timeout() {
         let report = validate(
-            "model: /models/en\ncompletion_timeout: 350ms\ngrammar: |\n  Reload = \"reload\" { x }\n  ReloadWeapon = \"reload weapon\" { a }\n",
+            "model: /models/en\nrecognition:\n  completion_timeout: 350ms\ngrammar: |\n  Reload = \"reload\" { x }\n  ReloadWeapon = \"reload weapon\" { a }\n",
             &mut full_vocabulary(),
         );
 

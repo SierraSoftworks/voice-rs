@@ -14,11 +14,13 @@
 //! ● listening: on  —  q to quit                            vosk-model-small-en-us-0.15
 //! ```
 //!
-//! A recognition is one entry which upgrades in place (see
-//! [`super::event::EventLog::push_at`]): grey while nothing has matched it,
-//! green with the command and its key plan once something has. The listening
-//! state is not logged at all — the footer shows it live, which is both fewer
-//! lines and more current.
+//! A recognition is one **live** entry (see
+//! [`super::event::EventLog::push_at`]): it appears — dim and italic — at the
+//! utterance's first partial, revises in place as the hypothesis grows, turns
+//! green the moment a command fires from it, and settles when the `Final`
+//! lands (or yellows when a mute abandons it). Grey-and-settled means "it
+//! heard me, nothing fired". The listening state is not logged at all — the
+//! footer shows it live, which is both fewer lines and more current.
 //!
 //! **Self-update.** Starting this UI also starts a background check for a newer
 //! release (see [`crate::update`] and DESIGN.md §"Self-update"); if it finds
@@ -483,10 +485,12 @@ fn render_header(frame: &mut Frame, area: Rect, overview: &Overview) {
 
 /// The event log, newest at the bottom, between two rules.
 ///
-/// Only as many lines as there are rows are built, so a full scrollback costs
-/// no more to draw than an empty one. Lines are not wrapped: a wrapped line
-/// would push the newest event off the bottom of the region it was measured
-/// for, which is the one line that must always be visible.
+/// Only as many entries as there are rows are built, so a full scrollback
+/// costs no more to draw than an empty one. Entries wrap within the body's
+/// width — a long warning must be readable, not cut off at the edge — with
+/// continuation lines indented past the timestamp+dot gutter so entries stay
+/// visually distinct; the tail is then trimmed from the top so the newest
+/// entry's last line is always the bottom line of the region.
 fn render_body(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::new()
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -505,8 +509,13 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let lines: Vec<Line<'static>> = app.log.tail(inner.height as usize).collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+    let mut lines: Vec<Line<'static>> = app
+        .log
+        .tail(inner.height as usize)
+        .flat_map(|line| super::event::wrap_line(line, inner.width))
+        .collect();
+    let overflow = lines.len().saturating_sub(inner.height as usize);
+    frame.render_widget(Paragraph::new(lines.split_off(overflow)), inner);
 }
 
 /// The live listening state, which model is doing the listening, and — once the
@@ -818,7 +827,13 @@ mod tests {
             hotkey: "always listening".to_string(),
             ..overview()
         });
-        app.record_at(at(), UiEvent::Heard("salute".to_string()));
+        app.record_at(
+            at(),
+            UiEvent::Heard {
+                text: "salute".to_string(),
+                seq: 1,
+            },
+        );
 
         let footer = row(&screen(&app, 90, 12), 11);
         assert!(
@@ -832,12 +847,19 @@ mod tests {
         let mut app = App::new(overview());
         // The listening change belongs to the footer, not the log.
         app.record_at(at(), UiEvent::Listening(true));
-        app.record_at(at(), UiEvent::Heard("deploy the autocannon".to_string()));
+        app.record_at(
+            at(),
+            UiEvent::Heard {
+                text: "deploy the autocannon".to_string(),
+                seq: 1,
+            },
+        );
         app.record_at(
             at(),
             UiEvent::Matched {
                 name: "Autocannon".to_string(),
                 plan: "leftctrl+4".to_string(),
+                utterance: Some(1),
             },
         );
         app.record_at(
@@ -853,9 +875,7 @@ mod tests {
         // Row 2 is the rule under the header, so the log starts at row 3.
         let lines: Vec<String> = (3..6).map(|y| row(&buffer, y)).collect();
         assert!(
-            lines[0].contains(&format!(
-                "{DOT} \"deploy the autocannon\" → Autocannon (leftctrl+4)"
-            )),
+            lines[0].contains(&format!("{DOT} \"deploy the autocannon\" (Autocannon)")),
             "the utterance and its match share one upgraded entry: {lines:?}"
         );
         assert!(
@@ -891,7 +911,13 @@ mod tests {
     fn test_the_body_shows_only_the_newest_events_it_has_room_for() {
         let mut app = App::new(overview());
         for i in 0..50 {
-            app.record_at(at(), UiEvent::Heard(format!("utterance {i}")));
+            app.record_at(
+                at(),
+                UiEvent::Heard {
+                    text: format!("utterance {i}"),
+                    seq: i + 1,
+                },
+            );
         }
 
         // 12 rows: 2 of header, 2 rules and a footer leave 7 lines of log.
@@ -905,6 +931,99 @@ mod tests {
         assert!(
             body[6].contains("utterance 49"),
             "the newest event should be the bottom line: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_long_entry_wraps_within_the_body() {
+        // The field-reported truncation: a long warning was cut off at the
+        // terminal's edge. It has to wrap, with continuations indented past
+        // the timestamp+dot gutter.
+        let mut app = App::new(overview());
+        app.record_at(
+            at(),
+            UiEvent::Warning(
+                "eager mismatch: fired \"Autocannon\", \"Autocannon sentry\" from a partial hypothesis, but the utterance settled as \"auto cannon sentry\"".to_string(),
+            ),
+        );
+
+        let buffer = screen(&app, 60, 12);
+        let body: Vec<String> = (3..10).map(|y| row(&buffer, y)).collect();
+
+        assert!(
+            body[0].contains("warning: eager mismatch"),
+            "the entry starts on the first body row: {body:?}"
+        );
+        assert!(
+            body[1].starts_with("           ") && !body[1].trim().is_empty(),
+            "continuation rows indent past the gutter: {body:?}"
+        );
+        assert!(
+            body.iter().any(|line| line.contains("auto cannon sentry")),
+            "the tail of the message must be visible, not cut off: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_wrapping_keeps_the_newest_entry_at_the_bottom() {
+        // A long entry above must not push the newest one out of the body:
+        // the tail is trimmed from the top instead.
+        let mut app = App::new(overview());
+        for i in 0..6u64 {
+            app.record_at(
+                at(),
+                UiEvent::Heard {
+                    text: format!("utterance number {i} with quite a few extra words to say"),
+                    seq: i + 1,
+                },
+            );
+        }
+        app.record_at(
+            at(),
+            UiEvent::Heard {
+                text: "the newest utterance".to_string(),
+                seq: 7,
+            },
+        );
+
+        // 40 columns: every utterance wraps onto two rows, far more rows than
+        // the 7-row body can hold.
+        let buffer = screen(&app, 40, 12);
+        let bottom = row(&buffer, 9);
+        assert!(
+            bottom.contains("the newest utterance"),
+            "the newest entry's last line must be the bottom row: {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_live_utterance_is_on_screen_before_its_final() {
+        // The field-reported latency was presentation: matches used to wait
+        // for the Final before anything changed on screen. Now the utterance
+        // is drawn from its first partial and the match lands the moment it
+        // fires.
+        let mut app = App::new(overview());
+        app.record_at(
+            at(),
+            UiEvent::Hearing {
+                text: "auto cannon sentry".to_string(),
+                seq: 1,
+            },
+        );
+        app.record_at(
+            at(),
+            UiEvent::Matched {
+                name: "AutocannonSentry".to_string(),
+                plan: "5".to_string(),
+                utterance: Some(1),
+            },
+        );
+
+        let buffer = screen(&app, 90, 12);
+        assert!(
+            row(&buffer, 3).contains("\"auto cannon sentry\" (AutocannonSentry)"),
+            "the eager fire is visible with no Final in sight: {:?}",
+            row(&buffer, 3)
         );
     }
 
@@ -926,6 +1045,7 @@ mod tests {
             UiEvent::Matched {
                 name: "Autocannon".to_string(),
                 plan: "4".to_string(),
+                utterance: None,
             },
         );
 
@@ -942,7 +1062,13 @@ mod tests {
     fn test_a_tiny_terminal_still_renders() {
         // Nothing here may panic on an area the layout cannot honour.
         let mut app = App::new(overview());
-        app.record_at(at(), UiEvent::Heard("salute".to_string()));
+        app.record_at(
+            at(),
+            UiEvent::Heard {
+                text: "salute".to_string(),
+                seq: 1,
+            },
+        );
 
         for (width, height) in [(1, 1), (4, 3), (20, 4), (200, 2)] {
             screen(&app, width, height);
@@ -1021,7 +1147,10 @@ mod tests {
         let quit = CancellationToken::new();
 
         events_tx
-            .send(UiEvent::Heard("salute".to_string()))
+            .send(UiEvent::Heard {
+                text: "salute".to_string(),
+                seq: 1,
+            })
             .expect("the UI should be listening");
 
         let ui = tokio::spawn(loop_with(events, keys, quit.clone()));
