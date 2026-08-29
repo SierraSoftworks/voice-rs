@@ -143,8 +143,8 @@ impl Grammar {
 pub(crate) mod fixtures {
     /// The `grammar:` block of the canonical Arma profile.
     pub fn arma_source() -> String {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma3.yaml");
-        let raw = std::fs::read_to_string(path).expect("profiles/arma3.yaml should be readable");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma.yaml");
+        let raw = std::fs::read_to_string(path).expect("profiles/arma.yaml should be readable");
         let profile: serde_yaml::Value =
             serde_yaml::from_str(&raw).expect("profiles/arma3.yaml should be valid YAML");
         profile["grammar"]
