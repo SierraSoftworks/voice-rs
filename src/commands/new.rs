@@ -226,7 +226,7 @@ mod tests {
             "the scaffold must be lint-free: {:?}",
             profile.grammar.lints()
         );
-        crate::grammar::v2::Automaton::compile(&profile.grammar)
+        crate::grammar::Automaton::compile(&profile.grammar)
             .expect("the scaffold's grammar should compile");
     }
 

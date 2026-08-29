@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::grammar::v2::{Accept, Automaton, Walk};
+use crate::grammar::{Accept, Automaton, Walk};
 use crate::output::assembly::{Pacing, assemble};
 use crate::output::{CompiledOutput, KeyEvent};
 use crate::recognition::{RecognitionEvent, Utterance};
@@ -440,7 +440,7 @@ impl<'a> Engine<'a> {
     ) -> bool {
         // The walk origin: an open eager context pins it (this utterance's
         // partials already walked from there, and may have fired), otherwise
-        // the pending state decides exactly as v1 did. Either way the
+        // the pending state decides, exactly as the eager-off machine does.
         // utterance is resolved by this Final, so the context ends here.
         let context = eager.take();
         let (origin, passed) = match &context {
@@ -611,7 +611,7 @@ impl<'a> Engine<'a> {
     /// origin the real utterance will use: the full walk's fires plus a
     /// resting pending command, each assembled under the profile's pacing,
     /// positions ignored — two texts which would press the same keys in the
-    /// same order are the same interpretation. (Where v1 compared
+    /// same order are the same interpretation. (Where the trie matcher compared
     /// `CommandId`s, the grammar has no per-command identity to compare, so
     /// the assembled plans themselves are the identity — which is what the
     /// n-best gating design specifies.)
@@ -967,7 +967,7 @@ fn quoted_list(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::v2::Grammar;
+    use crate::grammar::Grammar;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1004,7 +1004,7 @@ mod tests {
         })
     }
 
-    /// The standard test arsenal, matching the v1 suite's shape: "autocannon"
+    /// The standard test arsenal: "autocannon"
     /// is an ambiguous prefix of "autocannon sentry" *via a different rule*,
     /// "deploy sentry" and "reload" are unambiguous.
     fn arsenal() -> Automaton {
@@ -2005,9 +2005,9 @@ mod tests {
         h.shutdown().await;
     }
 
-    // --- Grammar v2 specifics ---------------------------------------------
+    // --- Grammar-language specifics ---------------------------------------
     //
-    // Everything above re-proves the v1 contract; these tests cover what the
+    // Everything above re-proves the trie matcher's contract; these cover what the
     // trie never could — captures, splices, shared subject rules, and the
     // hypothesis-set failure modes.
 
@@ -2034,7 +2034,7 @@ mod tests {
     fn arma() -> Automaton {
         use std::sync::OnceLock;
         static ARMA: OnceLock<Automaton> = OnceLock::new();
-        ARMA.get_or_init(|| compile(&crate::grammar::v2::fixtures::arma_source()))
+        ARMA.get_or_init(|| compile(&crate::grammar::fixtures::arma_source()))
             .clone()
     }
 

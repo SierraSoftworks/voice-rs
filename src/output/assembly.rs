@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_a_press_matches_the_old_keys_shorthand() {
-        // The pacing rules are exactly the v1 `keys:` shorthand's, and this
+        // The pacing rules are exactly the old `keys:` shorthand's, and this
         // pins the byte-for-byte plan that shorthand used to compile for the
         // same chords: down in written order, hold, up in reverse, an interval
         // between chords, nothing trailing the last one.

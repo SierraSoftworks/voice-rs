@@ -25,7 +25,7 @@ use clap::Args;
 use tracing_batteries::prelude::*;
 
 use crate::config::{Profile, SystemConfig, duration, loader, resolve_model};
-use crate::grammar::v2::{Automaton, MAX_EXPANSIONS_PER_RULE, feed, user_error};
+use crate::grammar::{Automaton, MAX_EXPANSIONS_PER_RULE, feed, user_error};
 use crate::recognition::{Vocabulary, vosk::VoskVocabulary};
 
 /// The largest edit distance we will still call a plausible mis-hearing.

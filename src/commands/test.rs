@@ -285,7 +285,7 @@ fn plan_duration(output: &CompiledOutput) -> Duration {
 mod tests {
     use super::*;
     use crate::config::LoadedProfile;
-    use crate::grammar::v2::Automaton;
+    use crate::grammar::Automaton;
     use crate::output::assembly::assemble;
     use rstest::rstest;
     use std::time::Duration;

@@ -45,7 +45,7 @@ use tracing_batteries::prelude::*;
 
 use crate::audio;
 use crate::config::{Profile, ResolvedSettings, SystemConfig, loader, resolve_model};
-use crate::grammar::v2::{Automaton, Feed, feed, user_error};
+use crate::grammar::{Automaton, Feed, feed, user_error};
 use crate::hotkey::{self, ListenMode};
 use crate::matcher::{CommandAction, MatcherOptions, engine::engine_task};
 use crate::output::{Interrupt, PlatformSink, executor};
@@ -2504,8 +2504,8 @@ mod tests {
             })
             .collect();
         let grammar_source =
-            crate::grammar::v2::Grammar::parse(&source).expect("the digit grammar should parse");
-        let automaton = crate::grammar::v2::Automaton::compile(&grammar_source)
+            crate::grammar::Grammar::parse(&source).expect("the digit grammar should parse");
+        let automaton = crate::grammar::Automaton::compile(&grammar_source)
             .expect("the digit grammar should compile");
         let grammar: Vec<String> = digits.iter().map(|word| (*word).to_string()).collect();
 

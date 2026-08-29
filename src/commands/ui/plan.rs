@@ -83,7 +83,7 @@ fn render_chord(keys: &[KeyCode]) -> String {
 mod tests {
     use super::*;
     use crate::config::OutputDefaults;
-    use crate::grammar::v2::{Automaton, Grammar};
+    use crate::grammar::{Automaton, Grammar};
     use crate::output::assembly::assemble;
     use crate::output::keys;
     use rstest::rstest;

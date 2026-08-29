@@ -12,7 +12,7 @@ pub(super) type LexError<'src> = Rich<'src, char, SimpleSpan<usize>>;
 pub(super) type SpannedToken = (Token, SimpleSpan<usize>);
 
 /// Whether `c` may appear inside a spoken literal word: letters, digits,
-/// apostrophes (`don't`) and hyphens (`auto-cannon`), exactly as in the v1
+/// apostrophes (`don't`) and hyphens (`auto-cannon`), exactly as in the old
 /// phrase DSL.
 fn is_literal_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '\'' || c == '-'

@@ -1,4 +1,4 @@
-//! The owned, spanned AST for grammar v2.
+//! The owned, spanned AST of the command grammar language.
 //!
 //! Everything here is `String`-owned and carries byte-offset [`Span`]s into
 //! the source it was parsed from — no borrowed lifetimes, no self-referential

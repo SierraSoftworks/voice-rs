@@ -1,4 +1,4 @@
-//! The token vocabulary of the grammar v2 language.
+//! The token vocabulary of the command grammar language.
 //!
 //! The lexer produces a flat stream of these; the parser gives them meaning.
 //! One deliberate simplification: [`Token::Word`] covers rule names, key

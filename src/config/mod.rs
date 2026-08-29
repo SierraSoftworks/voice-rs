@@ -31,7 +31,7 @@ pub use output::OutputDefaults;
 pub use recognition::RecognitionConfig;
 pub use system::{ResolvedSettings, SystemConfig};
 
-use crate::grammar::v2::Grammar;
+use crate::grammar::Grammar;
 
 /// Default values for the schema, in one place so that the documentation, the
 /// `new` scaffold and the code cannot disagree about them.
@@ -276,7 +276,7 @@ fn resolve_model_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::v2::{Automaton, feed};
+    use crate::grammar::{Automaton, feed};
     use crate::hotkey::ListenMode;
     use crate::output::assembly::ActionItem;
     use crate::output::keys;
@@ -457,7 +457,7 @@ mod tests {
 
     /// Spot checks on the migrated Helldivers profile: an alternates group, an
     /// optional word, and a plain multi-word phrase all walk to the exact
-    /// stratagem inputs the v1 profile compiled to.
+    /// stratagem inputs the pre-migration profile compiled to.
     #[rstest]
     // `("reinforce" | "reinforcements")` — the alternates form.
     #[case("reinforce", &["up", "down", "right", "left", "up"])]
@@ -579,12 +579,12 @@ mod tests {
 
     #[test]
     fn test_the_removed_commands_list_is_refused_by_name() {
-        // The v1 schema's `commands:` list is gone; a profile still carrying
+        // The old schema's `commands:` list is gone; a profile still carrying
         // one must hear that it is not silently ignored.
         let error = parse(
             "model: /models/en\ncommands:\n  - phrase: salute\ngrammar: |\n  Salute = \"salute\" { x }\n",
         )
-        .expect_err("the v1 commands list should be rejected");
+        .expect_err("the old commands list should be rejected");
         assert!(
             error.to_string().contains("commands"),
             "the error should name the removed field, got: {error}"
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn test_a_profile_needs_published_commands() {
         // A grammar of nothing but private building blocks listens for
-        // nothing — the v2 shape of the old empty-commands error.
+        // nothing — the grammar-schema shape of the old empty-commands error.
         let error = parse("model: /models/en\ngrammar: |\n  salute = \"salute\" { x }\n")
             .expect_err("a profile with no published rules is useless");
         assert!(
