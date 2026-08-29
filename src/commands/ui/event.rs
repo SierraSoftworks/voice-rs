@@ -151,13 +151,25 @@ impl UiEvent {
     /// should depend on. The one exception is a recognition, which the log
     /// merges into a single live entry ([`Entry::Recognition`]).
     fn line(&self, at: SystemTime) -> Line<'static> {
-        log_line(at, self.color(), self.plain_line(), self.text_style(), self.extra_text())
+        log_line(
+            at,
+            self.color(),
+            self.plain_line(),
+            self.text_style(),
+            self.extra_text(),
+        )
     }
 }
 
 /// One log line: the time it happened, a dot in the entry's color, and its
 /// text.
-fn log_line(at: SystemTime, dot: Color, text: String, style: Style, extra_text: Option<String>) -> Line<'static> {
+fn log_line(
+    at: SystemTime,
+    dot: Color,
+    text: String,
+    style: Style,
+    extra_text: Option<String>,
+) -> Line<'static> {
     Line::from(vec![
         Span::styled(clock_time(at), Style::new().fg(Color::DarkGray)),
         Span::raw(" "),
@@ -165,7 +177,10 @@ fn log_line(at: SystemTime, dot: Color, text: String, style: Style, extra_text: 
         Span::raw(" "),
         Span::styled(text, style),
         Span::raw(" "),
-        Span::styled(extra_text.unwrap_or_default(), style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+        Span::styled(
+            extra_text.unwrap_or_default(),
+            style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ),
     ])
 }
 
@@ -363,7 +378,7 @@ impl Entry {
                     .collect::<Vec<_>>()
                     .join(", ");
                 Some(format!("({resolved})"))
-            },
+            }
             _ => None,
         };
 
