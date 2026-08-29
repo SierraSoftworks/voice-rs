@@ -48,7 +48,7 @@ use crate::audio;
 use crate::config::{Profile, ResolvedSettings, SystemConfig, loader, resolve_model};
 use crate::grammar::expansion;
 use crate::hotkey::{self, ListenMode};
-use crate::matcher::{CommandAction, CompiledCommand, PhraseTrie, matcher_task};
+use crate::matcher::{CommandAction, CompiledCommand, MatcherOptions, PhraseTrie, matcher_task};
 use crate::output::{Interrupt, UinputSink, executor};
 use crate::recognition::{AudioMsg, RecognitionEvent, vosk};
 
@@ -409,6 +409,7 @@ impl Pipeline {
             &model,
             RECOGNIZER_SAMPLE_RATE,
             &grammar,
+            profile.recognition.recognizer_options(),
             events_tx,
             dropped_frames.clone(),
         )?;
@@ -454,12 +455,21 @@ impl Pipeline {
             }
         };
 
+        // The matcher's warnings (eager mismatches, suppressed utterances) go
+        // through the same sink as everything else the session reports: a
+        // yellow `warning:` entry under the UI, a plain `warning:` line
+        // otherwise.
+        let matcher_options = MatcherOptions::from_profile(profile, {
+            let events = options.events.clone();
+            Arc::new(move |message| events.send(UiEvent::Warning(message)))
+        });
+
         let mut tasks = vec![(
             "matcher",
             tokio::spawn(matcher_task(
                 trie,
                 commands,
-                profile.completion_timeout,
+                matcher_options,
                 matcher_events,
                 queue_tx,
                 cancel.clone(),
@@ -766,7 +776,7 @@ fn narration_event(event: &RecognitionEvent, narration: Narration) -> Option<UiE
         (_, Narration::Silent) => None,
         // A finalized utterance is the whole point: it is what the matcher gets
         // to work with, so it is reported whenever anything is reported at all.
-        (RecognitionEvent::Final(text), _) => Some(UiEvent::Heard(text.clone())),
+        (RecognitionEvent::Final(utterance), _) => Some(UiEvent::Heard(utterance.text.clone())),
         // A recognizer which cannot decode is reported as loudly as an
         // utterance: without it, a session where nothing works looks exactly
         // like one where nobody spoke. The recognizer thread has already
@@ -1125,6 +1135,7 @@ mod tests {
     use super::*;
     use crate::config::LoadedProfile;
     use crate::output::{CompiledOutput, KeyCode, KeyEvent, KeySink, keys};
+    use crate::recognition::Utterance;
     use std::sync::Mutex;
 
     pub(super) fn profile(yaml: &str) -> Profile {
@@ -1294,7 +1305,11 @@ mod tests {
 
     #[rstest::rstest]
     // Silence is silence, whatever happens.
-    #[case(RecognitionEvent::Final("salute".into()), Narration::Silent, None)]
+    #[case(
+        RecognitionEvent::Final(Utterance::plain("salute")),
+        Narration::Silent,
+        None
+    )]
     #[case(RecognitionEvent::Partial("sal".into()), Narration::Silent, None)]
     #[case(RecognitionEvent::Muted, Narration::Silent, None)]
     #[case(RecognitionEvent::Failed, Narration::Silent, None)]
@@ -1313,7 +1328,7 @@ mod tests {
     // `test` reports what it heard, and nothing else — an utterance with no
     // 'matched:' line under it is how an unrecognized command shows up.
     #[case(
-        RecognitionEvent::Final("salute".into()),
+        RecognitionEvent::Final(Utterance::plain("salute")),
         Narration::Utterances,
         Some("heard: \"salute\"")
     )]
@@ -1321,7 +1336,7 @@ mod tests {
     #[case(RecognitionEvent::Muted, Narration::Utterances, None)]
     // `--debug-recognition` shows the working out as well.
     #[case(
-        RecognitionEvent::Final("salute".into()),
+        RecognitionEvent::Final(Utterance::plain("salute")),
         Narration::Everything,
         Some("heard: \"salute\"")
     )]
@@ -1366,7 +1381,7 @@ mod tests {
         // what the matcher sees, only what the terminal does.
         let sent = vec![
             RecognitionEvent::Partial("sal".to_string()),
-            RecognitionEvent::Final("salute".to_string()),
+            RecognitionEvent::Final(Utterance::plain("salute")),
             RecognitionEvent::Muted,
         ];
         for event in sent.clone() {
@@ -1745,14 +1760,14 @@ mod tests {
         let matcher = tokio::spawn(matcher_task(
             trie,
             commands,
-            profile.completion_timeout,
+            MatcherOptions::with_timeout(profile.completion_timeout),
             events_rx,
             queue_tx,
             cancel.clone(),
         ));
 
         events_tx
-            .send(RecognitionEvent::Final("salute".to_string()))
+            .send(RecognitionEvent::Final(Utterance::plain("salute")))
             .await
             .expect("the matcher should be listening");
 
@@ -1837,6 +1852,7 @@ mod tests {
             &model,
             RECOGNIZER_SAMPLE_RATE,
             &grammar,
+            crate::recognition::RecognizerOptions::default(),
             events_tx.clone(),
             Arc::new(AtomicU64::new(0)),
         )
@@ -1849,7 +1865,7 @@ mod tests {
         let matcher = tokio::spawn(matcher_task(
             trie,
             commands,
-            profile.completion_timeout,
+            MatcherOptions::with_timeout(profile.completion_timeout),
             events_rx,
             queue_tx,
             cancel.clone(),
@@ -1863,7 +1879,7 @@ mod tests {
 
         // One synthetic utterance, straight down the real event path.
         events_tx
-            .send(RecognitionEvent::Final("salute".to_string()))
+            .send(RecognitionEvent::Final(Utterance::plain("salute")))
             .await
             .expect("the matcher should be listening");
 
@@ -1903,5 +1919,168 @@ mod tests {
             .await
             .expect("the executor should not panic")
             .expect("the executor should shut down cleanly");
+    }
+
+    /// The eager-latency claim, end to end against the real recognizer: with
+    /// eager on and **no trailing silence ever fed**, commands fire from
+    /// stable partials alone — no `Final` is ever produced — and the last
+    /// command lands within `eager_delay` (plus generous scheduling slack) of
+    /// the last partial hypothesis.
+    ///
+    /// Real time rather than paused time: the recognizer decodes on its own
+    /// thread, so the clock cannot be virtualized — the bounds are generous
+    /// for CI, and the hard assertions are the *ordering* facts (digits fired,
+    /// no `Final` involved).
+    #[tokio::test]
+    #[cfg_attr(feature = "pure_tests", ignore)]
+    async fn real_model_fires_eagerly_from_partials_without_a_final() {
+        let model = model_path();
+        assert!(
+            model.is_dir(),
+            "no Vosk model at '{}' — download one from https://alphacephei.com/vosk/models and set VOSK_MODEL_PATH, or run with --features pure_tests to skip this test",
+            model.display()
+        );
+
+        // The digits the fixture speaks, each its own unambiguous command.
+        let digits = ["one", "zero", "nine", "oh", "two", "eight", "three"];
+        let commands: Vec<CompiledCommand> = digits
+            .iter()
+            .map(|word| CompiledCommand {
+                name: (*word).to_string(),
+                output: CompiledOutput::Keyboard(Vec::new()),
+                phrases: vec![vec![(*word).to_string()]],
+            })
+            .collect();
+        let trie = PhraseTrie::build(&commands).expect("the digit commands should build");
+        let grammar: Vec<String> = digits.iter().map(|word| (*word).to_string()).collect();
+
+        // An endpointer that cannot fire behind our backs: 10s of trailing
+        // silence would be needed, and the fixture is cut off mid-speech.
+        let (events_tx, mut events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
+        let (recognizer, audio) = vosk::spawn_recognizer_with_drop_counter(
+            &model,
+            RECOGNIZER_SAMPLE_RATE,
+            &grammar,
+            crate::recognition::RecognizerOptions {
+                silence: Duration::from_secs(10),
+                alternatives: 0,
+            },
+            events_tx,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .expect("the recognizer should start");
+
+        // A tap between the recognizer and the matcher records when each
+        // event arrived, so the fire can be timed against the partial that
+        // armed it.
+        let (matcher_tx, matcher_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
+        let seen: Arc<Mutex<Vec<(std::time::Instant, RecognitionEvent)>>> = Arc::default();
+        let tap = tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                while let Some(event) = events_rx.recv().await {
+                    seen.lock()
+                        .unwrap()
+                        .push((std::time::Instant::now(), event.clone()));
+                    if matcher_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        const EAGER_DELAY: Duration = Duration::from_millis(150);
+        let cancel = CancellationToken::new();
+        let (queue_tx, mut queue_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let matcher = tokio::spawn(matcher_task(
+            trie,
+            commands,
+            crate::matcher::MatcherOptions {
+                eager: true,
+                eager_delay: EAGER_DELAY,
+                ..MatcherOptions::with_timeout(Duration::from_millis(300))
+            },
+            matcher_rx,
+            queue_tx,
+            cancel.clone(),
+        ));
+
+        // Real recorded speech (spoken digits, 16 kHz mono s16le), cut off
+        // mid-utterance — and nothing appended: no silence means no
+        // endpointer finalization, ever.
+        let speech: Vec<i16> = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/speech-digits-16k-mono.raw"),
+        )
+        .expect("the speech fixture should exist")
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c))
+        .collect();
+        for chunk in speech.chunks(1_600) {
+            audio
+                .send(AudioMsg::Frame(chunk.to_vec()))
+                .expect("the recognizer should be listening");
+        }
+
+        // Collect every command that fires, allowing the decode plus the
+        // eager delay to play out; the audio channel stays open the whole
+        // time, so nothing here can come from a Final.
+        let mut fired: Vec<(std::time::Instant, String)> = Vec::new();
+        while let Ok(Some(action)) =
+            tokio::time::timeout(Duration::from_secs(5), queue_rx.recv()).await
+        {
+            fired.push((std::time::Instant::now(), action.command));
+        }
+
+        assert!(
+            !fired.is_empty(),
+            "at least one digit should fire from partials alone; events seen: {:?}",
+            seen.lock().unwrap()
+        );
+        assert!(
+            fired
+                .iter()
+                .all(|(_, name)| digits.contains(&name.as_str())),
+            "only digit commands may fire: {fired:?}"
+        );
+
+        let events = seen.lock().unwrap().clone();
+        assert!(
+            !events
+                .iter()
+                .any(|(_, event)| matches!(event, RecognitionEvent::Final(_))),
+            "no Final may be involved in an eager fire: {events:?}"
+        );
+
+        // The latency claim: the last command fired within eager_delay (plus
+        // generous real-time slack for CI) of the partial which armed it —
+        // i.e. of the last partial at or before the fire.
+        let (last_fire_at, _) = fired.last().expect("checked non-empty above");
+        let armed_at = events
+            .iter()
+            .rev()
+            .find(|(at, event)| at <= last_fire_at && matches!(event, RecognitionEvent::Partial(_)))
+            .map(|(at, _)| *at)
+            .expect("a partial must precede an eager fire");
+        let elapsed = last_fire_at.saturating_duration_since(armed_at);
+        assert!(
+            elapsed <= EAGER_DELAY + Duration::from_millis(1_500),
+            "the eager fire should land within eager_delay of the stable partial, took {elapsed:?}"
+        );
+
+        // Shutdown in the pipeline's order.
+        cancel.cancel();
+        drop(audio);
+        tokio::task::spawn_blocking(move || recognizer.join())
+            .await
+            .expect("the join should not panic")
+            .expect("the recognizer should shut down cleanly");
+        tap.await.expect("the tap should not panic");
+        matcher
+            .await
+            .expect("the matcher should not panic")
+            .expect("the matcher should shut down cleanly");
     }
 }

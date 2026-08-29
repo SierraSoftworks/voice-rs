@@ -12,6 +12,7 @@ pub mod duration;
 pub mod hotkey;
 pub mod loader;
 pub mod output;
+pub mod recognition;
 pub mod system;
 
 use std::path::{Path, PathBuf};
@@ -25,6 +26,7 @@ pub use command::CommandConfig;
 #[allow(unused_imports)]
 pub use hotkey::{HotkeyConfig, ResolvedHotkey};
 pub use loader::LoadedProfile;
+pub use recognition::RecognitionConfig;
 pub use system::{ResolvedSettings, SystemConfig};
 // `Chord`, `KeyName` and `RawEvent` are the vocabulary the `run` assembly and
 // the docs generator speak; nothing in the binary reaches them until that lands.
@@ -100,6 +102,12 @@ pub struct Profile {
     )]
     pub completion_timeout: Duration,
 
+    /// The latency levers: endpointer silence, eager (partial-driven) firing,
+    /// and confidence gating. Absent means every default — see DESIGN.md
+    /// §"Endpointing and latency".
+    #[serde(default)]
+    pub recognition: RecognitionConfig,
+
     /// Timing shared by every command which uses the `keys:` shorthand.
     #[serde(default)]
     pub defaults: OutputDefaults,
@@ -171,6 +179,8 @@ impl Profile {
                 ],
             ));
         }
+
+        self.recognition.validate()?;
 
         for command in &self.commands {
             command.validate_output()?;
@@ -422,7 +432,33 @@ mod tests {
         );
         assert_eq!(profile.hotkey, None, "no hotkey means always listening");
         assert_eq!(profile.completion_timeout, Duration::from_millis(300));
+        assert_eq!(profile.recognition, RecognitionConfig::default());
         assert_eq!(profile.defaults, OutputDefaults::default());
+    }
+
+    #[test]
+    fn test_the_recognition_block_loads_and_validates() {
+        let profile = parse(
+            "model: /models/en\nrecognition:\n  silence: 150ms\n  alternatives: 3\n  confidence_margin: 2.5\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n",
+        )
+        .expect("a profile with a recognition block should load");
+
+        assert_eq!(profile.recognition.silence, Duration::from_millis(150));
+        assert_eq!(profile.recognition.alternatives, 3);
+        assert!(
+            !profile.recognition.eager(),
+            "alternatives flip the eager default off"
+        );
+
+        // The impossible combination is refused with the reason spelled out.
+        let error = parse(
+            "model: /models/en\nrecognition:\n  eager: true\n  alternatives: 3\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n",
+        )
+        .expect_err("eager + alternatives cannot work together");
+        assert!(
+            error.to_string().contains("finalized"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

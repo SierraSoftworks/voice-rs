@@ -251,6 +251,73 @@ completion_timeout: 350ms
 see exactly which of your commands pay the wait. The [grammar reference](../grammar/README.md#ambiguity-and-the-completion-timeout)
 explains what makes a phrase ambiguous and what the timeout costs you.
 
+With [eager matching](#recognition-eager) on (the default), this wait starts the moment the recognizer's in-progress
+hypothesis comes to rest on the ambiguous phrase — not hundreds of milliseconds later when the utterance finalizes.
+
+### recognition
+How quickly — and how cautiously — speech turns into keys. The whole block is optional, and so is every field in it;
+leaving it out gives you the defaults shown here:
+
+```yaml
+recognition:
+  silence: 200ms          # trailing silence before an utterance is finalized
+  eager: true             # fire commands from stable in-progress hypotheses
+  eager_delay: 100ms      # how long a hypothesis must hold still before it fires
+  alternatives: 0         # >0 asks for an n-best list and enables confidence gating
+  confidence_margin: 3.0  # how close a competing reading may score before we refuse to guess
+```
+
+The [grammar reference](../grammar/README.md#a-note-on-latency) explains how the three mechanisms fit together.
+
+#### recognition.silence <Badge text="default: 200ms"/>
+How much silence after you stop speaking makes the recognizer finalize the utterance. This is the floor under every
+command's latency when eager firing is off, and the floor under how quickly a *finalized* transcript (and its
+[alternatives](#recognition-alternatives)) exists either way. Vosk's own default is around `500ms`; voice-orders ships
+`200ms`, which measurably shortens the wait without changing what is recognized. Raise it if your speech has long
+natural pauses which are being cut into separate utterances; lower it (with care) if you want finalization sooner.
+
+#### recognition.eager <Badge text="default: true (false when alternatives is set)"/>
+Whether commands may fire from **stable in-progress hypotheses**, before the recognizer finalizes the utterance at all.
+The recognizer's hypothesis usually settles on your exact final words hundreds of milliseconds before the
+[silence](#recognition-silence) endpointer fires — eager matching claims that time back:
+
+- a command the hypothesis has moved *past* (you kept talking and the walk re-synced beyond it) fires immediately;
+- a command the hypothesis is resting on fires once it holds still for [`eager_delay`](#recognition-eager-delay);
+- an [ambiguous](#completion-timeout) command starts its completion wait at the hypothesis, not at finalization.
+
+The finalized utterance is always checked against what already fired. If they disagree — you were cut off, or the
+recognizer revised itself after a command fired — nothing can un-press a key: the session reports a
+`warning:` line naming what fired and what was actually said, and drops the rest of the utterance.
+
+`eager: false` restores the fire-only-on-finalized behaviour exactly, latency included.
+
+`eager: true` cannot be combined with [`alternatives`](#recognition-alternatives) — alternatives only exist on
+finalized results, so an eagerly fired command could never be confidence-checked. Setting `alternatives` without
+mentioning `eager` simply turns eager firing off.
+
+#### recognition.eager_delay <Badge text="default: 100ms"/>
+How long an unambiguous in-progress hypothesis must stay unchanged before it is trusted enough to fire. Shorter is
+faster and twitchier; longer gives the recognizer more room to revise itself before keys go down. Only meaningful with
+[`eager`](#recognition-eager) on.
+
+#### recognition.alternatives <Badge text="default: 0 (disabled)"/>
+How many alternative transcripts to request for each finalized utterance. Anything above `0` enables **confidence
+gating**: when a close runner-up reading of the same audio would have run *different* commands, the utterance is
+suppressed entirely — firing nothing beats firing a coin-flip — and a `warning:` line names both readings:
+
+```
+warning: ambiguous: "mortar sentry" vs "rocket sentry" (margin 1.2)
+```
+
+Alternatives which would run the same command (homophones like "one up" / "won up" in one phrase group), or which match
+nothing at all, never suppress anything. `3`–`5` is a sensible range. Implies [`eager: false`](#recognition-eager).
+
+#### recognition.confidence_margin <Badge text="default: 3.0"/>
+How close a competing alternative's confidence must be to the winner's before the utterance counts as ambiguous.
+Vosk's confidences are unnormalized scores, so only this *gap* means anything: acoustically distinct readings of a
+short phrase typically gap by several units, while genuinely confusable ones land within one or two. Raise it to be
+more conservative (more suppressions), lower it to be more trusting.
+
 ### defaults
 Timing shared by every command which uses the [`keys:`](#keys) shorthand. The block is optional, and so is each field
 inside it.

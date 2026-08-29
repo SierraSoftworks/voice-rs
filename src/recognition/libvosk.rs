@@ -58,6 +58,22 @@ pub enum LogLevel {
     Error = -2,
 }
 
+/// The endpointer's response-length presets, as libvosk's C API numbers them
+/// (`VoskEndpointerMode`). We drive the delays directly instead, but the
+/// binding carries the whole surface of the entry point.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub enum EndpointerMode {
+    /// libvosk's own tuning.
+    Default = 0,
+    /// Expecting short answers: finalize quickly.
+    Short = 1,
+    /// Expecting long answers: tolerate longer pauses.
+    Long = 2,
+    /// Expecting very long answers.
+    VeryLong = 3,
+}
+
 /// An opaque `VoskModel`, only ever handled behind a pointer.
 #[repr(C)]
 pub struct VoskModel {
@@ -91,6 +107,8 @@ struct Api {
         unsafe extern "C" fn(*mut VoskModel, f32, *const c_char) -> *mut VoskRecognizer,
     recognizer_free: unsafe extern "C" fn(*mut VoskRecognizer),
     recognizer_set_max_alternatives: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
+    recognizer_set_endpointer_mode: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
+    recognizer_set_endpointer_delays: unsafe extern "C" fn(*mut VoskRecognizer, f32, f32, f32),
     recognizer_set_words: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
     recognizer_set_partial_words: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
     recognizer_set_nlsml: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
@@ -276,6 +294,8 @@ impl Api {
             recognizer_new_grm: symbol!("vosk_recognizer_new_grm"),
             recognizer_free: symbol!("vosk_recognizer_free"),
             recognizer_set_max_alternatives: symbol!("vosk_recognizer_set_max_alternatives"),
+            recognizer_set_endpointer_mode: symbol!("vosk_recognizer_set_endpointer_mode"),
+            recognizer_set_endpointer_delays: symbol!("vosk_recognizer_set_endpointer_delays"),
             recognizer_set_words: symbol!("vosk_recognizer_set_words"),
             recognizer_set_partial_words: symbol!("vosk_recognizer_set_partial_words"),
             recognizer_set_nlsml: symbol!("vosk_recognizer_set_nlsml"),
@@ -391,6 +411,36 @@ impl Recognizer {
         unsafe { (self.api.recognizer_set_max_alternatives)(self.handle.as_ptr(), count) }
     }
 
+    /// Selects one of the endpointer's response-length presets.
+    pub fn set_endpointer_mode(&mut self, mode: EndpointerMode) {
+        // SAFETY: our handle is live.
+        unsafe { (self.api.recognizer_set_endpointer_mode)(self.handle.as_ptr(), mode as c_int) }
+    }
+
+    /// Tunes the endpointer's silence thresholds, all in **seconds** (the
+    /// header's comment says milliseconds for two of them, but its own
+    /// "usually around" figures — 5.0, 0.5–1.0 and 20–30 — only make sense as
+    /// seconds, and 0.15 here measurably shortens finalization by ~300ms):
+    ///
+    /// * `t_start_max` — how long initial silence may run before recognition
+    ///   gives up on the utterance (vosk suggests ~5.0);
+    /// * `t_end` — how much trailing silence finalizes an utterance once
+    ///   something was recognized (vosk suggests 0.5–1.0; its default is what
+    ///   the profile's `recognition.silence` shortens);
+    /// * `t_max` — the hard cap on one utterance's length (vosk suggests
+    ///   20–30).
+    pub fn set_endpointer_delays(&mut self, t_start_max: f32, t_end: f32, t_max: f32) {
+        // SAFETY: our handle is live.
+        unsafe {
+            (self.api.recognizer_set_endpointer_delays)(
+                self.handle.as_ptr(),
+                t_start_max,
+                t_end,
+                t_max,
+            )
+        }
+    }
+
     /// Whether finalized results carry per-word metadata.
     pub fn set_words(&mut self, enabled: bool) {
         // SAFETY: our handle is live.
@@ -423,11 +473,13 @@ impl Recognizer {
         Ok(DecodingState::from_c_int(state))
     }
 
-    /// The transcript of the utterance the endpointer has just finalized.
-    pub fn result(&mut self) -> String {
+    /// The transcript of the utterance the endpointer has just finalized:
+    /// the 1-best text, plus the n-best list when `set_max_alternatives` is
+    /// non-zero.
+    pub fn result(&mut self) -> Transcript {
         // SAFETY: our handle is live; the returned buffer is owned by libvosk
         // and stays valid until the next call on this recognizer.
-        transcript(unsafe { (self.api.recognizer_result)(self.handle.as_ptr()) })
+        full_transcript(unsafe { (self.api.recognizer_result)(self.handle.as_ptr()) })
     }
 
     /// The in-progress hypothesis.
@@ -515,18 +567,38 @@ struct ResultJson {
 struct Alternative {
     #[serde(default)]
     text: String,
+    /// An **unnormalized** path score, not a probability: only the gap between
+    /// two alternatives of the same utterance means anything.
+    #[serde(default)]
+    confidence: f32,
+}
+
+/// A decoded result: the 1-best text, plus the full n-best list when
+/// `set_max_alternatives` is non-zero (empty otherwise).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Transcript {
+    /// The best transcript libvosk offered.
+    pub text: String,
+    /// Every alternative with its unnormalized confidence, best first, exactly
+    /// as libvosk returned them. Empty unless alternatives were requested.
+    pub alternatives: Vec<(String, f32)>,
 }
 
 /// Reads the transcript out of one of libvosk's JSON results, tolerating the
-/// multi-alternative shape even though we keep `max_alternatives` at 0.
+/// multi-alternative shape even when `max_alternatives` is 0.
 ///
 /// # Safety
 ///
 /// Only called with a pointer libvosk has just returned, which is either NULL
 /// or a NUL-terminated buffer it owns.
 fn transcript(raw: *const c_char) -> String {
+    full_transcript(raw).text
+}
+
+/// [`transcript`], keeping the n-best list alongside the 1-best text.
+fn full_transcript(raw: *const c_char) -> Transcript {
     if raw.is_null() {
-        return String::new();
+        return Transcript::default();
     }
 
     // SAFETY: non-NULL results from libvosk are valid C strings, owned by the
@@ -537,23 +609,28 @@ fn transcript(raw: *const c_char) -> String {
         Ok(parsed) => parsed,
         Err(e) => {
             warn!(error = %e, "The speech recognizer returned a result we could not read.");
-            return String::new();
+            return Transcript::default();
         }
     };
 
-    if !parsed.text.is_empty() {
-        return parsed.text;
-    }
-    if !parsed.partial.is_empty() {
-        return parsed.partial;
-    }
-
-    parsed
+    let alternatives: Vec<(String, f32)> = parsed
         .alternatives
         .into_iter()
-        .next()
-        .map(|alternative| alternative.text)
-        .unwrap_or_default()
+        .map(|alternative| (alternative.text, alternative.confidence))
+        .collect();
+
+    let text = if !parsed.text.is_empty() {
+        parsed.text
+    } else if !parsed.partial.is_empty() {
+        parsed.partial
+    } else {
+        alternatives
+            .first()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default()
+    };
+
+    Transcript { text, alternatives }
 }
 
 #[cfg(test)]
@@ -584,6 +661,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(transcript(json.as_ptr()), "deploy the sentry");
+    }
+
+    #[test]
+    fn full_transcript_keeps_the_n_best_list_with_confidences() {
+        let json = CString::new(
+            r#"{"alternatives": [{"confidence": 240.4, "text": "one up"}, {"confidence": 240.4, "text": "won up"}, {"confidence": 235.5, "text": "run up"}]}"#,
+        )
+        .unwrap();
+
+        let transcript = full_transcript(json.as_ptr());
+        assert_eq!(transcript.text, "one up");
+        assert_eq!(
+            transcript.alternatives,
+            vec![
+                ("one up".to_string(), 240.4),
+                ("won up".to_string(), 240.4),
+                ("run up".to_string(), 235.5),
+            ]
+        );
+
+        // The single-best shape carries no alternatives at all.
+        let json = CString::new(r#"{"text": "deploy the sentry"}"#).unwrap();
+        assert_eq!(full_transcript(json.as_ptr()).alternatives, vec![]);
     }
 
     #[test]

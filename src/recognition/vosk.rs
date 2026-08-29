@@ -21,7 +21,7 @@ use tracing_batteries::prelude::*;
 use crate::{
     errors::HumanizableError,
     recognition::{
-        AudioMsg, RecognitionEvent, Vocabulary,
+        AudioMsg, RecognitionEvent, RecognizerOptions, Utterance, Vocabulary,
         libvosk::{self, BufferTooLong, DecodingState, LogLevel, Model, Recognizer},
     },
 };
@@ -38,6 +38,20 @@ const AUDIO_CHANNEL_CAPACITY: usize = 8;
 
 /// How much audio to process between dropped-frame reports.
 const DROP_REPORT_INTERVAL_SECS: u64 = 30;
+
+/// The endpointer's `t_start_max`: how long *initial* silence may run before
+/// recognition stops waiting for an utterance to begin. vosk-api's header
+/// suggests "usually around 5.0", which is also what its stock tuning uses;
+/// we keep it — the profile's `recognition.silence` is about trailing
+/// silence, and nothing about eager firing changes how long we wait for
+/// speech to start.
+const ENDPOINTER_START_MAX_SECS: f32 = 5.0;
+
+/// The endpointer's `t_max`: the hard cap on a single utterance's length.
+/// vosk-api's header suggests "usually around 20-30"; we take the top of that
+/// range so a long chain of commands spoken in one breath is never chopped,
+/// while a stuck decode still cannot hold an utterance open forever.
+const ENDPOINTER_MAX_UTTERANCE_SECS: f32 = 30.0;
 
 /// A handle to the recognizer thread.
 ///
@@ -78,18 +92,22 @@ impl RecognizerHandle {
 ///
 /// * `grammar` — the already-expanded, deduped phrase list; [`UNKNOWN_PHRASE`]
 ///   is appended if the caller has not included it.
+/// * `options` — the profile's `recognition:` tuning: endpointer trailing
+///   silence, and how many alternatives finalized results carry.
 /// * the returned sender is bounded (8 frames); the audio callback should
 ///   `try_send` and count drops.
 pub fn spawn_recognizer(
     model_path: &Path,
     sample_rate: u32,
     grammar: &[String],
+    options: RecognizerOptions,
     events: tokio::sync::mpsc::Sender<RecognitionEvent>,
 ) -> Result<(RecognizerHandle, std::sync::mpsc::SyncSender<AudioMsg>), crate::Error> {
     spawn_recognizer_with_drop_counter(
         model_path,
         sample_rate,
         grammar,
+        options,
         events,
         Arc::new(AtomicU64::new(0)),
     )
@@ -107,6 +125,7 @@ pub fn spawn_recognizer_with_drop_counter(
     model_path: &Path,
     sample_rate: u32,
     grammar: &[String],
+    options: RecognizerOptions,
     events: tokio::sync::mpsc::Sender<RecognitionEvent>,
     dropped_frames: Arc<AtomicU64>,
 ) -> Result<(RecognizerHandle, std::sync::mpsc::SyncSender<AudioMsg>), crate::Error> {
@@ -114,7 +133,7 @@ pub fn spawn_recognizer_with_drop_counter(
 
     let phrases = prepare_grammar(grammar)?;
     let model = load_model(model_path)?;
-    let recognizer = build_recognizer(&model, sample_rate, &phrases)?;
+    let recognizer = build_recognizer(&model, sample_rate, &phrases, options)?;
 
     // `Recognizer` holds a raw pointer into the model, so the model has to
     // outlive it; struct fields drop in declaration order, which puts the
@@ -175,13 +194,20 @@ fn recognition_loop(
                         failures.decoded();
                         last_partial.clear();
 
-                        let text = session.recognizer.result();
-                        if text.is_empty() {
+                        let transcript = session.recognizer.result();
+                        if transcript.text.is_empty() {
                             continue;
                         }
 
-                        debug!(text = %text, "Recognized an utterance.");
-                        if events.blocking_send(RecognitionEvent::Final(text)).is_err() {
+                        debug!(text = %transcript.text, "Recognized an utterance.");
+                        let utterance = Utterance {
+                            text: transcript.text,
+                            alternatives: transcript.alternatives,
+                        };
+                        if events
+                            .blocking_send(RecognitionEvent::Final(utterance))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -379,11 +405,13 @@ fn looks_like_model(model_path: &Path) -> bool {
 }
 
 /// Builds the grammar-constrained recognizer, with metadata we do not use
-/// turned off.
+/// turned off, the endpointer's trailing silence set from the profile, and
+/// n-best alternatives requested when confidence gating is on.
 fn build_recognizer(
     model: &Model,
     sample_rate: u32,
     phrases: &[String],
+    options: RecognizerOptions,
 ) -> Result<Recognizer, crate::Error> {
     let mut recognizer = Recognizer::with_grammar(model, sample_rate as f32, phrases)
         .ok_or_else(|| {
@@ -396,12 +424,24 @@ fn build_recognizer(
             )
         })?;
 
-    // A single best transcript, with no per-word timing metadata: the matcher
-    // only ever looks at the text.
-    recognizer.set_max_alternatives(0);
+    // No per-word timing metadata: the matcher only ever looks at the text.
+    // Alternatives stay off (a single best transcript) unless the profile's
+    // confidence gating asked for an n-best list.
+    recognizer.set_max_alternatives(i32::try_from(options.alternatives).unwrap_or(i32::MAX));
     recognizer.set_words(false);
     recognizer.set_partial_words(false);
     recognizer.set_nlsml(false);
+
+    // The endpointer's trailing silence is the *floor* under every command's
+    // latency — measured on real speech, shortening `t_end` from vosk's ~0.5s
+    // moved finalization from ~700ms to ~400ms after the last word with
+    // unchanged transcripts. The other two thresholds keep vosk's own
+    // suggested values (see the constants' comments).
+    recognizer.set_endpointer_delays(
+        ENDPOINTER_START_MAX_SECS,
+        options.silence.as_secs_f32(),
+        ENDPOINTER_MAX_UTTERANCE_SECS,
+    );
 
     Ok(recognizer)
 }
@@ -736,7 +776,19 @@ mod tests {
         ])
         .unwrap();
 
-        build_recognizer(&model, 16_000, &phrases).unwrap();
+        build_recognizer(&model, 16_000, &phrases, RecognizerOptions::default()).unwrap();
+
+        // The alternatives shape builds too — same model, n-best requested.
+        build_recognizer(
+            &model,
+            16_000,
+            &phrases,
+            RecognizerOptions {
+                alternatives: 3,
+                ..RecognizerOptions::default()
+            },
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -765,7 +817,16 @@ mod tests {
             .collect();
 
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
-        let (handle, audio) = spawn_recognizer(&model_path(), 16_000, &grammar, events_tx).unwrap();
+        // The endpointer keeps vosk's stock ~500ms trailing silence here: this
+        // test pins *reset* behavior, and a shorter `t_end` could let a pause
+        // between the recorded digits finalize an utterance before the Reset
+        // ever arrives, which is not the leak being tested.
+        let options = RecognizerOptions {
+            silence: std::time::Duration::from_millis(500),
+            alternatives: 0,
+        };
+        let (handle, audio) =
+            spawn_recognizer(&model_path(), 16_000, &grammar, options, events_tx).unwrap();
 
         // Speak — the decoder builds up an utterance ("one zero zero ...").
         for chunk in speech.chunks(1_600) {
@@ -781,8 +842,8 @@ mod tests {
 
         let mut finals = Vec::new();
         while let Some(event) = events_rx.recv().await {
-            if let RecognitionEvent::Final(text) = event {
-                finals.push(text);
+            if let RecognitionEvent::Final(utterance) = event {
+                finals.push(utterance.text);
             }
         }
 
@@ -805,6 +866,7 @@ mod tests {
             &model_path(),
             16_000,
             &["deploy the sentry".to_string()],
+            RecognizerOptions::default(),
             events_tx,
         )
         .unwrap();
