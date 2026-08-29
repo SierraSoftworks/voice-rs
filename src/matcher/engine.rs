@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 
 use crate::grammar::v2::{Accept, Automaton, Walk};
-use crate::output::CompiledOutput;
 use crate::output::assembly::{Pacing, assemble};
+use crate::output::{CompiledOutput, KeyEvent};
 use crate::recognition::{RecognitionEvent, Utterance};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -455,6 +455,35 @@ impl<'a> Engine<'a> {
         // on it.
         let origin_fresh = passed.is_none();
 
+        // Confidence gating first: when a close runner-up would have run
+        // different commands, the whole utterance is suppressed — firing
+        // nothing beats firing a coin-flip. (Config validation keeps
+        // `alternatives` and eager firing apart, so no eager fire can precede
+        // this check.)
+        if let Some((top, competitor, margin)) =
+            self.close_ambiguity(utterance, &origin, origin_fresh, passed.as_ref())
+        {
+            let message = format!("ambiguous: {top:?} vs {competitor:?} (margin {margin:.1})");
+            warn!("Suppressing an utterance: {message}");
+            (self.options.warn)(message);
+
+            // A suppressed utterance cannot supersede a *previously
+            // confirmed* pending command, and cannot be trusted to extend it
+            // either. It therefore follows the existing non-extending rule:
+            // the pending command — fully spoken and confirmed by its own
+            // Final — flushes now, and the engine goes idle. (The
+            // `fired`-is-empty guard only matters if gating and eager firing
+            // are ever combined, which config validation currently forbids.)
+            if let Some(accept) = &passed
+                && context.as_ref().is_none_or(|ctx| ctx.fired.is_empty())
+                && !self.fire(accept).await
+            {
+                return false;
+            }
+            *state = MatchState::Idle;
+            return true;
+        }
+
         let words = words_of(&utterance.text);
         let mut warn = |message: String| self.warn_user(message);
         let (matched, end) =
@@ -542,6 +571,71 @@ impl<'a> Engine<'a> {
             }
             _ => fresh,
         }
+    }
+
+    /// When the utterance's n-best list contains a close competitor which
+    /// would run *different* commands, returns
+    /// `(top text, competitor text, margin)` — the utterance should then be
+    /// suppressed. `None` whenever fewer than two alternatives are present
+    /// (gating off, or nothing to compare).
+    ///
+    /// Alternatives resolving to the same key sequences (homophones of the
+    /// same phrase, or of phrases with the same output) or to nothing at all
+    /// are ignored: they would not have changed what was pressed.
+    fn close_ambiguity(
+        &self,
+        utterance: &Utterance,
+        origin: &Walk<'a>,
+        origin_fresh: bool,
+        passed: Option<&Accept>,
+    ) -> Option<(String, String, f32)> {
+        let (top, rest) = utterance.alternatives.split_first()?;
+        if rest.is_empty() {
+            return None;
+        }
+
+        let chosen = self.resolve(&top.0, origin, origin_fresh, passed);
+        for (text, confidence) in rest {
+            let gap = top.1 - confidence;
+            if gap > self.options.confidence_margin {
+                continue;
+            }
+            let competitor = self.resolve(text, origin, origin_fresh, passed);
+            if !competitor.is_empty() && competitor != chosen {
+                return Some((top.0.clone(), text.clone(), gap.abs()));
+            }
+        }
+        None
+    }
+
+    /// What an alternative's text would press, resolved from the same walk
+    /// origin the real utterance will use: the full walk's fires plus a
+    /// resting pending command, each assembled under the profile's pacing,
+    /// positions ignored — two texts which would press the same keys in the
+    /// same order are the same interpretation. (Where v1 compared
+    /// `CommandId`s, the grammar has no per-command identity to compare, so
+    /// the assembled plans themselves are the identity — which is what the
+    /// n-best gating design specifies.)
+    fn resolve(
+        &self,
+        text: &str,
+        origin: &Walk<'a>,
+        origin_fresh: bool,
+        passed: Option<&Accept>,
+    ) -> Vec<Vec<KeyEvent>> {
+        let words = words_of(text);
+        // Resolving a hypothetical reading must not warn at the user: only
+        // the walk of the utterance the engine acts on gets to do that.
+        let mut warn = |_: String| {};
+        let (fired, end) = self.walk_final(&words, origin, origin_fresh, passed, &mut warn);
+        let mut sequence: Vec<Vec<KeyEvent>> = fired
+            .into_iter()
+            .map(|matched| assemble(&matched.accept.actions, &self.pacing))
+            .collect();
+        if let WalkEnd::Pending { accept, .. } = end {
+            sequence.push(assemble(&accept.actions, &self.pacing));
+        }
+        sequence
     }
 
     /// Handles a partial hypothesis with eager matching on. Returns whether
@@ -984,6 +1078,14 @@ mod tests {
         async fn hear_final(&self, text: &str) {
             self.events
                 .send(RecognitionEvent::Final(Utterance::plain(text)))
+                .await
+                .expect("the engine should still be listening");
+            settle().await;
+        }
+
+        async fn hear_final_with_alternatives(&self, alternatives: &[(&str, f32)]) {
+            self.events
+                .send(RecognitionEvent::Final(utterance_of(alternatives)))
                 .await
                 .expect("the engine should still be listening");
             settle().await;
@@ -1766,6 +1868,143 @@ mod tests {
 
         h.hear_final("deploy sentry").await;
         assert_eq!(h.fired(), vec!["DeploySentry"]);
+        h.shutdown().await;
+    }
+
+    // --- Confidence gating (alternatives) ---------------------------------
+
+    /// A grammar for the gating suite: two acoustically-confusable commands
+    /// with different keys, and one command with homophone phrases.
+    fn gating_arsenal() -> Automaton {
+        compile(
+            r#"
+            MortarSentry = "mortar sentry" { 1 }
+            RocketSentry = "rocket sentry" { 2 }
+            OneUp = "one up" | "won up" { 3 }
+            "#,
+        )
+    }
+
+    /// An utterance carrying an n-best list, best first.
+    fn utterance_of(alternatives: &[(&str, f32)]) -> Utterance {
+        Utterance {
+            text: alternatives
+                .first()
+                .map(|(text, _)| (*text).to_string())
+                .unwrap_or_default(),
+            alternatives: alternatives
+                .iter()
+                .map(|&(text, confidence)| (text.to_string(), confidence))
+                .collect(),
+        }
+    }
+
+    #[rstest::rstest]
+    // A close competitor resolving to different keys: suppress.
+    #[case(&[("mortar sentry", 240.0), ("rocket sentry", 238.8)], Some(1.2))]
+    // The same competitor, outside the margin: the winner is clear.
+    #[case(&[("mortar sentry", 240.0), ("rocket sentry", 235.0)], None)]
+    // Homophone phrases of one command at identical confidence: they press
+    // the same keys, never suppressed.
+    #[case(&[("one up", 240.0), ("won up", 240.0)], None)]
+    // A competitor resolving to nothing at all is ignored.
+    #[case(&[("mortar sentry", 240.0), ("more tar sen tree", 239.9)], None)]
+    // A single alternative has nothing to compete with.
+    #[case(&[("mortar sentry", 240.0)], None)]
+    // No alternatives at all (gating disabled): nothing to do.
+    #[case(&[], None)]
+    fn gating_margin_table(#[case] alternatives: &[(&str, f32)], #[case] expected: Option<f32>) {
+        let automaton = gating_arsenal();
+        let (queue, _actions) = mpsc::channel(1);
+        let engine = Engine::new(
+            &automaton,
+            pacing(),
+            MatcherOptions::with_timeout(TIMEOUT),
+            queue,
+        );
+        let utterance = utterance_of(alternatives);
+
+        let ambiguity = engine.close_ambiguity(&utterance, &engine.automaton.walk(), true, None);
+
+        match expected {
+            None => assert!(ambiguity.is_none(), "unexpected suppression: {ambiguity:?}"),
+            Some(margin) => {
+                let (top, competitor, gap) = ambiguity.expect("the utterance should be suppressed");
+                assert_eq!(top, utterance.text);
+                assert_ne!(competitor, top);
+                assert!(
+                    (gap - margin).abs() < 0.01,
+                    "unexpected margin {gap} (expected {margin})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gating_suppresses_a_close_call_and_warns() {
+        let mut h = Harness::start(gating_arsenal());
+
+        h.hear_final_with_alternatives(&[("mortar sentry", 240.0), ("rocket sentry", 238.8)])
+            .await;
+
+        h.nothing_fired();
+        let warnings = h.warnings();
+        assert_eq!(
+            warnings,
+            vec!["ambiguous: \"mortar sentry\" vs \"rocket sentry\" (margin 1.2)"]
+        );
+
+        // Suppression leaves the engine idle: the next utterance matches
+        // exactly as it would from scratch.
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+        h.hear_final_with_alternatives(&[("mortar sentry", 240.0), ("rocket sentry", 230.0)])
+            .await;
+        assert_eq!(h.fired(), vec!["MortarSentry"]);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gating_same_command_homophones_do_not_suppress() {
+        // "one"/"won" return byte-identical confidences from Vosk; both
+        // phrases belong to the same rule, so there is nothing ambiguous
+        // about what to press.
+        let mut h = Harness::start(gating_arsenal());
+
+        h.hear_final_with_alternatives(&[("one up", 240.0), ("won up", 240.0)])
+            .await;
+
+        assert_eq!(h.fired(), vec!["OneUp"]);
+        h.no_warnings();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gating_suppression_flushes_a_prior_pending_command() {
+        // A pending command from a previous, trusted utterance follows the
+        // existing non-extending rule when the next utterance is suppressed:
+        // it was fully spoken and confirmed, so it fires; only the suppressed
+        // utterance's own commands are withheld.
+        let mut h = Harness::start(compile(
+            r#"
+            MortarSentry = "mortar sentry" { 1 }
+            RocketSentry = "rocket sentry" { 2 }
+            Autocannon = "autocannon" { 4 }
+            AutocannonSentry = "autocannon sentry" { 5 }
+            "#,
+        ));
+
+        h.hear_final("autocannon").await;
+        h.nothing_fired();
+
+        h.hear_final_with_alternatives(&[("mortar sentry", 240.0), ("rocket sentry", 238.8)])
+            .await;
+        assert_eq!(h.fired(), vec!["Autocannon"]);
+        assert_eq!(h.warnings().len(), 1);
+
+        // And the pending state is gone for good.
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
         h.shutdown().await;
     }
 }
