@@ -24,6 +24,8 @@ command phrase, it presses keys in a game (or any application) for you. It is bu
   arbitrary nesting of the two.
 - Ambiguous-prefix commands ("autocannon" vs "autocannon sentry") resolved by a configurable
   statement-completion timeout.
+- Low-latency recognition: a configurable endpointer, partial-driven ("eager") command firing, and
+  optional n-best confidence gating — see [Endpointing](#endpointing-and-latency).
 - Non-blocking detection path on Tokio: audio capture, recognition, matching, and key output are
   separate tasks/threads connected by bounded channels, with recognized commands flowing through a
   command queue.
@@ -40,8 +42,10 @@ command phrase, it presses keys in a game (or any application) for you. It is bu
 - Mouse movement/click output, process execution, and audio playback outputs — `CompiledOutput` is an
   enum precisely so these can be added without touching the pipeline.
 - Runtime grammar switching (per-app sub-profiles).
-- Partial-result ("eager") command firing — see [Endpointing](#endpointing-and-latency).
 - Windows/macOS support. This tool is deliberately Linux-first at the evdev/uinput layer.
+
+(Partial-result "eager" command firing was originally listed here as future work; it has since been
+implemented — see [Endpointing](#endpointing-and-latency).)
 
 ## Architectural lineage
 
@@ -226,8 +230,13 @@ grammar-constrained `Recognizer`, blocks on the audio channel, and pushes events
 // recognition/mod.rs
 pub enum RecognitionEvent {
     Partial(String),   // unstable, may be revised; emitted only when the text changes
-    Final(String),     // utterance finalized by Vosk's endpointer
+    Final(Utterance),  // utterance finalized by Vosk's endpointer
     Muted,             // listening turned off; matcher must clear all state
+}
+
+pub struct Utterance {
+    pub text: String,                       // the 1-best transcript
+    pub alternatives: Vec<(String, f32)>,   // n-best list; empty unless recognition.alternatives > 0
 }
 
 pub enum AudioMsg {
@@ -457,8 +466,11 @@ enum MatchState {
 }
 ```
 
-Commands fire on **Final** results only; partials are used solely to hold a pending timer open,
-never to fire. Transitions:
+The matcher runs under a `MatcherOptions` struct (completion timeout, the eager switch and its
+delay, the confidence margin, and a warning sink) threaded in from the profile by the `run`
+assembly. With **eager matching off** (`recognition.eager: false` — the compatibility escape
+hatch), commands fire on **Final** results only; partials are used solely to hold a pending timer
+open, never to fire. Transitions:
 
 - **Idle + Final(words):** strip `[unk]` tokens, then walk the words from the root with greedy
   longest-match segmentation — when a word has no child but the path passed a terminal, emit that
@@ -478,6 +490,66 @@ never to fire. Transitions:
 - **Any + Muted:** clear everything, including a pending command — a half-confirmed command must not
   fire when listening resumes.
 
+### Eager matching (partial-driven firing)
+
+With **eager matching on** (the default), the same walk also runs over every *partial* hypothesis,
+and an utterance-scoped `EagerContext` tracks what may fire before the endpointer ever finalizes:
+
+```rust
+struct EagerContext {                       // Some(_) from an utterance's first partial to its Final
+    start: usize,                           // walk origin: the pending node, or the root
+    passed: Option<CommandId>,              // pending command absorbed from the previous utterance
+    fired: Vec<(usize, CommandId)>,         // (position, command) already fired from partials
+    resting: Option<EagerResting>,          // the armed deadline, if the walk rests on a terminal
+}
+```
+
+- **Certain fires.** A command the greedy walk has *passed and resynced beyond* ended strictly
+  before the partial's last word — no revision of the words still being spoken can take it back —
+  so it fires **immediately**, recorded in `fired`.
+- **Resting on an unambiguous terminal** arms `now + eager_delay`, re-armed on every changed
+  partial: the hypothesis must hold still before it is trusted. The deadline firing fires the
+  command, records it, and keeps the context open.
+- **Resting on an ambiguous terminal** arms the **completion timeout from the partial** — the wait
+  no longer starts at finalization, which is the big win for prefix commands. A later partial which
+  does not move the resting point keeps the armed deadline.
+- **Resting mid-trie** (including past an uncommitted crossed terminal) arms nothing: the trailing
+  words may still grow into the longer phrase.
+- **Final(utterance):** *reconciliation*. The full walk runs as usual and its `(position, command)`
+  sequence is compared against `fired`: a matching prefix means the remainder fires and an
+  ambiguous rest goes `Pending` (keeping the **earlier** partial-armed deadline when it is the same
+  wait); `fired` containing exactly the resting command as its one extra entry means the ambiguous
+  choice was already made mid-utterance (nothing fires twice, nothing is held pending); anything
+  else is an **eager mismatch** — the keys are already down, nothing can be un-pressed, so the rest
+  of the utterance is dropped and a warning is emitted through the session's event sink
+  (`warning:` line / yellow TUI entry). The context is cleared at every Final.
+- **A new utterance's partial while a command is Pending** absorbs the pending command into the
+  context (`start`/`passed`) and disarms its timer: the continuation logic itself now decides its
+  fate — an extending hypothesis supersedes it, a non-extending one flushes it immediately. This
+  subsumes the eager-off rule where an extending partial merely pushed the deadline.
+- **Muted / cancellation** clear the context without firing, exactly as they clear `Pending`. The
+  events channel closing fires only what a Final confirmed: a still-undecided absorbed pending
+  command, never a bare partial hypothesis.
+
+### Confidence gating (alternatives)
+
+When `recognition.alternatives > 0`, finalized utterances carry Vosk's n-best list. Confidences are
+**unnormalized** path scores (measured: ~150–240 for five-word utterances; homophones return
+byte-identical scores; acoustically distinct competitors gap by a few units), so only the *margin*
+between alternatives of one utterance is meaningful. At each Final, every alternative's text is
+resolved through the trie (from the same walk origin the utterance itself will use) to the command
+sequence it would run; if any alternative within `confidence_margin` of the 1-best resolves to a
+**different non-empty** sequence, the whole utterance is suppressed and a warning names both
+readings (`ambiguous: "mortar sentry" vs "rocket sentry" (margin 1.2)`). Alternatives resolving to
+the same sequence (homophone phrases of one command) or to nothing are ignored. A suppressed
+utterance leaves the matcher Idle; a command left Pending by a *previous* utterance follows the
+existing non-extending rule — it was confirmed, so it flushes rather than being dropped or
+superseded by an utterance we refused to trust.
+
+Because alternatives exist only on finalized results, confidence gating and eager firing are
+per-utterance incompatible: `eager: true` + `alternatives > 0` is a config error, and `alternatives`
+flips the eager default to `false`.
+
 The loop is a single `select!`:
 
 ```rust
@@ -496,18 +568,48 @@ loop {
 
 ### Endpointing and latency
 
-Vosk finalizes an utterance after its internal silence endpoint (~0.5 s; not configurable through
-the `vosk` 0.3 crate). Two honest consequences:
+Where the latency actually lives, measured on real recorded speech (lgraph model, this codebase):
+commands used to fire only on Vosk `Finalized` results, which the endpointer emits after trailing
+silence — **700–1000 ms after the partial hypothesis had already stabilized on the exact final
+text**. That dead time was the whole user-felt latency, and it also meant `completion_timeout`
+started far later than it needed to for ambiguous prefixes. Three independent levers now attack it,
+all under the profile's `recognition:` block:
 
-1. "autocannon sentry" spoken in one breath arrives as a *single* Final — the completion timeout
-   never engages, and the command fires as fast as Vosk can finalize.
-2. The timeout only matters when the speaker *pauses* between "autocannon" and "sentry". In that
-   case the perceived latency for the short command is `endpoint silence + completion_timeout`.
+1. **The endpointer itself** (`recognition.silence`, default 200ms). libvosk 0.3.45 exports
+   `vosk_recognizer_set_endpointer_delays(rec, t_start_max, t_end, t_max)` and
+   `vosk_recognizer_set_endpointer_mode` (verified via `nm`; no published crate binds them — our
+   dlopen table in `recognition/libvosk.rs` does). Setting `t_end` = 0.15 s cut the measured
+   finalize delay from ~700 ms to ~400 ms with unchanged transcripts; the default ships a
+   still-conservative 200 ms (Vosk's own default is ~500 ms). The other two parameters keep the
+   values vosk-api's header suggests — `t_start_max` 5.0 s (initial-silence timeout) and `t_max`
+   30 s (hard utterance cap) — see the constants in `recognition/vosk.rs`.
+2. **Eager (partial-driven) firing** (`recognition.eager`, default on; `recognition.eager_delay`,
+   default 100ms). The matcher fires from *stable partials* instead of waiting for finalization at
+   all: certain (resynced-past) commands fire instantly, unambiguous resting matches fire after
+   `eager_delay` of hypothesis stability, and ambiguous resting matches start their
+   `completion_timeout` at the partial rather than at the Final. The eventual Final is reconciled
+   against what already fired, and a mismatch is warned about (keys cannot be un-pressed) — see
+   §"Eager matching" above. `eager: false` restores the original Final-only machine exactly.
+3. **Confidence gating** (`recognition.alternatives` + `recognition.confidence_margin`), the
+   opposite trade: spend the finalization wait buying *certainty*, suppressing utterances whose
+   close n-best competitors would run different commands — see §"Confidence gating" above.
+   Measured: homophones (one/won) return byte-identical unnormalized confidences, distinct
+   competitors gap by a few units (4.9 observed), so only the margin is meaningful and gating keys
+   off it.
 
-That trade-off is correct for v1: it prioritizes never firing the wrong command over shaving
-milliseconds. Partial-driven eager firing (executing off stable partials before the endpointer
-closes) is the designed escape hatch if the latency proves objectionable, and is confined to the
-matcher module.
+Two honest consequences remain:
+
+1. "autocannon sentry" spoken in one breath is one hypothesis: with eager on it fires
+   `eager_delay` after the last word stabilizes; with eager off it fires when the endpointer does
+   (`silence` after the last word, plus decode).
+2. The completion timeout still only costs you when you *pause* inside an ambiguous phrase — but
+   with eager on the short command's perceived latency is now just `completion_timeout` from the
+   pause, instead of `endpoint silence + completion_timeout` from the eventual Final.
+
+The remaining risk is inherent: an eager fire acts on a hypothesis, and a speaker who pauses past
+`completion_timeout` mid-phrase (or a partial the recognizer later revises) produces keys that
+cannot be taken back. The matcher never attempts compensation; it reports the mismatch through the
+session's event path so the user sees exactly what fired.
 
 ## Profile schema
 
@@ -530,6 +632,13 @@ hotkey:
   interrupt: false         # true: stopping listening also cancels the command being typed
 
 completion_timeout: 350ms  # ambiguous-prefix settle time (default: 300ms)
+
+recognition:               # the latency levers (all optional; block absent = these defaults)
+  silence: 200ms           # endpointer trailing silence (t_end); Vosk's own default is ~500ms
+  eager: true              # fire from stable partials (default true; false = Final-only firing)
+  eager_delay: 100ms       # how long a partial must hold still before an unambiguous match fires
+  alternatives: 0          # >0 requests an n-best list and enables confidence gating
+  confidence_margin: 3.0   # suppress when a different-command alternative is this close to the winner
 
 defaults:                  # applies to the `keys:` shorthand form
   duration: 30ms           # how long each chord is held down
@@ -1035,10 +1144,9 @@ If none is set, the error advises downloading a model and lists the three mechan
 
 ## Risks & open questions
 
-1. **Vosk endpointing is not configurable** through the 0.3 crate; the latency trade-off is
-   documented under [Endpointing](#endpointing-and-latency), with partial-driven matching as the
-   escape hatch. The exact `DecodingState` variant names should be re-verified when implementation
-   starts.
+1. **Vosk endpointing** is not configurable through the published crates, but libvosk 0.3.45 does
+   export `vosk_recognizer_set_endpointer_delays`/`_mode`, which our own dlopen binding now drives —
+   the latency design is documented under [Endpointing](#endpointing-and-latency).
    *Discovered during implementation:* `Recognizer::reset()` alone does **not** discard a
    mid-utterance decode — the partial reads empty afterwards, but the stale utterance can still
    finalize off subsequent audio (verified empirically with libvosk 0.3.45; this is what made a

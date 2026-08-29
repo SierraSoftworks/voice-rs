@@ -15,13 +15,13 @@ pub mod libvosk;
 pub mod vosk;
 
 /// An event emitted by the recognizer towards the matcher.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RecognitionEvent {
     /// An in-progress hypothesis; unstable and may be revised. Emitted only
     /// when the hypothesis text changes.
     Partial(String),
     /// An utterance finalized by Vosk's silence endpointer.
-    Final(String),
+    Final(Utterance),
     /// Listening was turned off; the matcher must clear all pending state.
     Muted,
     /// The recognizer could not decode the audio it was given.
@@ -33,6 +33,51 @@ pub enum RecognitionEvent {
     /// shows it, because "the recognizer is failing" is the difference between
     /// a profile which does not match and a machine which cannot listen.
     Failed,
+}
+
+/// A finalized utterance, with the n-best list when the profile asked for one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Utterance {
+    /// The 1-best transcript — what the matcher walks, and what every report
+    /// prints.
+    pub text: String,
+    /// Every alternative with its **unnormalized** confidence, best first;
+    /// empty unless `recognition.alternatives` is non-zero. Only the *margin*
+    /// between two entries of the same utterance carries meaning.
+    pub alternatives: Vec<(String, f32)>,
+}
+
+impl Utterance {
+    /// An utterance carrying only its text — the single-best (default) shape.
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            alternatives: Vec::new(),
+        }
+    }
+}
+
+/// Recognizer tuning from the profile's `recognition:` block — the slice of it
+/// the decoder thread needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecognizerOptions {
+    /// The endpointer's trailing-silence threshold (`t_end`): how much silence
+    /// after speech finalizes an utterance.
+    pub silence: std::time::Duration,
+    /// How many alternative transcripts finalized results carry; `0` keeps the
+    /// single-best shape.
+    pub alternatives: u32,
+}
+
+impl Default for RecognizerOptions {
+    /// Mirrors `config::RecognitionConfig`'s defaults; a config test pins the
+    /// two together so they cannot drift.
+    fn default() -> Self {
+        Self {
+            silence: std::time::Duration::from_millis(200),
+            alternatives: 0,
+        }
+    }
 }
 
 /// A message on the audio channel into the recognizer thread.

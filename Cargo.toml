@@ -25,6 +25,7 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", features = ["opentelemetry"] }
 uinput-tokio = "0.1.36"
+update-rs = "0.4"
 
 [dev-dependencies]
 rstest = "0.26.1"

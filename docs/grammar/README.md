@@ -156,9 +156,12 @@ talking:
 - **You say something else entirely** → `reload` fires first, then the new words are matched from the start.
 - **You mute mid-way** → the pending command is discarded. A half-confirmed command must never fire when you unmute.
 
-Partial results are used only to *hold the timer open* — if what you are still saying continues to extend the pending
-phrase, the deadline is pushed out so the short command does not fire underneath you. Commands themselves only ever
-fire on finalized results.
+With [eager matching](../profiles/README.md#recognition-eager) on (the default), the timer starts the moment the
+recognizer's in-progress hypothesis comes to rest on the ambiguous phrase — you pay the timeout from when you pause,
+not from when the recognizer finalizes. And a hypothesis which continues to extend the pending phrase supersedes the
+short command directly, without waiting for finalization at all. With eager matching off, commands only ever fire on
+finalized results, and partial results are used solely to *hold the timer open* — if what you are still saying
+continues to extend the pending phrase, the deadline is pushed out so the short command does not fire underneath you.
 
 `voice-orders validate` prints a note for every prefix relation in your profile, quoting your configured timeout, so
 this behaviour is discoverable per profile rather than something you have to infer:
@@ -170,19 +173,30 @@ reload
 
 ### A note on latency
 
-Two consequences are worth being straight about.
+Where the time actually goes: the recognizer's in-progress hypothesis usually settles on your exact final words
+**hundreds of milliseconds before** its silence endpointer finalizes the utterance. Three
+[`recognition:`](../profiles/README.md#recognition) options decide how much of that time you get back.
 
-**The recognizer's own endpointer sets the floor.** Vosk finalizes an utterance after roughly half a second of silence,
-and that threshold is not configurable through the library. Every command carries that cost, ambiguous or not.
+**Eager matching claims most of it.** With [`eager`](../profiles/README.md#recognition-eager) on (the default),
+"reload weapon" spoken in one breath fires [`eager_delay`](../profiles/README.md#recognition-eager-delay) (100ms by
+default) after the hypothesis stops changing — no finalization involved. The trade is honesty about the rare miss: a
+hypothesis the recognizer later revises has already pressed its keys, and the session reports a `warning:` naming
+what fired versus what was actually said.
 
-**The completion timeout only costs you when you pause.** "reload weapon" spoken in one breath arrives as a *single*
-finalized result — the timeout never engages, and the command fires as fast as the recognizer can finalize. The timeout
-only matters when you actually pause between "reload" and "weapon", and then the short command's perceived latency is
-the endpoint silence *plus* your `completion_timeout`.
+**The endpointer sets the floor for everything else.** With eager off, every command waits out
+[`recognition.silence`](../profiles/README.md#recognition-silence) (200ms by default; Vosk's own default is roughly
+half a second) after your last word before it can fire.
 
-That trade-off is deliberate: firing the wrong command is worse than firing the right one a fraction of a second later.
-If the wait bothers you, the cheapest fix is usually to make the ambiguity go away — rename one of the two commands so
-that neither phrase is a prefix of the other.
+**The completion timeout only costs you when you pause.** It engages only when you actually stop between "reload" and
+"weapon" — and with eager matching on, it now runs from the moment you pause rather than from the later finalization,
+so the short command's perceived latency is just your `completion_timeout`. If even that wait bothers you, the
+cheapest fix is still to make the ambiguity go away — rename one of the two commands so that neither phrase is a
+prefix of the other.
+
+**When you would rather trade latency for certainty**, [`alternatives`](../profiles/README.md#recognition-alternatives)
+turns the equation around: the recognizer's n-best readings of each finalized utterance are compared, and an utterance
+whose close runner-up would have run a *different* command is suppressed with a warning instead of guessed at. Because
+it needs the finalized result, it cannot be combined with eager firing.
 
 ## How `validate` checks your words
 
