@@ -610,8 +610,11 @@ full-screen view: a header with the profile's name, stats and source; a scrollin
 live listening state and the loaded model. Press `q` (or `Ctrl-C`) to stop. (`voice-orders run` renders the same
 view, with the commands actually being played.)
 
-Each recognition is **one line** in that log, and it upgrades in place. The utterance appears in grey the moment it
-is heard, and turns green with the command and its keys when the matcher resolves it:
+Each recognition is **one line** in that log, and it lives while you speak. The utterance appears — dim and italic —
+the moment the recognizer forms its first guess, revises in place as you keep talking, and turns green with the
+command and its keys the instant one fires (eager matches show up while you are still mid-sentence, not when the
+recognizer finalizes). When the utterance settles, the line settles with it — the finalized transcript in place of
+the guess. Muting mid-utterance leaves the line yellow and marked `(muted)`:
 
 ```
 19:04:11 ● "deploy the auto cannon" → Autocannon (4)
@@ -623,9 +626,9 @@ is heard, and turns green with the command and its keys when the matcher resolve
 A command is named by the rule which matched it, with whatever it [captured](../grammar/README.md#captures) in
 parentheses — `Watch(two, north)` — so the log says what you actually said and not merely which rule fired.
 
-A line which **stays grey** is the signal to look for: the model understood you, but no rule in your grammar covers
+A line which **settles grey** is the signal to look for: the model understood you, but no rule in your grammar covers
 what you said. The dot carries the same reading as the color — green for a matched command, grey for an utterance nothing
-matched, yellow for a warning or for a command interrupted or discarded by
+matched, yellow for a warning, for an utterance a mute cut short, or for a command interrupted or discarded by
 [`hotkey.interrupt`](#hotkey-interrupt), red for pipeline errors. The listening state is not logged: the footer shows
 it live as you press and release the hotkey.
 

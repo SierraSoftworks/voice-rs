@@ -745,12 +745,18 @@ async fn narrate_recognition(
     // which is how the terminal UI reunites them however far apart they land
     // (an eager fire precedes its own Final; a completion-timeout fire trails
     // the next utterance).
+    // The terminal UI keeps a live entry per utterance, opened by its first
+    // partial and settled (or abandoned) with its slot — so a channel sink
+    // gets partials and mutes regardless of narration level. Plain output
+    // stays exactly what it always printed: partials and mutes only under
+    // `--debug-recognition`.
+    let live = matches!(sink, EventSink::Channel(_));
     let mut closed: u64 = 0;
     while let Some(event) = events.recv().await {
         if matches!(event, RecognitionEvent::Final(_) | RecognitionEvent::Muted) {
             closed += 1;
         }
-        if let Some(reported) = narration_event(&event, narration, closed) {
+        if let Some(reported) = narration_event(&event, narration, closed, live) {
             sink.send(reported);
         }
 
@@ -761,16 +767,24 @@ async fn narrate_recognition(
 }
 
 /// The report one recognition event deserves, or [`None`] when it is noise the
-/// user has not asked to see. `seq` is the utterance slot the event closed,
-/// meaningful for `Final`s.
-fn narration_event(event: &RecognitionEvent, narration: Narration, seq: u64) -> Option<UiEvent> {
+/// user has not asked to see. `closed` is how many utterance slots the stream
+/// has closed *including this event*: a `Final` or a mute closed slot
+/// `closed` itself, while a partial belongs to the still-open slot after it.
+/// `live` says the sink renders live entries (the terminal UI), which need
+/// every partial and mute whatever the narration level.
+fn narration_event(
+    event: &RecognitionEvent,
+    narration: Narration,
+    closed: u64,
+    live: bool,
+) -> Option<UiEvent> {
     match (event, narration) {
         (_, Narration::Silent) => None,
         // A finalized utterance is the whole point: it is what the matcher gets
         // to work with, so it is reported whenever anything is reported at all.
         (RecognitionEvent::Final(utterance), _) => Some(UiEvent::Heard {
             text: utterance.text.clone(),
-            seq,
+            seq: closed,
         }),
         // A recognizer which cannot decode is reported as loudly as an
         // utterance: without it, a session where nothing works looks exactly
@@ -779,12 +793,17 @@ fn narration_event(event: &RecognitionEvent, narration: Narration, seq: u64) -> 
         (RecognitionEvent::Failed, _) => Some(UiEvent::Warning(
             "the speech recognizer could not decode the audio".to_string(),
         )),
-        // Partials and mutes are noise unless they were asked for.
-        (RecognitionEvent::Partial(text), Narration::Everything) => {
-            Some(UiEvent::Hearing(text.clone()))
+        // Partials and mutes drive the UI's live entries; in plain mode they
+        // are noise unless they were asked for.
+        (RecognitionEvent::Partial(text), narration) => {
+            (live || narration == Narration::Everything).then(|| UiEvent::Hearing {
+                text: text.clone(),
+                seq: closed + 1,
+            })
         }
-        (RecognitionEvent::Muted, Narration::Everything) => Some(UiEvent::Muted),
-        _ => None,
+        (RecognitionEvent::Muted, narration) => {
+            (live || narration == Narration::Everything).then_some(UiEvent::Muted { seq: closed })
+        }
     }
 }
 
@@ -1839,14 +1858,52 @@ mod tests {
         #[case] narration: Narration,
         #[case] expected: Option<&str>,
     ) {
-        // Asserted through the plain rendering, because these exact lines are
-        // `test`'s piped output — the terminal UI draws the same text.
+        // Asserted through the plain rendering with `live` off, because these
+        // exact lines are `test`'s piped output — scripts and CI read them,
+        // so they are pinned character for character and the live entries the
+        // terminal UI needs must never leak into them.
         assert_eq!(
-            narration_event(&event, narration, 1)
+            narration_event(&event, narration, 1, false)
                 .map(|reported| reported.plain_line())
                 .as_deref(),
             expected,
             "{event:?} under {narration:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_live_sink_gets_partials_and_mutes_with_their_slots() {
+        // The terminal UI's live entries are driven by partials and mutes
+        // whatever the narration level; each carries the slot the log needs
+        // to attribute it. A partial belongs to the still-open slot (the one
+        // after the last closed), a mute to the slot it just closed.
+        assert_eq!(
+            narration_event(
+                &RecognitionEvent::Partial("sal".into()),
+                Narration::Utterances,
+                1,
+                true
+            ),
+            Some(UiEvent::Hearing {
+                text: "sal".into(),
+                seq: 2
+            })
+        );
+        assert_eq!(
+            narration_event(&RecognitionEvent::Muted, Narration::Utterances, 2, true),
+            Some(UiEvent::Muted { seq: 2 })
+        );
+
+        // Silent narration is still silence: plain `run` reports nothing at
+        // all, and it never has a live sink to feed anyway.
+        assert_eq!(
+            narration_event(
+                &RecognitionEvent::Partial("sal".into()),
+                Narration::Silent,
+                1,
+                true
+            ),
+            None
         );
     }
 

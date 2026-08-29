@@ -562,7 +562,11 @@ struct EagerContext {                       // Some(_) from an utterance's first
   already pressed: the field-observed double fire ("Autocannon" from the timer, then
   "AutocannonSentry" from the continuation over the same words) is structurally impossible, not
   merely unreached. A speaker who continues anyway is told at the Final (an **eager overrun**
-  warning naming the committed fire and the settled text) and the trailing words are dropped.
+  warning naming the committed fire and the settled text) and the trailing words are dropped. The
+  warning is deliberately *not* emitted when the overrunning partial is first seen: at that moment
+  the trailing words may still be revised, or grow into a genuine second command that fires from
+  the fresh root — an overrun only exists once the utterance settles having added up to nothing,
+  so an earlier warning would be a prediction the recognizer could falsify.
 - **Final(utterance):** *reconciliation*. The full walk runs from `committed` and its
   `(position, command)` sequence is compared against the post-commit entries of `fired`: a matching
   prefix means the remainder fires and an ambiguous rest goes `Pending` (keeping the **earlier**
@@ -944,31 +948,39 @@ only in what they put into the stream. Layout, kept deliberately simple:
 both commands fall back to their existing line-oriented behavior, so the wrapper contract and every
 script reading `test`'s output are untouched.
 
-**One entry per recognition.** The log is not a transcript of the event stream. A finalized
-utterance is appended as one grey entry (`"auto cannon sentry"`), and the match which resolves it
-**upgrades that same entry in place** to green with the command and its key plan
-(`"auto cannon sentry" → Autocannon sentry (4)`); a greedy multi-match appends its extra commands to
-the same line. An entry which never upgrades stays grey — that, rather than an absent line, is the
-"it heard me but nothing fired" signal. Interrupted and discarded commands keep their own yellow
-entries, because they say something about a command which already fired rather than about the
-utterance. Listening-state changes are **not** logged at all: the footer shows the live state, which
-is both fewer lines and more current.
+**One live entry per recognition.** The log is not a transcript of the event stream: an utterance
+is **one entry which lives through its recognition**. It is created — dim and italic, so a
+hypothesis never reads as a transcript — at the utterance's **first partial**, and its text revises
+in place as the hypothesis grows. Every command it fires **attaches the moment the match is
+reported**: an eager fire is visible when the keys press, not when the endpointer gets around to
+finalizing (recording-driven tests in `matcher/recorded.rs` measured that gap at ~600ms for an
+unambiguous phrase — the whole of the "feels slow" field report was this presentation delay). The
+`Final` then settles the entry: the finalized transcript replaces the hypothesis and the style
+settles — an entry which settles without ever matching stays grey, which (rather than an absent
+line) is the "it heard me but nothing fired" signal. A mute mid-utterance settles the entry as
+**abandoned** instead (yellow dot, the last hypothesis kept, marked `(muted)`), and an utterance
+muted before any partial produces no entry at all. A greedy multi-match appends its extra commands
+to the same line. Interrupted and discarded commands keep their own yellow entries, because they
+say something about a command which already fired rather than about the utterance.
+Listening-state changes are **not** logged at all: the footer shows the live state, which is both
+fewer lines and more current.
 
-Matches are correlated to utterances by **sequence**, not by order: the matcher stamps every
-`CommandAction` with the slot of the utterance it was heard in, and the recognition narrator stamps
-every `heard:` event the same way (both count the very same event stream — every `Final` *and*
+Everything meets by **sequence**, not by order: the matcher stamps every `CommandAction` with the
+slot of the utterance it was heard in, and the recognition narrator stamps every `hearing:`,
+`heard:` and mute event the same way (both count the very same event stream — every `Final` *and*
 every `Muted` closes a slot, so an utterance muted away after an eager fire cannot hand its number
-to the next one). The log attaches each match to the entry with the matching sequence: a
-completion-timeout fire lands on its own utterance however many lines have been logged since, an
-eager fire — which arrives *before* its utterance's `Final` — is **held** and attached when that
-entry appears, and a held match whose slot a mute consumed is logged on its own line once the next
-recognition proves it was skipped. Field testing motivated this: eager fires used to land on the
-previous utterance's line (painting a partial as a completed command and cascading every later
-match one entry up), because the earlier order-alone rule attached a match to the oldest
-unmatched recognition. The caveat that rule carried — an unmatched utterance stealing the next
-utterance's match, pinned as a known cost — disappears entirely: the stamp says which utterance a
-command came from, so the two sequences the old rule could not tell apart now render correctly,
-and that too is pinned by tests.
+to the next one; a partial belongs to the still-open slot). The log attaches each event to the
+entry with the matching sequence: a completion-timeout fire lands on its own utterance however
+many lines have been logged since, an eager fire lands on the live entry its own partials opened,
+and a match whose entry has scrolled away (or which carries no stamp) is logged on its own line
+rather than dropped. Field testing motivated the stamps: eager fires used to land on the previous
+utterance's line (painting a partial as a completed command and cascading every later match one
+entry up), because the earlier order-alone rule attached a match to the oldest unmatched
+recognition. With entries open from the first partial there is nothing left to hold back: the
+earlier hold-until-Final mechanism (and the held-match bookkeeping it needed) is gone entirely.
+Plain (non-TTY) mode is untouched by all of this: partials and mutes reach the terminal UI at
+every narration level, but plain output prints them only under `--debug-recognition`, so piped
+output stays character-identical.
 
 **Failures are visible.** A `DecodingState::Failed` from the recognizer becomes
 `RecognitionEvent::Failed`, coalesced to one event per run of failures (a decoder which cannot decode

@@ -226,7 +226,9 @@ listening: off
 Talk to it. Every utterance it recognizes appears as a `heard:` line, every command it matches appears as a `matched:`
 line named by the rule which matched — with whatever it captured in parentheses — and the exact key plan it *would*
 have played. Pressing your hotkey shows the listening state changing. Ctrl-C exits. In an interactive terminal the same
-information is drawn as a full-screen view instead; piped output stays line-oriented, exactly as above.
+information is drawn as a full-screen view instead — there each utterance appears **while you are still speaking it**
+(dim and italic until it settles) and turns green the instant a command fires; piped output stays line-oriented,
+exactly as above.
 
 Because it presses nothing, it is safe to run over a terminal you are reading — and because it needs no uinput
 permissions, you can rehearse a profile before you have finished setting your system up. It is also the quickest way to

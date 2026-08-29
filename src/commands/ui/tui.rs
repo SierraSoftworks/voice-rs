@@ -14,11 +14,13 @@
 //! ● listening: on  —  q to quit                            vosk-model-small-en-us-0.15
 //! ```
 //!
-//! A recognition is one entry which upgrades in place (see
-//! [`super::event::EventLog::push_at`]): grey while nothing has matched it,
-//! green with the command and its key plan once something has. The listening
-//! state is not logged at all — the footer shows it live, which is both fewer
-//! lines and more current.
+//! A recognition is one **live** entry (see
+//! [`super::event::EventLog::push_at`]): it appears — dim and italic — at the
+//! utterance's first partial, revises in place as the hypothesis grows, turns
+//! green the moment a command fires from it, and settles when the `Final`
+//! lands (or yellows when a mute abandons it). Grey-and-settled means "it
+//! heard me, nothing fired". The listening state is not logged at all — the
+//! footer shows it live, which is both fewer lines and more current.
 //!
 //! **Self-update.** Starting this UI also starts a background check for a newer
 //! release (see [`crate::update`] and DESIGN.md §"Self-update"); if it finds
@@ -993,6 +995,37 @@ mod tests {
         assert!(
             bottom.contains("the newest utterance"),
             "the newest entry's last line must be the bottom row: {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_live_utterance_is_on_screen_before_its_final() {
+        // The field-reported latency was presentation: matches used to wait
+        // for the Final before anything changed on screen. Now the utterance
+        // is drawn from its first partial and the match lands the moment it
+        // fires.
+        let mut app = App::new(overview());
+        app.record_at(
+            at(),
+            UiEvent::Hearing {
+                text: "auto cannon sentry".to_string(),
+                seq: 1,
+            },
+        );
+        app.record_at(
+            at(),
+            UiEvent::Matched {
+                name: "AutocannonSentry".to_string(),
+                plan: "5".to_string(),
+                utterance: Some(1),
+            },
+        );
+
+        let buffer = screen(&app, 90, 12);
+        assert!(
+            row(&buffer, 3).contains("\"auto cannon sentry\" → AutocannonSentry (5)"),
+            "the eager fire is visible with no Final in sight: {:?}",
+            row(&buffer, 3)
         );
     }
 

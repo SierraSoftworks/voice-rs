@@ -16,13 +16,15 @@
 //! which decides what an event *says*, and the mode only decides how it looks.
 //!
 //! The log is not a transcript of the stream, though: a recognition is **one**
-//! entry which upgrades in place, so an utterance and the command it resolved
-//! to share a line rather than filling two. See [`EventLog::push_at`].
+//! entry which lives through the utterance — created at its first partial,
+//! updated in place as the hypothesis grows, and settled by its `Final` (or
+//! abandoned by a mute) — so an utterance and the commands it resolved to
+//! share a line rather than filling several. See [`EventLog::push_at`].
 
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use tokio::sync::mpsc;
 
@@ -43,12 +45,15 @@ pub(crate) enum UiEvent {
     /// and mutes exactly as the matcher does, so this meets the stamp a
     /// [`UiEvent::Matched`] carries).
     Heard { text: String, seq: u64 },
-    /// A partial result on its way to becoming an utterance
-    /// (`--debug-recognition` only).
-    Hearing(String),
-    /// The recognizer was reset because the hotkey muted us
-    /// (`--debug-recognition` only).
-    Muted,
+    /// A partial result on its way to becoming an utterance, with the slot of
+    /// the utterance it belongs to (the one the stream has not closed yet).
+    /// The terminal UI opens (and live-updates) that utterance's entry from
+    /// these; plain mode prints them under `--debug-recognition` only.
+    Hearing { text: String, seq: u64 },
+    /// The recognizer was reset because the hotkey muted us, consuming
+    /// utterance slot `seq`. The terminal UI settles that slot's live entry
+    /// as abandoned; plain mode prints it under `--debug-recognition` only.
+    Muted { seq: u64 },
     /// A command matched: in `run` it is being played, in `test` it is what
     /// would have been played. `utterance` is the slot of the utterance the
     /// matcher heard it in, when the source knows it — the log uses it to put
@@ -85,8 +90,8 @@ impl UiEvent {
     pub(crate) fn plain_line(&self) -> String {
         match self {
             UiEvent::Heard { text, .. } => format!("heard: {text:?}"),
-            UiEvent::Hearing(text) => format!("hearing: {text:?}"),
-            UiEvent::Muted => "hearing: (muted)".to_string(),
+            UiEvent::Hearing { text, .. } => format!("hearing: {text:?}"),
+            UiEvent::Muted { .. } => "hearing: (muted)".to_string(),
             UiEvent::Matched { name, plan, .. } => format!("matched: {name:?} → {plan}"),
             UiEvent::Interrupted(name) => format!("interrupted: {name:?}"),
             UiEvent::Discarded(name) => format!("discarded: {name:?}"),
@@ -106,7 +111,7 @@ impl UiEvent {
         match self {
             UiEvent::Matched { .. } => Color::Green,
             UiEvent::Heard { .. } => Color::Gray,
-            UiEvent::Hearing(_) | UiEvent::Muted => Color::DarkGray,
+            UiEvent::Hearing { .. } | UiEvent::Muted { .. } => Color::DarkGray,
             UiEvent::Interrupted(_) | UiEvent::Discarded(_) | UiEvent::Warning(_) => Color::Yellow,
             UiEvent::Error(_) => Color::Red,
             UiEvent::Child { .. } => Color::White,
@@ -120,7 +125,7 @@ impl UiEvent {
     /// severity, so only the quietest and loudest events restyle their text.
     fn text_style(&self) -> Style {
         match self {
-            UiEvent::Hearing(_) | UiEvent::Muted => Style::new().fg(Color::DarkGray),
+            UiEvent::Hearing { .. } | UiEvent::Muted { .. } => Style::new().fg(Color::DarkGray),
             UiEvent::Child { .. } | UiEvent::ChildExited { .. } => Style::new().fg(Color::Gray),
             UiEvent::Warning(_) => Style::new().fg(Color::Yellow),
             UiEvent::Error(_) => Style::new().fg(Color::Red),
@@ -134,7 +139,7 @@ impl UiEvent {
     /// modes never disagree about what happened and the dot is a redundant
     /// (rather than the only) cue — colors alone are not something a report
     /// should depend on. The one exception is a recognition, which the log
-    /// merges into a single upgrading entry ([`Entry::Recognition`]).
+    /// merges into a single live entry ([`Entry::Recognition`]).
     fn line(&self, at: SystemTime) -> Line<'static> {
         log_line(at, self.color(), self.plain_line(), self.text_style())
     }
@@ -286,18 +291,36 @@ struct Resolved {
     plan: String,
 }
 
+/// Where a recognition entry is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Still being spoken: the text is a partial hypothesis the recognizer
+    /// may yet revise, drawn dim and italic so a guess never reads as a
+    /// transcript.
+    Live,
+    /// Finalized: the text is the settled transcript.
+    Settled,
+    /// Muted mid-utterance: the endpointer never finalized it, so the text
+    /// stays the last hypothesis and the entry says so.
+    Abandoned,
+}
+
 /// One line of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
-    /// A recognition: what was heard, and every command it resolved to. Starts
-    /// empty (grey) and upgrades in place (green) as the matcher resolves it —
-    /// an entry which never upgrades is the "it heard me but nothing fired"
-    /// signal a rehearsal exists to find.
+    /// A recognition: what is being (or was) heard, and every command it has
+    /// resolved to. Created **live** at the utterance's first partial, its
+    /// text updating in place as the hypothesis grows; matches attach the
+    /// moment they fire; the `Final` settles the text and style (or a mute
+    /// abandons it). An entry which settles without ever matching stays grey
+    /// — the "it heard me but nothing fired" signal a rehearsal exists to
+    /// find.
     Recognition {
         text: String,
-        /// The utterance slot this recognition closed, for meeting the
+        /// The utterance slot this recognition occupies, for meeting the
         /// matcher's stamps.
         seq: u64,
+        stage: Stage,
         matches: Vec<Resolved>,
     },
     /// Anything else, exactly as it was reported.
@@ -306,26 +329,57 @@ enum Entry {
 
 impl Entry {
     fn line(&self, at: SystemTime) -> Line<'static> {
-        match self {
-            Entry::Other(event) => event.line(at),
-            Entry::Recognition { text, matches, .. } if matches.is_empty() => {
-                log_line(at, Color::Gray, format!("{text:?}"), Style::new())
-            }
-            Entry::Recognition { text, matches, .. } => {
-                let resolved = matches
-                    .iter()
-                    .map(|m| format!("{} ({})", m.name, m.plan))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+        let Entry::Recognition {
+            text,
+            stage,
+            matches,
+            ..
+        } = self
+        else {
+            let Entry::Other(event) = self else {
+                unreachable!()
+            };
+            return event.line(at);
+        };
 
-                log_line(
-                    at,
-                    Color::Green,
-                    format!("{text:?} → {resolved}"),
-                    Style::new(),
-                )
-            }
+        // An abandoned entry says what happened to it; the others speak for
+        // themselves.
+        let mut said = match stage {
+            Stage::Abandoned => format!("{text:?} (muted)"),
+            _ => format!("{text:?}"),
+        };
+        if !matches.is_empty() {
+            let resolved = matches
+                .iter()
+                .map(|m| format!("{} ({})", m.name, m.plan))
+                .collect::<Vec<_>>()
+                .join(", ");
+            said = format!("{said} → {resolved}");
         }
+
+        // The dot keeps the severity vocabulary: green the moment anything
+        // fires, grey while nothing has, yellow for an utterance a mute cut
+        // short (the same color interrupted commands carry). The text style
+        // carries the *certainty*: a live hypothesis is dim and italic, a
+        // settled transcript is plain, an abandoned one stays dim.
+        let (dot, style) = match (stage, matches.is_empty()) {
+            (Stage::Live, true) => (
+                Color::DarkGray,
+                Style::new()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            (Stage::Live, false) => (
+                Color::Green,
+                Style::new()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            (Stage::Settled, true) => (Color::Gray, Style::new()),
+            (Stage::Settled, false) => (Color::Green, Style::new()),
+            (Stage::Abandoned, _) => (Color::Yellow, Style::new().fg(Color::DarkGray)),
+        };
+        log_line(at, dot, said, style)
     }
 }
 
@@ -334,12 +388,6 @@ impl Entry {
 pub(crate) struct EventLog {
     entries: VecDeque<(SystemTime, Entry)>,
     capacity: usize,
-    /// Matches which arrived before their utterance did — an eager fire
-    /// lands mid-utterance, before the `Final` is narrated — waiting to be
-    /// attached the moment that utterance's entry appears.
-    held: Vec<(u64, Resolved)>,
-    /// The newest utterance slot a recognition has been logged for.
-    last_heard: u64,
 }
 
 impl EventLog {
@@ -348,83 +396,100 @@ impl EventLog {
         Self {
             entries: VecDeque::new(),
             capacity: capacity.max(1),
-            held: Vec::new(),
-            last_heard: 0,
         }
     }
 
     /// Records an event at a given time, dropping the oldest entry if that
     /// takes the log past its capacity.
     ///
-    /// A recognition is **one** entry rather than two lines: the utterance
-    /// arrives first and is logged grey, and the match which resolves it
-    /// upgrades that same entry rather than appending under it. They meet by
-    /// **utterance sequence**: the matcher stamps every command with the slot
-    /// of the utterance it was heard in, and the narrator stamps every
-    /// recognition the same way, so the log never has to guess from order:
+    /// A recognition is **one** entry rather than a transcript of events: its
+    /// first partial creates the entry live, later partials revise its text
+    /// in place, its `Final` settles it (or a mute abandons it), and every
+    /// command it fires attaches the moment the match is reported. Events
+    /// meet by **utterance sequence**: the matcher stamps every command with
+    /// the slot of the utterance it was heard in, and the narrator stamps
+    /// every partial, recognition and mute the same way, so the log never has
+    /// to guess from order:
     ///
-    /// - a match whose utterance is already logged upgrades that entry, no
-    ///   matter how many later utterances have been heard since (the
-    ///   completion timeout regularly fires after the next utterance);
-    /// - a match whose utterance has *not* been heard yet — an eager fire
-    ///   mid-utterance — is **held** and attached when its `Final` lands, so
-    ///   it can never land on the previous utterance's line;
-    /// - a held match whose utterance can no longer arrive (a mute consumed
-    ///   the slot, so the narrator has moved past it) is logged on its own
-    ///   line once the next recognition proves it was skipped;
+    /// - a match lands on the entry with its own slot, no matter how many
+    ///   later utterances have been heard since (the completion timeout
+    ///   regularly fires after the next utterance) — and because the entry
+    ///   exists from the first partial, an eager fire is *visible the moment
+    ///   the keys press* rather than waiting for the `Final`;
+    /// - a `Final` for a slot with no live entry (partials suppressed, or the
+    ///   entry scrolled away) still gets its settled entry;
+    /// - a mute for a slot with no entry — listening turned off before
+    ///   anything was heard — logs nothing at all;
     /// - and a match with no stamp, or whose entry has scrolled away, is
     ///   logged on its own rather than dropped.
     pub(crate) fn push_at(&mut self, at: SystemTime, event: UiEvent) {
         match event {
-            UiEvent::Heard { text, seq } => {
-                // Anything held for an earlier slot missed its Final for good
-                // (a mute consumed that slot): the command still ran, so it
-                // gets its own line rather than vanishing.
-                let held = std::mem::take(&mut self.held);
-                let (ready, waiting): (Vec<_>, Vec<_>) =
-                    held.into_iter().partition(|(held_seq, _)| *held_seq <= seq);
-                self.held = waiting;
-
-                let mut matches = Vec::new();
-                for (held_seq, resolved) in ready {
-                    if held_seq == seq {
-                        matches.push(resolved);
-                    } else {
-                        self.push_standalone(at, resolved, Some(held_seq));
-                    }
+            UiEvent::Hearing { text, seq } => match self.recognition_with_seq(seq) {
+                // Only a live entry follows the hypothesis; partials cannot
+                // reopen a settled or abandoned slot.
+                Some(Entry::Recognition {
+                    text: entry_text,
+                    stage: Stage::Live,
+                    ..
+                }) => *entry_text = text,
+                Some(_) => {}
+                None => self.entries.push_back((
+                    at,
+                    Entry::Recognition {
+                        text,
+                        seq,
+                        stage: Stage::Live,
+                        matches: Vec::new(),
+                    },
+                )),
+            },
+            UiEvent::Heard { text, seq } => match self.recognition_with_seq(seq) {
+                Some(Entry::Recognition {
+                    text: entry_text,
+                    stage,
+                    ..
+                }) => {
+                    *entry_text = text;
+                    *stage = Stage::Settled;
                 }
-
-                self.entries
-                    .push_back((at, Entry::Recognition { text, seq, matches }));
-                self.last_heard = self.last_heard.max(seq);
+                _ => self.entries.push_back((
+                    at,
+                    Entry::Recognition {
+                        text,
+                        seq,
+                        stage: Stage::Settled,
+                        matches: Vec::new(),
+                    },
+                )),
+            },
+            UiEvent::Muted { seq } => {
+                // The mute abandons the slot's live entry, keeping whatever
+                // hypothesis (and fires) it had; an utterance muted before
+                // any partial was heard never existed as far as the log is
+                // concerned.
+                if let Some(Entry::Recognition {
+                    stage: stage @ Stage::Live,
+                    ..
+                }) = self.recognition_with_seq(seq)
+                {
+                    *stage = Stage::Abandoned;
+                }
             }
             UiEvent::Matched {
                 name,
                 plan,
                 utterance,
             } => {
-                let resolved = Resolved { name, plan };
-                match utterance {
-                    Some(seq) => {
-                        if let Some(matches) = self.recognition_with_seq(seq) {
-                            matches.push(resolved);
-                        } else if seq > self.last_heard {
-                            // The utterance is still being spoken: its Final
-                            // will follow, and the match waits for it.
-                            self.held.push((seq, resolved));
-                            // A session which never hears another Final must
-                            // not grow the holding pen without bound.
-                            if self.held.len() > self.capacity {
-                                let (held_seq, resolved) = self.held.remove(0);
-                                self.push_standalone(at, resolved, Some(held_seq));
-                            }
-                        } else {
-                            // The entry has scrolled out of the log; the
-                            // match must still be visible.
-                            self.push_standalone(at, resolved, Some(seq));
-                        }
-                    }
-                    None => self.push_standalone(at, resolved, None),
+                let mut resolved = Some(Resolved { name, plan });
+                if let Some(seq) = utterance
+                    && let Some(Entry::Recognition { matches, .. }) = self.recognition_with_seq(seq)
+                {
+                    matches.push(resolved.take().expect("the match attaches only once"));
+                }
+                // The entry has scrolled out of the log (or the source
+                // carried no stamp at all); the match must still be visible.
+                if let Some(resolved) = resolved {
+                    self.push_standalone(at, resolved, utterance);
                 }
             }
             other => self.entries.push_back((at, Entry::Other(other))),
@@ -448,20 +513,12 @@ impl EventLog {
         ));
     }
 
-    /// The match list of the logged recognition for utterance slot `seq`, if
-    /// it has not scrolled away.
-    fn recognition_with_seq(&mut self, seq: u64) -> Option<&mut Vec<Resolved>> {
-        self.entries
-            .iter_mut()
-            .rev()
-            .find_map(|(_, entry)| match entry {
-                Entry::Recognition {
-                    seq: entry_seq,
-                    matches,
-                    ..
-                } if *entry_seq == seq => Some(matches),
-                _ => None,
-            })
+    /// The logged recognition entry for utterance slot `seq`, if it has not
+    /// scrolled away.
+    fn recognition_with_seq(&mut self, seq: u64) -> Option<&mut Entry> {
+        self.entries.iter_mut().rev().map(|(_, entry)| entry).find(
+            |entry| matches!(entry, Entry::Recognition { seq: entry_seq, .. } if *entry_seq == seq),
+        )
     }
 
     /// How many entries are held. The UI never asks — it draws the tail it has
@@ -654,10 +711,18 @@ mod tests {
         }
     }
 
+    /// A partial hypothesis belonging to slot `seq`.
+    fn hearing(text: &str, seq: u64) -> UiEvent {
+        UiEvent::Hearing {
+            text: text.to_string(),
+            seq,
+        }
+    }
+
     #[rstest]
     #[case(heard("salute", 1), "heard: \"salute\"", Color::Gray)]
-    #[case(UiEvent::Hearing("sal".into()), "hearing: \"sal\"", Color::DarkGray)]
-    #[case(UiEvent::Muted, "hearing: (muted)", Color::DarkGray)]
+    #[case(hearing("sal", 1), "hearing: \"sal\"", Color::DarkGray)]
+    #[case(UiEvent::Muted { seq: 1 }, "hearing: (muted)", Color::DarkGray)]
     #[case(
         UiEvent::Matched { name: "Salute".into(), plan: "x".into(), utterance: Some(1) },
         "matched: \"Salute\" → x",
@@ -918,7 +983,7 @@ mod tests {
         assert_eq!(wrap_text(text, width), expected);
     }
 
-    // --- One entry per recognition ----------------------------------------
+    // --- The live recognition entry ----------------------------------------
 
     fn matched(name: &str, plan: &str, utterance: u64) -> UiEvent {
         UiEvent::Matched {
@@ -926,6 +991,206 @@ mod tests {
             plan: plan.to_string(),
             utterance: Some(utterance),
         }
+    }
+
+    /// The style of the newest entry's text span.
+    fn newest_style(log: &EventLog) -> Style {
+        let lines: Vec<Line<'static>> = log.tail(SCROLLBACK).collect();
+        lines.last().expect("the log has an entry").spans[4].style
+    }
+
+    #[test]
+    fn test_a_partial_creates_a_live_entry_and_later_partials_revise_it() {
+        // Realtime feedback: the utterance is on screen from its very first
+        // partial, dim and italic so a hypothesis never reads as a settled
+        // transcript.
+        let mut log = EventLog::new(SCROLLBACK);
+
+        log.push_at(at(), hearing("auto", 1));
+        assert_eq!(
+            rendered(&log),
+            vec![(Color::DarkGray, "\"auto\"".to_string())],
+            "the first partial opens the entry"
+        );
+        assert!(
+            newest_style(&log).add_modifier.contains(Modifier::ITALIC),
+            "a live hypothesis is italic"
+        );
+
+        // A changed hypothesis revises the same entry rather than adding one.
+        log.push_at(at(), hearing("auto cannon", 1));
+        assert_eq!(
+            rendered(&log),
+            vec![(Color::DarkGray, "\"auto cannon\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_the_final_settles_the_live_entry() {
+        let mut log = EventLog::new(SCROLLBACK);
+        log.push_at(at(), hearing("deploy the", 1));
+        log.push_at(at(), heard("deploy the thing", 1));
+
+        // The finalized transcript replaces the hypothesis, the style
+        // settles, and an unmatched final stays grey — the "it heard me but
+        // nothing fired" signal keeps its meaning.
+        assert_eq!(
+            rendered(&log),
+            vec![(Color::Gray, "\"deploy the thing\"".to_string())]
+        );
+        assert_eq!(
+            newest_style(&log),
+            Style::new(),
+            "a settled transcript drops the live styling"
+        );
+
+        // And a late partial for a settled slot cannot reopen it.
+        log.push_at(at(), hearing("stray", 1));
+        assert_eq!(
+            rendered(&log),
+            vec![(Color::Gray, "\"deploy the thing\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_an_eager_match_attaches_to_the_live_entry_the_moment_it_fires() {
+        // The field-measured latency: the engine fires an unambiguous phrase
+        // ~600ms before its Final. The entry exists from the first partial,
+        // so the fire is visible immediately — nothing waits for the
+        // endpointer.
+        let mut log = EventLog::new(SCROLLBACK);
+        log.push_at(at(), hearing("auto cannon sentry", 1));
+        log.push_at(at(), matched("AutocannonSentry", "5", 1));
+
+        assert_eq!(
+            rendered(&log),
+            vec![(
+                Color::Green,
+                "\"auto cannon sentry\" → AutocannonSentry (5)".to_string()
+            )],
+            "the fire lands on the live entry at once"
+        );
+        assert!(
+            newest_style(&log).add_modifier.contains(Modifier::ITALIC),
+            "the text is still a hypothesis until the Final settles it"
+        );
+
+        // The Final then settles text and style, keeping the match.
+        log.push_at(at(), heard("auto cannon sentry", 1));
+        assert_eq!(
+            rendered(&log),
+            vec![(
+                Color::Green,
+                "\"auto cannon sentry\" → AutocannonSentry (5)".to_string()
+            )]
+        );
+        assert_eq!(newest_style(&log), Style::new());
+    }
+
+    #[test]
+    fn test_a_mute_settles_a_live_entry_as_abandoned() {
+        // Muted mid-utterance: the hypothesis text is kept, the entry says
+        // what happened to it, and the interrupted-yellow vocabulary marks
+        // it. An eager fire it had already attached stays visible — the keys
+        // pressed, and pretending otherwise would be a lie.
+        let mut log = EventLog::new(SCROLLBACK);
+        log.push_at(at(), hearing("deploy sentry reload", 1));
+        log.push_at(at(), matched("DeploySentry", "6", 1));
+        log.push_at(at(), UiEvent::Muted { seq: 1 });
+
+        assert_eq!(
+            rendered(&log),
+            vec![(
+                Color::Yellow,
+                "\"deploy sentry reload\" (muted) → DeploySentry (6)".to_string()
+            )]
+        );
+
+        // An unmatched live entry abandons the same way, minus the match.
+        let mut log = EventLog::new(SCROLLBACK);
+        log.push_at(at(), hearing("auto can", 1));
+        log.push_at(at(), UiEvent::Muted { seq: 1 });
+        assert_eq!(
+            rendered(&log),
+            vec![(Color::Yellow, "\"auto can\" (muted)".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_a_mute_before_any_partial_logs_nothing() {
+        // Listening toggled off between utterances: the slot closes on the
+        // narrator's count, but there was never anything to show for it.
+        let mut log = EventLog::new(SCROLLBACK);
+        log.push_at(at(), UiEvent::Muted { seq: 1 });
+
+        assert!(log.is_empty(), "an unheard mute must not invent an entry");
+    }
+
+    #[test]
+    fn test_interleaved_utterances_stay_correctly_attributed() {
+        // Entry N live while entry N-1 is settled: the completion-timeout
+        // interleaving, with the next utterance already being spoken when the
+        // previous one's match fires. Every event carries its slot, so
+        // nothing lands one line up.
+        let mut log = EventLog::new(SCROLLBACK);
+        log.push_at(at(), hearing("autocannon", 1));
+        log.push_at(at(), heard("autocannon", 1)); // settled, still unmatched
+        log.push_at(at(), hearing("re", 2)); // the next one is live
+        log.push_at(at(), matched("Autocannon", "4", 1)); // timeout fire for 1
+        log.push_at(at(), hearing("reload", 2));
+        log.push_at(at(), matched("Reload", "r", 2)); // eager fire for 2
+        log.push_at(at(), heard("reload", 2));
+
+        assert_eq!(
+            rendered(&log),
+            vec![
+                (Color::Green, "\"autocannon\" → Autocannon (4)".to_string()),
+                (Color::Green, "\"reload\" → Reload (r)".to_string()),
+            ],
+            "each match lands on the utterance which produced it"
+        );
+    }
+
+    #[test]
+    fn test_the_field_transcripts_render_correctly() {
+        // The two recordings from the field report, replayed as the narrator
+        // and reporter emit them (timings measured in
+        // src/matcher/recorded.rs): the unambiguous phrase fires off its
+        // stable partial well before its Final, and the ambiguous prefix
+        // fires off its armed completion timeout — also before its Final.
+        let mut log = EventLog::new(SCROLLBACK);
+
+        // "auto cannon sentry.wav"
+        log.push_at(at(), hearing("auto", 1)); // 1.300s
+        log.push_at(at(), hearing("auto cannon", 1)); // 1.500s
+        log.push_at(at(), hearing("auto cannon sentry", 1)); // 2.000s
+        log.push_at(at(), matched("AutocannonSentry", "5", 1)); // 2.102s
+        assert_eq!(
+            rendered(&log),
+            vec![(
+                Color::Green,
+                "\"auto cannon sentry\" → AutocannonSentry (5)".to_string()
+            )],
+            "the fire is visible ~600ms before the Final arrives"
+        );
+        log.push_at(at(), heard("auto cannon sentry", 1)); // 2.700s
+
+        // "auto cannon.wav"
+        log.push_at(at(), hearing("auto", 2)); // 1.003s
+        log.push_at(at(), hearing("auto cannon", 2)); // 1.303s
+        log.push_at(at(), matched("Autocannon", "4", 2)); // 1.805s
+        log.push_at(at(), heard("auto cannon", 2)); // 2.003s
+
+        assert_eq!(
+            rendered(&log),
+            vec![
+                (
+                    Color::Green,
+                    "\"auto cannon sentry\" → AutocannonSentry (5)".to_string()
+                ),
+                (Color::Green, "\"auto cannon\" → Autocannon (4)".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -991,30 +1256,18 @@ mod tests {
     }
 
     #[test]
-    fn test_an_eager_match_waits_for_its_own_utterance() {
-        // The field transcript: with eager firing, a command lands *before*
-        // its utterance's Final is narrated. It must be held for that entry —
-        // attaching it to the previous utterance painted a partial as a
-        // completed command and cascaded every later match one line up.
+    fn test_a_match_for_an_unheard_slot_never_lands_on_the_previous_entry() {
+        // A match whose slot has no entry at all — its partials were never
+        // reported (a scrolled log, a source with no live narration). It must
+        // be visible, but on its own line: attaching it to the previous
+        // utterance painted a partial as a completed command and cascaded
+        // every later match one line up, which is the bug the sequence
+        // stamps exist to prevent.
         let mut log = EventLog::new(SCROLLBACK);
         log.push_at(at(), heard("auto cannon sentry", 1));
         log.push_at(at(), matched("AutocannonSentry", "down up right", 1));
-
-        // Utterance 2's eager fire arrives while entry 1 is already green
-        // and entry 2 does not exist yet: nothing may be logged for it.
         log.push_at(at(), matched("Autocannon", "down left down", 2));
-        assert_eq!(
-            rendered(&log),
-            vec![(
-                Color::Green,
-                "\"auto cannon sentry\" → AutocannonSentry (down up right)".to_string()
-            )],
-            "an eager fire is held until its utterance lands"
-        );
 
-        // The Final lands: the held match upgrades the new entry, not the
-        // old one.
-        log.push_at(at(), heard("auto cannon", 2));
         assert_eq!(
             rendered(&log),
             vec![
@@ -1024,32 +1277,10 @@ mod tests {
                 ),
                 (
                     Color::Green,
-                    "\"auto cannon\" → Autocannon (down left down)".to_string()
+                    "matched: \"Autocannon\" → down left down".to_string()
                 ),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_a_held_match_whose_utterance_was_muted_away_gets_its_own_line() {
-        // An eager fire followed by a mute: slot 2 never finalizes, so its
-        // Final never arrives. The command still ran — when the next
-        // recognition proves the slot was skipped, the held match is logged
-        // on its own rather than vanishing (or stealing the newer entry).
-        let mut log = EventLog::new(SCROLLBACK);
-        log.push_at(at(), heard("salute", 1));
-        log.push_at(at(), matched("Salute", "x", 1));
-        log.push_at(at(), matched("DeploySentry", "6", 2)); // then muted away
-        log.push_at(at(), heard("reload", 3));
-        log.push_at(at(), matched("Reload", "r", 3));
-
-        assert_eq!(
-            rendered(&log),
-            vec![
-                (Color::Green, "\"salute\" → Salute (x)".to_string()),
-                (Color::Green, "matched: \"DeploySentry\" → 6".to_string()),
-                (Color::Green, "\"reload\" → Reload (r)".to_string()),
-            ]
+            ],
+            "the stray match keeps its own line rather than stealing entry 1"
         );
     }
 
