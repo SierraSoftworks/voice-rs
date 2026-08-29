@@ -45,6 +45,17 @@ pub(crate) fn render_plan(output: &CompiledOutput) -> String {
                     chord.clear();
                 }
             }
+            KeyEvent::ReleaseAll => {
+                // Everything outstanding goes up at once, so whatever chord was
+                // being assembled ends here whether or not it was balanced.
+                if !chord.is_empty() {
+                    steps.push(render_chord(&chord));
+                    chord.clear();
+                    holding = 0;
+                }
+
+                steps.push("(release everything)".to_string());
+            }
             KeyEvent::Wait(_) => {}
         }
     }
@@ -148,6 +159,22 @@ mod tests {
                 KeyEvent::Up(key("x")),
             ])),
             "x"
+        );
+    }
+
+    #[test]
+    fn test_release_everything_closes_the_chord_it_lets_go_of() {
+        assert_eq!(
+            render_plan(&CompiledOutput::Keyboard(vec![
+                KeyEvent::Down(key("w")),
+                KeyEvent::ReleaseAll,
+            ])),
+            "w (release everything)"
+        );
+        assert_eq!(
+            render_plan(&CompiledOutput::Keyboard(vec![KeyEvent::ReleaseAll])),
+            "(release everything)",
+            "a panic command holds nothing of its own, and still says what it does"
         );
     }
 

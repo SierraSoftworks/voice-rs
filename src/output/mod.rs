@@ -36,7 +36,6 @@ pub use uinput::UinputSink as PlatformSink;
 
 use crate::Error;
 use crate::matcher::CommandAction;
-use std::collections::HashSet;
 use std::future::Future;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -56,6 +55,12 @@ pub enum KeyEvent {
     Down(KeyCode),
     Up(KeyCode),
     Wait(std::time::Duration),
+    /// Release every key the virtual keyboard is currently holding — the
+    /// grammar's `release(*)`, which is what makes a panic command possible
+    /// (DESIGN.md §"Command semantics"). Plays from the executor's own tracked
+    /// set, so it lets go of keys held by *earlier* commands too, and does
+    /// nothing at all when nothing is held.
+    ReleaseAll,
 }
 
 /// The seam between the executor and the virtual keyboard.
@@ -142,6 +147,50 @@ impl Interrupt {
     }
 }
 
+/// The keys the virtual keyboard is holding down, in the order they went down.
+///
+/// Press order is kept because every path which lets go of the whole set at
+/// once — `release(*)`, an interrupt, shutdown — releases in the reverse of it,
+/// so a modifier outlives the key it modifies exactly as a chord's own releases
+/// do. A `Vec` rather than a `HashSet` for that reason alone: a virtual
+/// keyboard never holds more than a handful of keys, so the linear scans cost
+/// nothing and the ordering is the whole point.
+#[derive(Debug, Default)]
+struct HeldKeys(Vec<KeyCode>);
+
+impl HeldKeys {
+    /// Records that `key` is now down. Pressing a key which is already held
+    /// keeps its original position, so it is still released in press order.
+    fn pressed(&mut self, key: KeyCode) {
+        if !self.0.contains(&key) {
+            self.0.push(key);
+        }
+    }
+
+    /// Records that `key` is no longer down.
+    fn released(&mut self, key: KeyCode) {
+        if let Some(position) = self.0.iter().position(|held| *held == key) {
+            self.0.remove(position);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Empties the set, handing back the keys in the order they must be
+    /// released: the reverse of the order they were pressed.
+    fn take(&mut self) -> Vec<KeyCode> {
+        let mut keys = std::mem::take(&mut self.0);
+        keys.reverse();
+        keys
+    }
+}
+
 /// Plays command output plans from the command queue onto `sink`.
 ///
 /// Runs until the queue closes or `cancel` fires, and **always** releases every
@@ -159,7 +208,7 @@ pub async fn executor<S: KeySink>(
     cancel: CancellationToken,
     mut interrupt: Interrupt,
 ) -> Result<(), Error> {
-    let mut held: HashSet<KeyCode> = HashSet::new();
+    let mut held = HeldKeys::default();
 
     let outcome = loop {
         let action = tokio::select! {
@@ -235,7 +284,7 @@ enum Played {
 /// releases whatever is still held either way.
 async fn play<S: KeySink>(
     sink: &mut S,
-    held: &mut HashSet<KeyCode>,
+    held: &mut HeldKeys,
     plan: &[KeyEvent],
     cancel: &CancellationToken,
     interrupt: &mut Interrupt,
@@ -253,12 +302,20 @@ async fn play<S: KeySink>(
             KeyEvent::Down(key) => {
                 sink.press(key).await?;
                 sink.synchronize().await?;
-                held.insert(key);
+                held.pressed(key);
             }
             KeyEvent::Up(key) => {
                 sink.release(key).await?;
                 sink.synchronize().await?;
-                held.remove(&key);
+                held.released(key);
+            }
+            KeyEvent::ReleaseAll => {
+                debug!(
+                    keys = held.len(),
+                    "Releasing the {} key(s) currently held down.",
+                    held.len()
+                );
+                release_held(sink, held).await?;
             }
             KeyEvent::Wait(duration) => {
                 tokio::select! {
@@ -294,28 +351,37 @@ fn discard_queued(queue: &mut mpsc::Receiver<CommandAction>) -> usize {
     discarded
 }
 
-/// Releases every key which is still held down and flushes the device.
+/// Releases every key which is *still* held down and flushes the device.
 ///
-/// Used both on the way out and when an interrupt cuts a plan short, so the
-/// message says what happened rather than why. Keys are released in ascending
-/// code order so the emitted sequence is deterministic regardless of `HashSet`
-/// iteration order.
-async fn release_all<S: KeySink>(sink: &mut S, held: &mut HashSet<KeyCode>) -> Result<(), Error> {
+/// Used both on the way out and when an interrupt cuts a plan short — neither
+/// is something a well-written plan should need, hence the warning; the
+/// deliberate [`KeyEvent::ReleaseAll`] goes to [`release_held`] directly.
+async fn release_all<S: KeySink>(sink: &mut S, held: &mut HeldKeys) -> Result<(), Error> {
     if held.is_empty() {
         return Ok(());
     }
 
-    let mut pending: Vec<KeyCode> = held.drain().collect();
-    pending.sort_unstable();
-
     warn!(
-        keys = pending.len(),
+        keys = held.len(),
         "Releasing {} key(s) which were still held down.",
-        pending.len()
+        held.len()
     );
 
+    release_held(sink, held).await
+}
+
+/// Lets go of everything the virtual keyboard holds, newest key first.
+///
+/// Releasing in the reverse of press order keeps a modifier held until the keys
+/// it modifies are up, which is what a game (and the X server) expects to see.
+/// Holding nothing is a no-op: no releases, and no flush of an empty batch.
+async fn release_held<S: KeySink>(sink: &mut S, held: &mut HeldKeys) -> Result<(), Error> {
+    if held.is_empty() {
+        return Ok(());
+    }
+
     let mut result = Ok(());
-    for key in pending {
+    for key in held.take() {
         // Keep going even if one release fails: a stuck key is worse than a
         // duplicated error, and we want to free as many as we can.
         if let Err(e) = sink.release(key).await
@@ -582,10 +648,6 @@ mod tests {
 
         // `w` and `leftshift` go down and stay down: a sprint-forward macro.
         let (w, shift) = (key("w"), key("leftshift"));
-        assert!(
-            w < shift,
-            "the release order assertion assumes w < leftshift"
-        );
 
         tx.send(action(
             "sprint forward",
@@ -618,10 +680,10 @@ mod tests {
             vec![
                 SinkEvent::Press(w),
                 SinkEvent::Press(shift),
-                SinkEvent::Release(w),
                 SinkEvent::Release(shift),
+                SinkEvent::Release(w),
             ],
-            "both held keys must be released on cancellation"
+            "both held keys must be released on cancellation, newest first"
         );
         assert_eq!(
             sink.all().last(),
@@ -679,6 +741,112 @@ mod tests {
         );
     }
 
+    // --- `release(*)` -----------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn release_all_lets_go_in_reverse_press_order() {
+        let (tx, rx) = mpsc::channel(4);
+        let sink = FakeSink::default();
+        let (w, shift, a) = (key("w"), key("leftshift"), key("a"));
+
+        tx.send(action(
+            "stand down",
+            vec![
+                KeyEvent::Down(w),
+                KeyEvent::Down(shift),
+                KeyEvent::Down(a),
+                KeyEvent::Wait(Duration::from_millis(30)),
+                KeyEvent::ReleaseAll,
+            ],
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let origin = Instant::now();
+        executor(rx, sink.clone(), CancellationToken::new(), Interrupt::Never)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.keys(),
+            vec![
+                SinkEvent::Press(w),
+                SinkEvent::Press(shift),
+                SinkEvent::Press(a),
+                SinkEvent::Release(a),
+                SinkEvent::Release(shift),
+                SinkEvent::Release(w),
+            ],
+            "the keys must come up in the reverse of the order they went down"
+        );
+        assert_eq!(
+            sink.key_offsets(origin).last(),
+            Some(&Duration::from_millis(30)),
+            "a release-everything is immediate; it adds no pacing of its own"
+        );
+        assert_eq!(
+            sink.all().last(),
+            Some(&SinkEvent::Synchronize),
+            "the releases must be flushed to the device"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_all_with_nothing_held_does_nothing() {
+        let (tx, rx) = mpsc::channel(4);
+        let sink = FakeSink::default();
+
+        tx.send(action("panic", vec![KeyEvent::ReleaseAll]))
+            .await
+            .unwrap();
+        drop(tx);
+
+        executor(rx, sink.clone(), CancellationToken::new(), Interrupt::Never)
+            .await
+            .unwrap();
+
+        assert!(
+            sink.all().is_empty(),
+            "a panic command with nothing to release must not even flush the device"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_all_frees_keys_an_earlier_command_left_held() {
+        let (tx, rx) = mpsc::channel(4);
+        let sink = FakeSink::default();
+        let (w, shift) = (key("w"), key("leftshift"));
+
+        // The whole point of a panic command: it lets go of the sprint some
+        // *other* command started.
+        tx.send(action(
+            "sprint forward",
+            vec![KeyEvent::Down(w), KeyEvent::Down(shift)],
+        ))
+        .await
+        .unwrap();
+        tx.send(action("panic", vec![KeyEvent::ReleaseAll]))
+            .await
+            .unwrap();
+        drop(tx);
+
+        executor(rx, sink.clone(), CancellationToken::new(), Interrupt::Never)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.keys(),
+            vec![
+                SinkEvent::Press(w),
+                SinkEvent::Press(shift),
+                SinkEvent::Release(shift),
+                SinkEvent::Release(w),
+            ],
+            "the panic command releases the hold, and the shutdown finds nothing left to free"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn returns_immediately_when_cancelled_while_idle() {
         let (_tx, rx) = mpsc::channel::<CommandAction>(4);
@@ -714,10 +882,6 @@ mod tests {
         let (listening_tx, listening_rx) = watch::channel(true);
 
         let (w, shift, x) = (key("w"), key("leftshift"), key("x"));
-        assert!(
-            w < shift,
-            "the release order assertion assumes w < leftshift"
-        );
 
         tx.send(action("sprint forward", long_hold(w, shift)))
             .await
@@ -750,8 +914,8 @@ mod tests {
             vec![
                 SinkEvent::Press(w),
                 SinkEvent::Press(shift),
-                SinkEvent::Release(w),
                 SinkEvent::Release(shift),
+                SinkEvent::Release(w),
             ],
             "both held keys must be released, and the rest of the plan skipped"
         );
@@ -776,8 +940,8 @@ mod tests {
             vec![
                 SinkEvent::Press(w),
                 SinkEvent::Press(shift),
-                SinkEvent::Release(w),
                 SinkEvent::Release(shift),
+                SinkEvent::Release(w),
                 // The command queued behind the interrupted one was discarded,
                 // so 'x' is pressed exactly once — by the command which came
                 // after listening resumed.
@@ -912,8 +1076,8 @@ mod tests {
             vec![
                 SinkEvent::Press(w),
                 SinkEvent::Press(shift),
-                SinkEvent::Release(w),
                 SinkEvent::Release(shift),
+                SinkEvent::Release(w),
             ],
             "the interrupt releases the held keys, and the shutdown must not release them again"
         );
