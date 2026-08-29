@@ -21,31 +21,41 @@ use crate::audio;
 use crate::config::{
     MODEL_PATH_ENV, Profile, ResolvedSettings, SystemConfig, loader, resolve_model, system,
 };
+#[cfg(target_os = "linux")]
 use crate::hotkey::discover_device;
+use crate::output::KeyCode;
+#[cfg(target_os = "linux")]
 use crate::output::{UinputSink, keys};
 use crate::recognition::libvosk;
 
 /// The device node the virtual keyboard is created on.
+#[cfg(target_os = "linux")]
 pub(crate) const UINPUT_PATH: &str = "/dev/uinput";
 
 /// Where the kernel exposes evdev device nodes.
+#[cfg(target_os = "linux")]
 const INPUT_DIR: &str = "/dev/input";
 
 /// The group which owns both `/dev/uinput` and `/dev/input/event*`.
+#[cfg(target_os = "linux")]
 pub(crate) const INPUT_GROUP: &str = "input";
 
 /// The group database we read configured membership from.
+#[cfg(target_os = "linux")]
 pub(crate) const GROUP_FILE: &str = "/etc/group";
 
 /// The name the doctor's throwaway virtual keyboard is created under, so that
 /// it cannot be confused with a running `voice-orders run`.
+#[cfg(target_os = "linux")]
 const PROBE_DEVICE_NAME: &str = "voice-orders-doctor";
 
 /// The `hotkey.device` value which asks discovery to pick a device for us.
+#[cfg(target_os = "linux")]
 const AUTO_DEVICE: &str = "auto";
 
 /// The key we ask discovery to find a device for when there is no profile to
 /// tell us which one matters: every keyboard has a left control.
+#[cfg(target_os = "linux")]
 const PROBE_KEY: &str = "leftctrl";
 
 /// The relative path which distinguishes a dynamic-graph model (which can be
@@ -53,12 +63,14 @@ const PROBE_KEY: &str = "leftctrl";
 const DYNAMIC_GRAPH: &str = "graph/Gr.fst";
 
 /// Advice for everything `voice-orders setup` knows how to fix.
+#[cfg(target_os = "linux")]
 const SETUP_ADVICE: &[&str] = &[
     "Run 'voice-orders setup' to apply the missing system configuration, or 'voice-orders setup --print' to see the commands and run them yourself.",
     "See the permissions guide at https://sierrasoftworks.github.io/voice-rs/guide/permissions.html for what each step does.",
 ];
 
 /// Advice for a group membership which is configured but not yet in effect.
+#[cfg(target_os = "linux")]
 const RELOGIN_ADVICE: &[&str] = &[
     "Log out and back in (or reboot) — group membership is attached to your session when you log in, so a shell or desktop session which started earlier is still denied.",
     "'id -nG' will list 'input' once the change has taken effect.",
@@ -171,14 +183,15 @@ pub async fn run(args: DoctorArgs) -> Result<i32, crate::Error> {
 
     println!("{}\n", system_summary(&system));
 
-    let mut results = vec![
-        check_uinput_node(Path::new(UINPUT_PATH)),
-        check_virtual_keyboard().await,
-        check_input_access(),
+    // Checks 1–3 are about how this platform gets keys in and out of the
+    // kernel, which is the one part of the diagnosis with nothing in common
+    // between Linux and Windows.
+    let mut results = platform_checks().await;
+    results.extend([
         check_audio_input(audio_device(settings.as_ref(), &system)),
         check_libvosk(),
         check_model(resolve(args.model.as_deref(), profile, &system)),
-    ];
+    ]);
 
     if let Some(loaded) = &loaded {
         results.push(check_profile(loaded, settings.as_ref()));
@@ -277,10 +290,54 @@ fn resolve(
         })
 }
 
+// ── Checks 1–3: this platform's input plumbing ──────────────────────────────
+
+/// Checks 1–3 on Linux: the `uinput` node, a virtual keyboard, and `input`
+/// group membership with a readable `/dev/input/event*`.
+#[cfg(target_os = "linux")]
+async fn platform_checks() -> Vec<CheckResult> {
+    vec![
+        check_uinput_node(Path::new(UINPUT_PATH)),
+        check_virtual_keyboard().await,
+        check_input_access(),
+    ]
+}
+
+/// Checks 1–3 on Windows.
+///
+/// The first is genuinely good news — nothing has to be configured, which is
+/// the whole of what the Linux checks 1 and 3 are about — and the other two
+/// are honest failures rather than reassuring silence: this build cannot press
+/// keys (W2) and cannot watch for a hotkey (W3), and a `doctor` which said
+/// otherwise would be lying about what a `run` would do.
+#[cfg(not(target_os = "linux"))]
+async fn platform_checks() -> Vec<CheckResult> {
+    /// Advice for the parts of the Windows port which are not finished.
+    const UNFINISHED_ADVICE: &[&str] = &[
+        "This is a preview build of the Windows port: profiles load, the model and microphone can be checked, but input is not wired up yet.",
+        "On Linux, voice-orders is feature complete — see https://sierrasoftworks.github.io/voice-rs/ for the installation guide.",
+    ];
+
+    vec![
+        CheckResult::ok(
+            "Windows needs no drivers, kernel modules or group membership for voice-orders: keyboard output goes through SendInput and the listen hotkey through a low-level keyboard hook.",
+        ),
+        CheckResult::failed(
+            "Keyboard output is not implemented in this Windows build yet, so voice-orders cannot press keys for you.",
+            UNFINISHED_ADVICE,
+        ),
+        CheckResult::failed(
+            "The global listen hotkey is not implemented in this Windows build yet, so voice-orders cannot watch for your listen key.",
+            UNFINISHED_ADVICE,
+        ),
+    ]
+}
+
 // ── Check 1: the device node ────────────────────────────────────────────────
 
 /// Whether `/dev/uinput` exists at all — which is to say, whether the `uinput`
 /// kernel module is loaded.
+#[cfg(target_os = "linux")]
 pub(crate) fn check_uinput_node(path: &Path) -> CheckResult {
     if path.exists() {
         return CheckResult::ok(format!("{} exists.", path.display()));
@@ -297,6 +354,7 @@ pub(crate) fn check_uinput_node(path: &Path) -> CheckResult {
 
 // ── Check 2: creating a virtual keyboard ────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 /// Creates a virtual keyboard and immediately destroys it.
 ///
 /// This is the definitive permissions test: everything else about `/dev/uinput`
@@ -316,6 +374,7 @@ pub(crate) async fn check_virtual_keyboard() -> CheckResult {
 
 // ── Check 3: input group membership and readable devices ────────────────────
 
+#[cfg(target_os = "linux")]
 /// The `input` line of `/etc/group`, as far as we care about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputGroup {
@@ -325,6 +384,7 @@ pub(crate) struct InputGroup {
     pub members: Vec<String>,
 }
 
+#[cfg(target_os = "linux")]
 /// How the `input` group stands for this user, right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GroupState {
@@ -338,6 +398,7 @@ pub(crate) enum GroupState {
     Effective,
 }
 
+#[cfg(target_os = "linux")]
 /// Parses the `input` line out of an `/etc/group` file.
 ///
 /// The format is `name:password:gid:member,member,…`; anything which is not the
@@ -364,12 +425,14 @@ pub(crate) fn parse_input_group(content: &str) -> Option<InputGroup> {
     })
 }
 
+#[cfg(target_os = "linux")]
 /// Whether `/etc/group` lists this user as a member of the `input` group —
 /// what `setup` needs to know, since it is what `usermod -aG` changes.
 pub(crate) fn is_configured(group: Option<&InputGroup>, username: &str) -> bool {
     group.is_some_and(|group| group.members.iter().any(|member| member == username))
 }
 
+#[cfg(target_os = "linux")]
 /// Compares the configured membership against the one this session actually
 /// has, which is the distinction people trip over: `usermod` takes effect at
 /// the next login, not immediately.
@@ -393,6 +456,7 @@ pub(crate) fn group_state(
     }
 }
 
+#[cfg(target_os = "linux")]
 /// The user we are configuring, from `$USER` and then `$LOGNAME`.
 pub(crate) fn current_username() -> Result<String, crate::Error> {
     for variable in ["USER", "LOGNAME"] {
@@ -411,6 +475,7 @@ pub(crate) fn current_username() -> Result<String, crate::Error> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 /// The group ids this process actually carries — the *effective* membership,
 /// as opposed to the one `/etc/group` has been configured with.
 pub(crate) fn effective_gids() -> Vec<u32> {
@@ -445,6 +510,7 @@ pub(crate) fn effective_gids() -> Vec<u32> {
     gids
 }
 
+#[cfg(target_os = "linux")]
 /// Group membership *and* at least one readable keyboard, as one check: the
 /// membership is the cause and the readable device is the effect, so reporting
 /// them separately would only ever say the same thing twice.
@@ -470,6 +536,7 @@ fn check_input_access() -> CheckResult {
     )
 }
 
+#[cfg(target_os = "linux")]
 /// Renders check 3 from its two inputs, so every combination of them can be
 /// exercised without a `/dev/input` to enumerate.
 fn input_access_check(
@@ -508,6 +575,7 @@ fn input_access_check(
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Asks the hotkey discovery path, exactly as `run` would, whether there is a
 /// keyboard under `/dev/input` we are allowed to read.
 ///
@@ -654,24 +722,49 @@ fn check_profile(
         ));
     };
 
-    match discover_device(&hotkey.device, hotkey.key.code()) {
+    match resolve_hotkey_device(&hotkey.device, hotkey.key.code()) {
         Ok(device) => CheckResult::ok(format!(
             "The profile '{name}' loads, and its listen hotkey ({} in {} mode) resolves to '{}'.",
-            hotkey.key,
-            hotkey.mode,
-            device.name().unwrap_or("<unnamed device>")
+            hotkey.key, hotkey.mode, device
         )),
         Err(e) => CheckResult::from_error(&e),
     }
 }
 
+/// The name of the device a merged hotkey resolves to.
+///
+/// Goes through the same discovery a real run does, so the report cannot claim
+/// a device `run` would not find.
+#[cfg(target_os = "linux")]
+fn resolve_hotkey_device(device: &str, key: KeyCode) -> Result<String, crate::Error> {
+    discover_device(device, key)
+        .map(|device| device.name().unwrap_or("<unnamed device>").to_string())
+}
+
+/// On Windows there is no per-device hotkey to resolve yet: the low-level
+/// keyboard hook which replaces evdev is system-wide, and it lands in W3.
+#[cfg(not(target_os = "linux"))]
+fn resolve_hotkey_device(_device: &str, _key: KeyCode) -> Result<String, crate::Error> {
+    Err(human_errors::user(
+        "This profile configures a listen hotkey, which is not implemented in this Windows build yet.",
+        &[
+            "The global listen hotkey is being added in a later phase of the Windows port; leave the 'hotkey:' block out of your profile to have voice-orders listen continuously instead.",
+            "On Linux, voice-orders is feature complete — see https://sierrasoftworks.github.io/voice-rs/ for the installation guide.",
+        ],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Every table-driven test here is one of the `/etc/group` ones, which only
+    // Linux has.
+    #[cfg(target_os = "linux")]
     use rstest::rstest;
 
     /// An `/etc/group` with the shape a real one has: other groups around the
     /// one we care about, and a trailing member list.
+    #[cfg(target_os = "linux")]
     const GROUP_FILE_CONTENT: &str =
         "root:x:0:\naudio:x:995:alice\ninput:x:992:alice,bob\nwheel:x:998:alice\n";
 
@@ -727,6 +820,7 @@ mod tests {
         assert_eq!(result.advice, vec!["Try the other thing.".to_string()]);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_a_missing_uinput_node_blames_the_module() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -750,6 +844,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_an_existing_uinput_node_passes() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -761,6 +856,7 @@ mod tests {
         assert!(result.headline.contains("exists"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_the_input_group_is_parsed_out_of_the_file() {
         let group = parse_input_group(GROUP_FILE_CONTENT).expect("the group should be found");
@@ -769,6 +865,7 @@ mod tests {
         assert_eq!(group.members, vec!["alice".to_string(), "bob".to_string()]);
     }
 
+    #[cfg(target_os = "linux")]
     #[rstest]
     #[case::no_input_group("root:x:0:\nwheel:x:998:alice\n")]
     #[case::empty("")]
@@ -777,6 +874,7 @@ mod tests {
         assert_eq!(parse_input_group(content), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_an_empty_member_list_is_not_a_member() {
         let group = parse_input_group("input:x:992:\n").expect("the group should be found");
@@ -793,6 +891,7 @@ mod tests {
     // We are in it, but this session predates that.
     #[case::stale(Some((992, "alice")), "alice", &[1000], GroupState::Stale)]
     // Everything is as it should be.
+    #[cfg(target_os = "linux")]
     #[case::effective(Some((992, "alice")), "alice", &[1000, 992], GroupState::Effective)]
     fn test_group_state_distinguishes_configured_from_effective(
         #[case] group: Option<(u32, &str)>,
@@ -808,6 +907,7 @@ mod tests {
         assert_eq!(group_state(group.as_ref(), username, effective), expected);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_a_missing_group_tells_you_to_run_setup() {
         let result = input_access_check(GroupState::Missing, "alice", &Ok(String::new()));
@@ -828,6 +928,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_a_missing_membership_names_the_user_and_advises_setup() {
         let result = input_access_check(GroupState::NotConfigured, "alice", &Ok(String::new()));
@@ -848,6 +949,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_a_stale_membership_asks_for_a_re_login() {
         let result = input_access_check(GroupState::Stale, "alice", &Ok(String::new()));
@@ -876,6 +978,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_an_unreadable_input_device_folds_into_the_same_check() {
         // Discovery has already humanized this; the check must not paper over
@@ -900,6 +1003,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_no_keyboard_is_a_failure_even_when_the_group_is_right() {
         let result = input_access_check(
@@ -919,6 +1023,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_a_readable_keyboard_passes_and_names_it() {
         let result = input_access_check(
@@ -1120,6 +1225,7 @@ mod tests {
         assert_eq!(resolved, PathBuf::from("/profile/model"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_the_username_comes_from_the_environment() {
         // Whichever of the two is set here, we must agree with it rather than
@@ -1141,6 +1247,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     /// The real `/dev/uinput`, the real `/dev/input`, a real microphone and a
     /// real model: gated like every other hardware-touching test in the crate.
     #[tokio::test]
@@ -1161,6 +1268,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[cfg_attr(feature = "pure_tests", ignore)]
     fn real_input_devices_include_a_keyboard() {

@@ -9,10 +9,9 @@ repository = "https://github.com/SierraSoftworks/voice-rs"
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 cpal = "0.16"
-evdev = { version = "0.13", features = ["tokio"] }
 human-errors = { version = "0.2.3", features = ["pretty"] }
 humantime = "2.1"
-libc = "0.2"
+libloading = "0.8"
 ratatui = "0.30.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -24,8 +23,22 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "ti
 tokio-stream = "0.1"
 tokio-util = "0.7"
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", features = ["opentelemetry"] }
-uinput-tokio = "0.1.36"
 update-rs = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { version = "0.13", features = ["tokio"] }
+libc = "0.2"
+uinput-tokio = "0.1.36"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",              # GenerateConsoleCtrlEvent
+    "Win32_System_JobObjects",           # CreateJobObjectW, KILL_ON_JOB_CLOSE
+    "Win32_System_Threading",            # GetCurrentThreadId
+    "Win32_UI_Input_KeyboardAndMouse",   # SendInput, KEYBDINPUT, KEYEVENTF_*, VK_*
+    "Win32_UI_WindowsAndMessaging",      # SetWindowsHookExW, GetMessageW, KBDLLHOOKSTRUCT
+] }
 
 [dev-dependencies]
 rstest = "0.26.1"

@@ -49,7 +49,7 @@ use crate::config::{Profile, ResolvedSettings, SystemConfig, loader, resolve_mod
 use crate::grammar::expansion;
 use crate::hotkey::{self, ListenMode};
 use crate::matcher::{CommandAction, CompiledCommand, MatcherOptions, PhraseTrie, matcher_task};
-use crate::output::{Interrupt, UinputSink, executor};
+use crate::output::{Interrupt, PlatformSink, executor};
 use crate::recognition::{AudioMsg, RecognitionEvent, vosk};
 
 use super::ui::{EventSink, ReportMode, UiEvent, tui};
@@ -111,7 +111,7 @@ pub async fn run(args: RunArgs) -> Result<i32, crate::Error> {
     // 3. The virtual keyboard, *first*: creating it is what fails when
     //    /dev/uinput is missing or unreadable, and finding that out after
     //    loading a model and opening a microphone would be needlessly slow.
-    let sink = UinputSink::new().await?;
+    let sink = PlatformSink::new().await?;
 
     // 4. The model, the recognizer, the microphone and the tasks.
     let model = resolve_model(args.model.as_deref(), &profile, &system)?;
@@ -481,17 +481,16 @@ impl Pipeline {
         // path.
         let bridge = match (&settings.hotkey, mode) {
             (Some(config), Some(mode)) => {
-                let device = hotkey::discover_device(&config.device, config.key.code())?;
-                tasks.push((
-                    "hotkey watcher",
-                    tokio::spawn(hotkey::hotkey_task(
-                        device,
-                        config.key.code(),
-                        mode,
-                        listening_tx,
-                        cancel.clone(),
-                    )),
-                ));
+                // Resolving the device is part of starting: an unresolvable
+                // one fails here, before any audio machinery spins up.
+                let watcher = hotkey::watch(
+                    &config.device,
+                    config.key.code(),
+                    mode,
+                    listening_tx,
+                    cancel.clone(),
+                )?;
+                tasks.push(("hotkey watcher", tokio::spawn(watcher)));
 
                 Some(tokio::spawn(listening_bridge(
                     listening_rx,
@@ -845,19 +844,46 @@ pub(super) async fn interrupts() -> Shutdown {
 
 /// A future which resolves when we are asked to terminate (SIGTERM — which is
 /// how Steam stops a game).
+#[cfg(target_os = "linux")]
 pub(super) fn terminations() -> Result<impl Future<Output = ()>, crate::Error> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| {
-            human_errors::wrap_system(
-                e,
-                "We could not install a handler for the SIGTERM signal.",
-                &["Please report this issue on GitHub so that we can investigate."],
-            )
-        })?;
+        .map_err(|e| signal_handler_error(e, "SIGTERM"))?;
 
     Ok(async move {
         sigterm.recv().await;
     })
+}
+
+/// A future which resolves when Windows asks us to terminate.
+///
+/// There is no SIGTERM to wait for: the two console control events which mean
+/// "your process is going away" are `CTRL_CLOSE_EVENT` (the console window was
+/// closed) and `CTRL_SHUTDOWN_EVENT` (the system is shutting down), and either
+/// one is the same intent, so they are raced. `CTRL_BREAK_EVENT` is
+/// deliberately not among them — it is a user gesture like Ctrl-C, which
+/// [`interrupts`] already covers.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn terminations() -> Result<impl Future<Output = ()>, crate::Error> {
+    let mut close =
+        tokio::signal::windows::ctrl_close().map_err(|e| signal_handler_error(e, "CTRL_CLOSE"))?;
+    let mut shutdown = tokio::signal::windows::ctrl_shutdown()
+        .map_err(|e| signal_handler_error(e, "CTRL_SHUTDOWN"))?;
+
+    Ok(async move {
+        tokio::select! {
+            _ = close.recv() => {}
+            _ = shutdown.recv() => {}
+        }
+    })
+}
+
+/// The failure to install a shutdown handler, which is never the user's fault.
+fn signal_handler_error(e: std::io::Error, signal: &str) -> crate::Error {
+    human_errors::wrap_system(
+        e,
+        format!("We could not install a handler for the {signal} signal."),
+        &["Please report this issue on GitHub so that we can investigate."],
+    )
 }
 
 /// Starts the wrapped application, if we were given one.
@@ -1046,13 +1072,13 @@ pub(super) async fn supervise(
             // a termination gets, rather than being abandoned to a wrapper
             // which has already exited.
             if let Some(child) = child.as_mut() {
-                forward_signal(child, libc::SIGINT, "interrupt").await;
+                forward_signal(child, Signal::Interrupt).await;
             }
             Ending::Interrupted
         }
         Outcome::Terminate => {
             let child_exited = match child.as_mut() {
-                Some(child) => forward_signal(child, libc::SIGTERM, "shutdown").await,
+                Some(child) => forward_signal(child, Signal::Terminate).await,
                 None => true,
             };
             Ending::Terminated { child_exited }
@@ -1076,6 +1102,67 @@ async fn wait_for(child: Option<&mut Child>) -> std::io::Result<std::process::Ex
     }
 }
 
+/// Which of the two "please stop" signals we are passing on to the child.
+///
+/// Named rather than numeric because the two platforms number them
+/// differently — and Windows does not number them at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    /// The SIGINT a real Ctrl-C would have delivered.
+    Interrupt,
+    /// The SIGTERM a shutdown (Steam stopping the game) delivers.
+    Terminate,
+}
+
+impl Signal {
+    /// What this signal means, for the message a failure to send it produces.
+    fn what(self) -> &'static str {
+        match self {
+            Signal::Interrupt => "interrupt",
+            Signal::Terminate => "shutdown",
+        }
+    }
+}
+
+/// Delivers a signal to a child process.
+#[cfg(target_os = "linux")]
+fn send_signal(pid: u32, signal: Signal) {
+    let number = match signal {
+        Signal::Interrupt => libc::SIGINT,
+        Signal::Terminate => libc::SIGTERM,
+    };
+
+    debug!(
+        pid,
+        signal = number,
+        "Forwarding a signal to the application."
+    );
+    // SAFETY: `kill` is safe to call with any pid, and this one belongs to a
+    // child we started and have not yet reaped, so it cannot have been recycled
+    // onto an unrelated process.
+    if unsafe { libc::kill(pid as libc::pid_t, number) } != 0 {
+        let error = std::io::Error::last_os_error();
+        warn!(
+            "We could not pass the {} signal on to the application ({error}).",
+            signal.what()
+        );
+    }
+}
+
+/// Windows has no per-process signals: telling a child to wind down means
+/// either `GenerateConsoleCtrlEvent` (which only reaches a process *group*, so
+/// the child has to have been started in one) or a job object, both of which
+/// are W4's job. Until then the child is left alone and the grace period below
+/// simply elapses before we shut down around it.
+#[cfg(not(target_os = "linux"))]
+fn send_signal(pid: u32, signal: Signal) {
+    debug!(
+        pid,
+        "Graceful child signalling lands in W4; not passing the {} on to the application.",
+        signal.what()
+    );
+}
+
 /// Forwards a signal to the child and gives it [`SIGTERM_GRACE`] to wind down.
 ///
 /// Both shutdown paths come through here: SIGTERM (Steam stopping the game) and
@@ -1085,20 +1172,13 @@ async fn wait_for(child: Option<&mut Child>) -> std::io::Result<std::process::Ex
 /// Returns whether it actually stopped in time; we proceed with shutdown either
 /// way, because an application which refuses to exit must not keep the wrapper
 /// (and therefore Steam) hanging indefinitely.
-async fn forward_signal(child: &mut Child, signal: libc::c_int, what: &str) -> bool {
+async fn forward_signal(child: &mut Child, signal: Signal) -> bool {
     let Some(pid) = child.id() else {
         // Already reaped: there is nothing left to signal.
         return true;
     };
 
-    debug!(pid, signal, "Forwarding a signal to the application.");
-    // SAFETY: `kill` is safe to call with any pid, and this one belongs to a
-    // child we started and have not yet reaped, so it cannot have been recycled
-    // onto an unrelated process.
-    if unsafe { libc::kill(pid as libc::pid_t, signal) } != 0 {
-        let error = std::io::Error::last_os_error();
-        warn!("We could not pass the {what} signal on to the application ({error}).");
-    }
+    send_signal(pid, signal);
 
     match tokio::time::timeout(SIGTERM_GRACE, child.wait()).await {
         Ok(Ok(_)) => true,

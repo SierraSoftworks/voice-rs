@@ -333,16 +333,33 @@ impl EventLog {
     }
 }
 
-/// A wall-clock `HH:MM:SS` in the machine's local timezone.
-///
-/// `localtime_r` rather than a date crate: the only thing a log line needs is
-/// the time of day the user's clock shows, and the C library already knows the
-/// timezone this process is running in.
+/// A wall-clock `HH:MM:SS`, in the machine's local timezone where we can work
+/// out what that is.
 fn clock_time(at: SystemTime) -> String {
     let seconds = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    if let Some(local) = local_clock(seconds) {
+        return local;
+    }
+
+    // A clock we cannot localize (a timestamp beyond the C library's range, or
+    // a platform we have no localization for yet): fall back to UTC arithmetic
+    // rather than lose the timestamp.
+    let day = seconds % 86_400;
+    format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
+}
+
+/// The local `HH:MM:SS` for a Unix timestamp, or [`None`] when the C library
+/// cannot break it down.
+///
+/// `localtime_r` rather than a date crate: the only thing a log line needs is
+/// the time of day the user's clock shows, and the C library already knows the
+/// timezone this process is running in.
+#[cfg(target_os = "linux")]
+fn local_clock(seconds: u64) -> Option<String> {
     let stamp = seconds as libc::time_t;
     let mut parts: libc::tm = unsafe { std::mem::zeroed() };
 
@@ -351,16 +368,20 @@ fn clock_time(at: SystemTime) -> String {
     // keeps no global state, so it is safe to call from any thread.
     let converted = unsafe { libc::localtime_r(&raw const stamp, &raw mut parts) };
     if converted.is_null() {
-        // A clock the C library cannot break down (a timestamp beyond its
-        // range): fall back to UTC arithmetic rather than lose the timestamp.
-        let day = seconds % 86_400;
-        return format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60);
+        return None;
     }
 
-    format!(
+    Some(format!(
         "{:02}:{:02}:{:02}",
         parts.tm_hour, parts.tm_min, parts.tm_sec
-    )
+    ))
+}
+
+/// Windows has no `localtime_r`; localizing the session log's timestamps is
+/// W5's job, and until then [`clock_time`]'s UTC fallback carries them.
+#[cfg(not(target_os = "linux"))]
+fn local_clock(_seconds: u64) -> Option<String> {
+    None
 }
 
 #[cfg(test)]

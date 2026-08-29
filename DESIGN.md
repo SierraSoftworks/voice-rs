@@ -42,7 +42,9 @@ command phrase, it presses keys in a game (or any application) for you. It is bu
 - Mouse movement/click output, process execution, and audio playback outputs — `CompiledOutput` is an
   enum precisely so these can be added without touching the pipeline.
 - Runtime grammar switching (per-app sub-profiles).
-- Windows/macOS support. This tool is deliberately Linux-first at the evdev/uinput layer.
+- Windows/macOS support. This tool is deliberately Linux-first at the evdev/uinput layer. (A
+  Windows port is now underway — see [Windows support](#windows-support) — on the standing condition
+  that it never compromises the Linux one. macOS remains out of scope.)
 
 (Partial-result "eager" command firing was originally listed here as future work; it has since been
 implemented — see [Endpointing](#endpointing-and-latency).)
@@ -120,11 +122,15 @@ voice-orders/
     │   ├── mod.rs                 # matcher task: event loop + completion-timeout state machine
     │   └── trie.rs                # word trie phrase table
     ├── hotkey/
-    │   └── mod.rs                 # evdev device discovery, EventStream task, ListenMode logic
+    │   ├── mod.rs                 # ListenMode logic + the platform-neutral watch() seam
+    │   ├── discovery.rs           # evdev device discovery and ranking          [linux]
+    │   ├── task.rs                # evdev EventStream task                      [linux]
+    │   └── win.rs                 # WH_KEYBOARD_LL hook (stub until W3)         [windows]
     └── output/
         ├── mod.rs                 # executor task consuming the command queue
-        ├── keys.rs                # KeyCode + name table (macro-generated, single source of truth)
-        └── uinput.rs              # uinput-tokio device wrapper, release-on-shutdown safety
+        ├── keys.rs                # KeyCode + name/uinput/Windows table (macro-generated)
+        ├── uinput.rs              # uinput-tokio device wrapper                 [linux]
+        └── sendinput.rs           # SendInput KeySink (stub until W2)           [windows]
 ```
 
 ### Dependencies
@@ -1181,6 +1187,107 @@ If none is set, the error advises downloading a model and lists the three mechan
   repository is `voice-rs`) rewrites the formula in `SierraSoftworks/homebrew-tap` with `major minor`
   aliases. The formula installs the binary alone — libvosk goes into `$(brew --prefix)/lib`, which
   the rpath above covers.
+
+## Windows support
+
+voice-orders is being ported to Windows. This section is the standing design for that port; the
+phase table below says how much of it exists today.
+
+### The guiding constraint
+
+**Linux is never compromised for Windows.** The Linux behaviour — the evdev search order, the uinput
+capability set, the error text, the log lines, the timing — is the reference implementation, and a
+Windows change which would alter any of it is the wrong change. In practice that means: portable
+code stays portable, platform code sits behind `#[cfg(target_os = "linux")]` / `#[cfg(windows)]` at
+the *narrowest* seam that works, and where the two platforms need different code they get two
+functions with one name rather than one function with a branch inside it. The Windows CI job runs
+`clippy --all-targets -D warnings` on `windows-latest` so a Linux-only assumption cannot be merged.
+
+### The architecture
+
+**Keyboard output: `SendInput` through `windows-sys`.** Each `KeyEvent` becomes an `INPUT` record
+with `KEYEVENTF_SCANCODE` — a **scancode**, not a virtual key, because a game reading raw input sees
+a scancode where it ignores a synthesized VK, and because a scancode is layout-independent (`w` is
+the key above `s` on AZERTY too, which is what a movement macro means). `output/keys.rs` carries the
+encoding per row as `WinKey::{Scan, ScanExt, VirtualKey}`, and the one row which cannot be a
+scancode at all — `pause`, whose keyboard sequence is `E1 1D 45` — is injected by virtual key.
+
+`enigo` was considered and rejected. Two reasons, either sufficient: its extended-key handling is an
+acknowledged TODO in its own source (`LWIN`/`RWIN`, the numeric-keypad `Enter` and the media keys
+are all missing from its extended list, and it works from virtual keys rather than scancodes
+throughout), and it depends on `xkbcommon`/`libxdo` on Linux — pulling a display-server dependency
+into a project whose entire premise is sitting *below* the display server.
+
+**Hotkeys: `WH_KEYBOARD_LL`, observe-don't-consume.** A low-level keyboard hook is the closest
+Windows analogue of reading `/dev/input/event*`: it sees keys system-wide, including inside
+fullscreen games. The hook returns `CallNextHookEx` unconditionally — it *observes* the hotkey and
+never swallows it, so the key still reaches the game, exactly as an evdev read does. The hook needs
+a thread with a message pump (`GetMessageW`), which is a dedicated OS thread rather than a Tokio
+task. Raw Input (`WM_INPUT` with `RIDEV_INPUTSINK`) is the future upgrade: it is the only Windows
+API which can say *which keyboard* a key came from, which is what `hotkey.device` would need to
+mean anything — until then `hotkey.device` stays a Linux concept and `voice-orders devices` says so.
+
+**libvosk: `libloading`, and a frozen DLL.** The raw `dlopen`/`dlsym` binding was replaced by
+`libloading`'s OS-specific `Library` types, which gives both platforms typed symbol lookup with no
+`transmute` and lets each keep its own loader flags: `RTLD_NOW | RTLD_LOCAL` on unix,
+`LOAD_WITH_ALTERED_SEARCH_PATH` on Windows. The Windows flag matters — `libvosk.dll` is a MinGW
+build which imports `libstdc++-6.dll`, `libgcc_s_seh-1.dll` and `libwinpthread-1.dll`, and that flag
+is what makes the DLL's own directory the first place those are looked for, so the official zip's
+contents can simply be unpacked together.
+
+The last published Windows build is **0.3.45**, which predates
+`vosk_recognizer_set_endpointer_delays` and `vosk_recognizer_set_endpointer_mode`. Those two entry
+points are therefore **optional**: they resolve to `None` rather than failing the load, and the
+recognizer emits one warning ("this libvosk build does not support endpointer tuning;
+recognition.silence has no effect") and keeps vosk's stock trailing silence. Every other symbol stays
+required — a library missing those is not libvosk.
+
+**Child processes: job objects.** Windows has no per-process signals, so the Linux
+`libc::kill(SIGINT/SIGTERM)` forwarding has no direct equivalent. `GenerateConsoleCtrlEvent` reaches
+a process *group* rather than a process, which means the child has to have been started in one; a
+job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is the reliable containment primitive and is
+what the wrapper contract (voice-orders exits, the game goes with it) will be built on.
+
+**Audio: cpal's WASAPI host, and `!Send`.** cpal works unchanged, but a WASAPI `Stream` is `!Send`
+(COM apartment state is per-thread) where the ALSA one is `Send + Sync`. The pipeline future which
+owns the capture handle is therefore `!Send` on Windows and must be awaited where it was built — the
+assembly already does that, and the Send-ness assertion in `audio/mod.rs` is Linux-only because on
+Windows it would be asserting something false.
+
+### Phases
+
+| # | Phase | Contents | Status |
+|---|---|---|---|
+| W1 | Portability refactor | The only phase which touches Linux code. `keys.rs` gains a Windows column and literal key codes (with a Linux test pinning them against `evdev`); `libvosk.rs` migrates to `libloading` with the two optional endpointer symbols; every Linux-only module is `cfg`-gated behind a platform-neutral seam (`output::PlatformSink`, `hotkey::watch`, `doctor`'s platform checks, `run`'s signal handling); Windows CI job. | **done** |
+| W2 | Keyboard output | `output/sendinput.rs`: a real `SendInput` `KeySink` replacing the stub, driven by `keys::to_windows`. | stub |
+| W3 | Hotkey | `hotkey/win.rs`: the `WH_KEYBOARD_LL` hook thread, feeding the same `transition`/`ListenMode` logic the Linux task uses. | stub |
+| W4 | Child processes | Job-object containment and a graceful stop for the wrapped application, replacing the `send_signal` no-op. | stub |
+| W5 | Polish | Local time in the session log (the UTC fallback stands in today), Windows paths and docs. | stub |
+| W6 | Release | Windows build matrix, the `voice-orders-windows-amd64.exe` asset, libvosk DLL packaging. | not started |
+| W7 | Verification | End-to-end on real Windows hardware, in a real game. | not started |
+
+Every stub reports the same shape of failure: an ordinary `human_errors` **user** error saying the
+feature "is not implemented in this Windows build yet", raised at the point the Linux code would
+have reported a missing device. Nothing panics, nothing silently does nothing, and
+`voice-orders doctor` reports each unfinished piece as its own `✗` line — a `doctor` which claimed a
+clean bill of health on a build that cannot press keys would be worse than no `doctor` at all.
+
+### Rejected compromises
+
+- **No cross-platform input abstraction replacing uinput.** The tempting refactor is a single
+  `InputBackend` trait with evdev and Windows implementations behind it. It was rejected: the
+  existing `KeySink` seam is already exactly that trait, at the right altitude, and anything larger
+  would mean rewriting working Linux code to suit a platform which has not shipped yet.
+- **`synchronize()` stays in `KeySink`.** It is a uinput concept (`EV_SYN`/`SYN_REPORT`) and
+  `SendInput` needs no flush, so a purist would drop it from the trait and let uinput batch
+  internally. That would change the Linux emission sequence, which is pinned by tests and is what a
+  game actually sees. The Windows sink implements it as a no-op instead.
+- **`hotkey.device` stays Linux-ranked.** Rather than inventing a Windows meaning for it (a window
+  title? a HID path?), the option keeps its evdev semantics and Windows says plainly that it has
+  none, until Raw Input makes per-device selection real.
+- **No second key table.** One table, three columns, one row per key — a Windows-only table would
+  drift, and a Windows-only *test* would mean the mapping was only ever checked on the platform
+  nobody develops on. The Windows column is pure data, compiled and tested everywhere.
 
 ## Testing strategy
 

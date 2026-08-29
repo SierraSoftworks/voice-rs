@@ -65,6 +65,24 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  check-windows:
+    name: Check (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      # Nothing to install: cpal uses WASAPI (in the OS), evdev/uinput are not
+      # in the dependency tree at all on Windows, and libvosk is loaded with
+      # LoadLibrary at runtime rather than linked — so there is no DLL to fetch
+      # in order to *compile*.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   test:
     name: Test
     runs-on: ubuntu-latest

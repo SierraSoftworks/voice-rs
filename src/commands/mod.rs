@@ -4,6 +4,12 @@ mod devices;
 mod doctor;
 mod new;
 mod run;
+// `setup` applies system configuration which only Linux needs; the Windows
+// sibling has the same CLI surface and simply says there is nothing to do.
+#[cfg(target_os = "linux")]
+mod setup;
+#[cfg(not(target_os = "linux"))]
+#[path = "setup_windows.rs"]
 mod setup;
 mod test;
 mod ui;
