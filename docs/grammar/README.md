@@ -340,7 +340,7 @@ beginning of a longer one. With both `Reload` and `ReloadWeapon` in a profile, s
 of all — wherever a bare subject is published alongside the commands built on it.
 
 Unambiguous commands fire as soon as the recognizer's hypothesis settles. An ambiguous one waits for
-[`completion_timeout`](../profiles/README.md#completion-timeout) (300ms by default) to see whether you are still
+[`completion_timeout`](../profiles/README.md#completion-timeout) (500ms by default) to see whether you are still
 talking:
 
 - **You carry on with "weapon"** → the longer command supersedes the short one, and only `ReloadWeapon` fires.
@@ -359,7 +359,7 @@ per profile rather than something you have to infer:
 
 ```
 Select
-  note: saying "all" will wait 350ms in case you continue with "all hide"
+  note: saying "all" will wait 500ms in case you continue with "all hide"
 ```
 
 ::: tip

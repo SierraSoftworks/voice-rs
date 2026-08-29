@@ -78,7 +78,7 @@ model: ~/.local/share/vosk/vosk-model-small-en-us-0.15
 # How long an ambiguous phrase waits in case you carry on with a longer one:
 # with both "reload" and "reload weapon" in the profile, saying "reload" waits
 # this long before firing, in case "weapon" is still coming.
-# completion_timeout: 300ms
+# completion_timeout: 500ms
 
 # The pacing applied to every command's key presses.
 # defaults:
@@ -204,7 +204,7 @@ mod tests {
         );
         assert_eq!(profile.audio.device, None);
         assert_eq!(profile.hotkey, None);
-        assert_eq!(profile.completion_timeout, Duration::from_millis(300));
+        assert_eq!(profile.completion_timeout, Duration::from_millis(500));
 
         // The worked grammar demonstrates published rules, a private rule and
         // a capture — and all of it is proven to compile, lint-free.

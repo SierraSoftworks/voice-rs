@@ -391,7 +391,7 @@ sweep — identical outputs may silently collapse, which is how deliberate synon
 unknown key names or malformed chords in actions. Lints (warnings): a private rule referenced by
 nothing; bare `...` alongside `name...` in one block; a `hold` with no `release` on some accepting
 path (path-sensitive — checked per rule, with `release(*)` discharging it); prefix-relation notes
-naming the completion-timeout cost ("saying \"two\" waits 350ms in case you continue"); adjacent-
+naming the completion-timeout cost ("saying \"two\" waits 500ms in case you continue"); adjacent-
 slot homophone confusability ("to"/"two", "four"/"for") where both are valid continuations of the
 same state. Vocabulary checking walks the rule graph's literal set linearly
 (`Grammar::word_set`), so it never needs an expansion.
@@ -439,7 +439,7 @@ recognition accuracy for feasibility.
 name: Arma 3
 model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
 hotkey: { device: auto, key: leftctrl, mode: push-to-talk }
-completion_timeout: 350ms
+completion_timeout: 500ms
 defaults: { duration: 30ms, interval: 30ms }   # press pacing, as before
 grammar: |
   Map = "map" | "toggle map" { m }
@@ -539,6 +539,7 @@ struct EagerContext {                       // Some(_) from an utterance's first
     origin: Walk,                           // walk origin: the pending walk, or a fresh root walk
     passed: Option<Accept>,                 // pending command absorbed from the previous utterance
     fired: Vec<Match>,                      // (position, accept) already fired from partials
+    committed: usize,                       // words spent by deadline fires; later walks start here
     resting: Option<EagerResting>,          // the armed deadline, if the walk rests on an accept
 }
 ```
@@ -554,14 +555,23 @@ struct EagerContext {                       // Some(_) from an utterance's first
   does not move the resting point keeps the armed deadline.
 - **Resting mid-phrase** (including past an uncommitted crossed accept) arms nothing: the trailing
   words may still grow into the longer phrase.
-- **Final(utterance):** *reconciliation*. The full walk runs as usual and its `(position, command)`
-  sequence is compared against `fired`: a matching prefix means the remainder fires and an
-  ambiguous rest goes `Pending` (keeping the **earlier** partial-armed deadline when it is the same
-  wait); `fired` containing exactly the resting command as its one extra entry means the ambiguous
-  choice was already made mid-utterance (nothing fires twice, nothing is held pending); anything
-  else is an **eager mismatch** — the keys are already down, nothing can be un-pressed, so the rest
-  of the utterance is dropped and a warning is emitted through the session's event sink
-  (`warning:` line / yellow TUI entry). The context is cleared at every Final.
+- **A deadline fire commits the hypothesis set.** When a resting deadline fires (either kind), the
+  words the accept consumed are *spent*: `committed` records the boundary, `origin` resets to a
+  fresh root walk, and every later walk of the utterance — partial or Final — starts past it. No
+  continuation or revision can grow the same words into a second, longer command on top of keys
+  already pressed: the field-observed double fire ("Autocannon" from the timer, then
+  "AutocannonSentry" from the continuation over the same words) is structurally impossible, not
+  merely unreached. A speaker who continues anyway is told at the Final (an **eager overrun**
+  warning naming the committed fire and the settled text) and the trailing words are dropped.
+- **Final(utterance):** *reconciliation*. The full walk runs from `committed` and its
+  `(position, command)` sequence is compared against the post-commit entries of `fired`: a matching
+  prefix means the remainder fires and an ambiguous rest goes `Pending` (keeping the **earlier**
+  partial-armed deadline when it is the same wait); `fired` containing exactly the resting command
+  as its one extra entry means a certain fire's revision shortened the text back onto it (nothing
+  fires twice, nothing is held pending); anything else is an **eager mismatch** — the keys are
+  already down, nothing can be un-pressed, so the rest of the utterance is dropped and a warning is
+  emitted through the session's event sink (`warning:` line / yellow TUI entry). The context is
+  cleared at every Final.
 - **A new utterance's partial while a command is Pending** absorbs the pending command into the
   context (`origin`/`passed`) and disarms its timer: the continuation logic itself now decides its
   fate — an extending hypothesis supersedes it, a non-extending one flushes it immediately. This
@@ -589,17 +599,22 @@ Because alternatives exist only on finalized results, confidence gating and eage
 per-utterance incompatible: `eager: true` + `alternatives > 0` is a config error, and `alternatives`
 flips the eager default to `false`.
 
-The loop is a single `select!`:
+The loop is a single `select!`, **biased** so queued events always beat an elapsed timer: every
+event spends real time in the audio and recognition pipeline before it reaches the matcher, so an
+event and an elapsed deadline ready together means the event describes something which physically
+happened first — an unbiased select would let the timer fire a command the user had already muted
+or superseded, about half the time:
 
 ```rust
 loop {
     tokio::select! {
+        biased;
         _ = cancel.cancelled() => break,
-        _ = sleep_until_deadline(&state) => fire_pending(&mut state, &queue).await,
         ev = events.recv() => match ev {
             Some(ev) => transition(&mut state, ev, &automaton, &queue).await,
             None => break,
         },
+        _ = sleep_until_deadline(&state) => fire_pending(&mut state, &queue).await,
     }
 }
 // sleep_until_deadline: sleep_until(deadline) when Pending, std::future::pending() when Idle
@@ -636,7 +651,7 @@ all under the profile's `recognition:` block:
    competitors gap by a few units (4.9 observed), so only the margin is meaningful and gating keys
    off it.
 
-Two honest consequences remain:
+Three honest consequences remain:
 
 1. "autocannon sentry" spoken in one breath is one hypothesis: with eager on it fires
    `eager_delay` after the last word stabilizes; with eager off it fires when the endpointer does
@@ -644,6 +659,18 @@ Two honest consequences remain:
 2. The completion timeout still only costs you when you *pause* inside an ambiguous phrase — but
    with eager on the short command's perceived latency is now just `completion_timeout` from the
    pause, instead of `endpoint silence + completion_timeout` from the eventual Final.
+3. **`completion_timeout` has a practical floor of ~500ms** (the schema default). The wait is
+   armed when a partial *rests* on the ambiguous accept, but the evidence that the speaker carried
+   on trails the speech itself: audio reaches the recognizer in ~100ms frames, and a continuation
+   word only appears in a partial once it has been (mostly) spoken *and* decoded — inter-word gap
+   + word duration + framing + decode adds up to several hundred milliseconds even in fluent
+   speech. Field testing at 350ms produced exactly that failure: "auto cannon sentry" in one
+   breath fired "Autocannon" from the timer before any partial contained "sentry". This is not a
+   deadline-arithmetic bug — the arming and re-arming rules behaved as specified — it is the
+   emission latency of the evidence. Two mitigations are in place: the matcher's `select!` is
+   biased to drain already-queued events (a continuation partial, a mute) before trusting any
+   elapsed timer, and a deadline fire commits the hypothesis set (see §"Eager matching") so the
+   mistimed case degrades to one wrong-but-reported command rather than two.
 
 The remaining risk is inherent: an eager fire acts on a hypothesis, and a speaker who pauses past
 `completion_timeout` mid-phrase (or a partial the recognizer later revises) produces keys that
@@ -671,7 +698,7 @@ hotkey:
   mode: toggle             # toggle | push-to-talk | push-to-mute
   interrupt: false         # true: stopping listening also cancels the command being typed
 
-completion_timeout: 350ms  # ambiguous-prefix settle time (default: 300ms)
+completion_timeout: 500ms  # ambiguous-prefix settle time (default: 500ms)
 
 recognition:               # the latency levers (all optional; block absent = these defaults)
   silence: 200ms           # endpointer trailing silence (t_end); Vosk's own default is ~500ms
@@ -1103,7 +1130,7 @@ misses, suggest in order:
   [Feeding Vosk](#feeding-vosk)) — the accuracy trade should be discoverable, not silent.
 - **Prefix relations:** a bounded breadth-first sweep of the automaton finds the points where a
   command is complete while a longer one is still possible, and reports one witness per rule:
-  `note: saying "autocannon" will wait 350ms in case you continue with "autocannon sentry"` —
+  `note: saying "autocannon" will wait 500ms in case you continue with "autocannon sentry"` —
   making the completion-timeout behavior discoverable per profile. (Bounded like duplicate
   detection: shortest phrases are swept first, and a grammar too large to sweep exhaustively is
   covered to the budget's depth.)

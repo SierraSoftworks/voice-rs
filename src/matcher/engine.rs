@@ -119,6 +119,14 @@ struct EagerContext<'a> {
     /// `Final` reconciliation checks these against the finalized walk, and
     /// repeated partial walks use them to never fire the same position twice.
     fired: Vec<Match>,
+    /// The word index up to which this utterance is *spent*: a resting
+    /// deadline fire commits the hypothesis set to the words it consumed, so
+    /// every later walk of the utterance — partial or Final — starts here
+    /// (from a fresh root `origin`) and can never re-read those words into a
+    /// different, longer command. This is what makes the double fire
+    /// ("Autocannon" from the timer, then "AutocannonSentry" from the
+    /// continuation) structurally impossible rather than merely unreached.
+    committed: usize,
     /// The accept the latest partial's walk rests on, with its armed
     /// deadline. `None` when the walk rests mid-phrase or at the root.
     resting: Option<EagerResting>,
@@ -353,16 +361,20 @@ impl<'a> Engine<'a> {
     /// already crossed at `origin` (the pending command), so a continuation
     /// which fails to extend it flushes the pending command before re-syncing
     /// from the root.
+    ///
+    /// `from` is the index of the first word the walk may consume — anything
+    /// before it was committed by an earlier deadline fire and is spent.
     fn walk_final(
         &self,
         words: &[String],
+        from: usize,
         origin: &Walk<'a>,
         origin_fresh: bool,
         passed: Option<&Accept>,
         warn: &mut dyn FnMut(String),
     ) -> (Vec<Match>, WalkEnd<'a>) {
         let mut fired = Vec::new();
-        let mut i = 0;
+        let mut i = from;
         let mut origin = origin.clone();
         let mut origin_fresh = origin_fresh;
         let mut passed = passed.cloned();
@@ -443,11 +455,11 @@ impl<'a> Engine<'a> {
         // the pending state decides, exactly as the eager-off machine does.
         // utterance is resolved by this Final, so the context ends here.
         let context = eager.take();
-        let (origin, passed) = match &context {
-            Some(ctx) => (ctx.origin.clone(), ctx.passed.clone()),
+        let (origin, passed, committed) = match &context {
+            Some(ctx) => (ctx.origin.clone(), ctx.passed.clone(), ctx.committed),
             None => match &*state {
-                MatchState::Pending { accept, walk, .. } => (walk.clone(), Some(accept.clone())),
-                MatchState::Idle => (self.automaton.walk(), None),
+                MatchState::Pending { accept, walk, .. } => (walk.clone(), Some(accept.clone()), 0),
+                MatchState::Idle => (self.automaton.walk(), None, 0),
             },
         };
         // The origin has consumed words exactly when a pending accept rode in
@@ -460,7 +472,7 @@ impl<'a> Engine<'a> {
         // `alternatives` and eager firing apart, so no eager fire can precede
         // this check.)
         if let Some((top, competitor, margin)) =
-            self.close_ambiguity(utterance, &origin, origin_fresh, passed.as_ref())
+            self.close_ambiguity(utterance, committed, &origin, origin_fresh, passed.as_ref())
         {
             let message = format!("ambiguous: {top:?} vs {competitor:?} (margin {margin:.1})");
             warn!("Suppressing an utterance: {message}");
@@ -485,13 +497,47 @@ impl<'a> Engine<'a> {
 
         let words = words_of(&utterance.text);
         let mut warn = |message: String| self.warn_user(message);
-        let (matched, end) =
-            self.walk_final(&words, &origin, origin_fresh, passed.as_ref(), &mut warn);
+        let (matched, end) = self.walk_final(
+            &words,
+            committed,
+            &origin,
+            origin_fresh,
+            passed.as_ref(),
+            &mut warn,
+        );
 
-        let (already, resting) = match context {
+        let (fired_from_partials, resting) = match context {
             Some(ctx) => (ctx.fired, ctx.resting),
             None => (Vec::new(), None),
         };
+        // The name of the deadline fire which committed this utterance, for
+        // the overrun report below.
+        let committed_fire = fired_from_partials
+            .iter()
+            .rfind(|fire| fire.position == committed)
+            .map(|fire| fire.accept.display.clone());
+        // Only fires past the committed boundary reconcile against the walk:
+        // everything at or before it consumed words the walk above never
+        // re-read, so it can neither be confirmed nor contradicted.
+        let already: Vec<Match> = fired_from_partials
+            .into_iter()
+            .filter(|fire| fire.position > committed)
+            .collect();
+
+        // The speaker kept talking after a deadline fire had already spent
+        // their words, and the remainder added up to nothing: the choice
+        // cannot be un-pressed, so the trailing words were dropped — say so.
+        if committed > 0
+            && words.len() > committed
+            && matched.is_empty()
+            && matches!(end, WalkEnd::Complete)
+        {
+            let name = committed_fire.unwrap_or_else(|| "(nothing)".to_string());
+            self.warn_user(format!(
+                "eager overrun: {:?} had already fired when the utterance settled as {:?} — the keys were already pressed, and the words after it were dropped",
+                name, utterance.text
+            ));
+        }
 
         if already.len() <= matched.len()
             && already.iter().zip(&matched).all(|(a, b)| same_match(a, b))
@@ -584,6 +630,7 @@ impl<'a> Engine<'a> {
     fn close_ambiguity(
         &self,
         utterance: &Utterance,
+        committed: usize,
         origin: &Walk<'a>,
         origin_fresh: bool,
         passed: Option<&Accept>,
@@ -593,13 +640,13 @@ impl<'a> Engine<'a> {
             return None;
         }
 
-        let chosen = self.resolve(&top.0, origin, origin_fresh, passed);
+        let chosen = self.resolve(&top.0, committed, origin, origin_fresh, passed);
         for (text, confidence) in rest {
             let gap = top.1 - confidence;
             if gap > self.options.confidence_margin {
                 continue;
             }
-            let competitor = self.resolve(text, origin, origin_fresh, passed);
+            let competitor = self.resolve(text, committed, origin, origin_fresh, passed);
             if !competitor.is_empty() && competitor != chosen {
                 return Some((top.0.clone(), text.clone(), gap.abs()));
             }
@@ -618,6 +665,7 @@ impl<'a> Engine<'a> {
     fn resolve(
         &self,
         text: &str,
+        committed: usize,
         origin: &Walk<'a>,
         origin_fresh: bool,
         passed: Option<&Accept>,
@@ -626,7 +674,8 @@ impl<'a> Engine<'a> {
         // Resolving a hypothetical reading must not warn at the user: only
         // the walk of the utterance the engine acts on gets to do that.
         let mut warn = |_: String| {};
-        let (fired, end) = self.walk_final(&words, origin, origin_fresh, passed, &mut warn);
+        let (fired, end) =
+            self.walk_final(&words, committed, origin, origin_fresh, passed, &mut warn);
         let mut sequence: Vec<Vec<KeyEvent>> = fired
             .into_iter()
             .map(|matched| assemble(&matched.accept.actions, &self.pacing))
@@ -662,6 +711,7 @@ impl<'a> Engine<'a> {
                 origin,
                 passed,
                 fired: Vec::new(),
+                committed: 0,
                 resting: None,
                 warned: Vec::new(),
             });
@@ -680,9 +730,12 @@ impl<'a> Engine<'a> {
                 }
             };
             let mut certain = Vec::new();
+            // The pass starts past whatever an earlier deadline fire
+            // committed: those words are spent, and no revision of this
+            // hypothesis may re-read them.
             let rest = self.greedy_pass(
                 &words,
-                0,
+                ctx.committed,
                 &ctx.origin,
                 ctx.passed.is_none(),
                 ctx.passed.as_ref(),
@@ -917,13 +970,21 @@ pub async fn engine_task(
                 if let Some(ctx) = eager.as_mut() {
                     // The partial hypothesis held still long enough: the
                     // resting command fires, and the utterance stays open —
-                    // later partials may still extend it, and the eventual
-                    // Final reconciles against `fired`.
+                    // later partials may still fire further commands, and the
+                    // eventual Final reconciles against `fired`.
                     if let Some(rest) = ctx.resting.take() {
                         ctx.fired.push(Match {
                             position: rest.position,
                             accept: rest.accept.clone(),
                         });
+                        // The fire commits the hypothesis set to the words it
+                        // consumed: every later walk of this utterance starts
+                        // after them, from a fresh root, so no continuation
+                        // or revision can grow the same words into a second,
+                        // longer command on top of the keys just pressed.
+                        ctx.committed = rest.position;
+                        ctx.origin = engine.automaton.walk();
+                        ctx.passed = None;
                         if !engine.fire(&rest.accept).await {
                             return Ok(());
                         }
@@ -1714,7 +1775,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn eager_completion_fire_followed_by_a_continuation_is_reported() {
+    async fn eager_completion_fire_commits_and_a_continuation_cannot_double_fire() {
+        // The field-reported double fire: "auto cannon" firing from the
+        // completion timeout mid-utterance and the continuation then *also*
+        // firing "auto cannon sentry" over the same words. The fire commits
+        // the hypothesis set, so the second fire is structurally impossible.
         let mut h = Harness::start_with(arsenal(), eager_options());
 
         // The speaker pauses longer than the completion timeout mid-utterance:
@@ -1723,22 +1788,31 @@ mod tests {
         h.advance(TIMEOUT).await;
         assert_eq!(h.fired(), vec!["Autocannon"]);
 
-        // ...and then they continue after all. The longer command fires too —
-        // its keys are what they now asked for — and the Final reports the
-        // overrun, because "autocannon" was pressed and cannot be taken back.
+        // ...and then they continue after all. The words the fire consumed
+        // are spent: no revision of this utterance may grow them into the
+        // longer command on top of the keys already pressed.
         h.hear_partial("autocannon sentry").await;
-        h.advance(EAGER_DELAY).await;
-        assert_eq!(h.fired(), vec!["AutocannonSentry"]);
+        h.advance(EAGER_DELAY + TIMEOUT).await;
+        h.nothing_fired();
 
+        // The Final reports the overrun instead: the choice was already
+        // made, and the trailing words were dropped.
         h.hear_final("autocannon sentry").await;
         h.nothing_fired();
         let warnings = h.warnings();
         assert_eq!(warnings.len(), 1, "the overrun warns once: {warnings:?}");
         assert!(
-            warnings[0].contains("\"Autocannon\""),
-            "the warning should name the early fire: {}",
+            warnings[0].contains("\"Autocannon\"") && warnings[0].contains("autocannon sentry"),
+            "the warning should name the early fire and the settled text: {}",
             warnings[0]
         );
+
+        // The overrun leaves no state behind.
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+        h.hear_final("autocannon sentry").await;
+        assert_eq!(h.fired(), vec!["AutocannonSentry"]);
+        h.no_warnings();
         h.shutdown().await;
     }
 
@@ -2029,7 +2103,7 @@ mod tests {
         );
         let utterance = utterance_of(alternatives);
 
-        let ambiguity = engine.close_ambiguity(&utterance, &engine.automaton.walk(), true, None);
+        let ambiguity = engine.close_ambiguity(&utterance, 0, &engine.automaton.walk(), true, None);
 
         match expected {
             None => assert!(ambiguity.is_none(), "unexpected suppression: {ambiguity:?}"),

@@ -79,7 +79,7 @@ hotkey:
   key: rightctrl
   mode: toggle
 
-completion_timeout: 350ms
+completion_timeout: 500ms
 
 defaults:
   duration: 30ms

@@ -22,7 +22,7 @@ hotkey:
   key: rightctrl
   mode: toggle
 
-completion_timeout: 350ms
+completion_timeout: 500ms
 
 defaults:
   duration: 30ms
@@ -278,7 +278,7 @@ would take to type it, and stopping listening part-way through prints `interrupt
 `discarded: "…"` line for each command which was waiting behind it.
 :::
 
-### completion_timeout <Badge text="default: 300ms"/>
+### completion_timeout <Badge text="default: 500ms"/>
 How long a command which is a **prefix** of a longer one waits, in case you are still talking.
 
 With both `Reload = "reload"` and `ReloadWeapon = "reload weapon"` in a profile, saying "reload" and stopping fires the
@@ -287,7 +287,7 @@ Durations are written the way you would say them: `300ms`, `1s`, `1s 500ms`. A b
 voice-orders will not guess whether you meant seconds or milliseconds.
 
 ```yaml
-completion_timeout: 350ms
+completion_timeout: 500ms
 ```
 
 `voice-orders validate` prints a note for every prefix relation it finds in your profile, quoting this value, so you can
@@ -297,6 +297,13 @@ publishes a shared subject, which makes every command built on it ambiguous.
 
 With [eager matching](#recognition-eager) on (the default), this wait starts the moment the recognizer's in-progress
 hypothesis comes to rest on the ambiguous phrase — not hundreds of milliseconds later when the utterance finalizes.
+
+::: warning Going below ~500ms is a gamble
+The evidence that you carried on arrives well after the words leave your mouth: the recognizer listens in ~100ms
+chunks, and a word only shows up in its hypothesis once it has been (mostly) spoken and decoded. Set this much below
+500ms and the short command can fire while the longer phrase's words are still on their way — you say "auto cannon
+sentry" in one breath and get the autocannon anyway.
+:::
 
 ### recognition
 How quickly — and how cautiously — speech turns into keys. The whole block is optional, and so is every field in it;
@@ -332,6 +339,11 @@ The recognizer's hypothesis usually settles on your exact final words hundreds o
 The finalized utterance is always checked against what already fired. If they disagree — you were cut off, or the
 recognizer revised itself after a command fired — nothing can un-press a key: the session reports a
 `warning:` line naming what fired and what was actually said, and drops the rest of the utterance.
+
+A fire is also a commitment: the words it consumed are spent. If you pause past the
+[completion timeout](#completion-timeout) mid-phrase and then carry on, the continuation cannot grow those words into
+the longer command on top of the keys already pressed — you get the command the pause chose, and a `warning:` line
+telling you the trailing words were dropped.
 
 `eager: false` restores the fire-only-on-finalized behaviour exactly, latency included.
 
@@ -573,7 +585,7 @@ drg.yaml — Deep Rock Galactic
 
 Autocannon
   note: compiles into 30 automaton states
-  note: saying "autocannon" will wait 350ms in case you continue with "autocannon sentry"
+  note: saying "autocannon" will wait 500ms in case you continue with "autocannon sentry"
 
 Terminal
   note: compiles into 15 automaton states

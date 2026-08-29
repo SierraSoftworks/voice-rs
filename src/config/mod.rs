@@ -47,8 +47,15 @@ mod default {
     }
 
     /// `completion_timeout`: how long an ambiguous prefix waits for more words.
+    ///
+    /// 500ms because the continuation's first *evidencing* partial trails the
+    /// speech itself: the recognizer only sees ~100ms audio frames, and a
+    /// word only shows up in a partial once it has been (mostly) spoken and
+    /// decoded. Field testing showed sub-500ms waits firing the short
+    /// command while the longer phrase's words were still in flight — see
+    /// DESIGN.md §"Endpointing and latency".
     pub fn completion_timeout() -> Duration {
-        Duration::from_millis(300)
+        Duration::from_millis(500)
     }
 
     /// `defaults.duration`: how long each chord is held down.
@@ -496,7 +503,7 @@ mod tests {
             "an unset device defers to the machine's configuration"
         );
         assert_eq!(profile.hotkey, None, "no hotkey means always listening");
-        assert_eq!(profile.completion_timeout, Duration::from_millis(300));
+        assert_eq!(profile.completion_timeout, Duration::from_millis(500));
         assert_eq!(profile.recognition, RecognitionConfig::default());
         assert_eq!(profile.defaults, OutputDefaults::default());
     }

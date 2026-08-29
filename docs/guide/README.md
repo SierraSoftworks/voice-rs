@@ -197,7 +197,7 @@ drg.yaml — Deep Rock Galactic
 
 Autocannon
   note: compiles into 30 automaton states
-  note: saying "autocannon" will wait 350ms in case you continue with "autocannon sentry"
+  note: saying "autocannon" will wait 500ms in case you continue with "autocannon sentry"
 
 1 command checked — 0 errors, 0 warnings.
 ```

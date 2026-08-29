@@ -29,7 +29,7 @@ drg.yaml — Deep Rock Galactic
 
 Autocannon
   note: compiles into 30 automaton states
-  note: saying "autocannon" will wait 350ms in case you continue with "autocannon sentry"
+  note: saying "autocannon" will wait 500ms in case you continue with "autocannon sentry"
 
 Terminal
   note: compiles into 15 automaton states
@@ -154,7 +154,7 @@ It is not something to fix; it is something to know about the profile you wrote.
 
 ```
 Select
-  note: saying "all" will wait 350ms in case you continue with "all hide"
+  note: saying "all" will wait 500ms in case you continue with "all hide"
 ```
 
 Where the [completion timeout](../profiles/README.md#completion-timeout) is actually paid: a point at which one command
