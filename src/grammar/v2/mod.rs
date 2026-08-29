@@ -15,6 +15,7 @@
 
 mod analysis;
 mod ast;
+mod automaton;
 mod diagnostic;
 mod lexer;
 mod parser;
@@ -22,11 +23,13 @@ mod token;
 
 use std::collections::BTreeSet;
 
-#[allow(unused_imports)] // consumed as the automaton compiler (G4) lands
+#[allow(unused_imports)] // the remainder is consumed as the profile wiring (G6) lands
 pub use ast::{
     Action, ActionBlock, ActionKind, Alternation, Atom, Branch, Capture, Chord, ChordSegment,
     MAX_REPETITION, Repeat, Rule, Span, Term,
 };
+#[allow(unused_imports)] // consumed as the matcher (G5) lands
+pub use automaton::{Accept, Automaton, MAX_AUTOMATON_STATES, MAX_HYPOTHESES, Walk};
 #[allow(unused_imports)] // consumed as the profile wiring (G6) lands
 pub use diagnostic::{Diagnostic, DiagnosticKind, user_error};
 
@@ -131,12 +134,12 @@ impl Grammar {
     }
 }
 
+/// Shared test fixtures: the canonical Arma profile's grammar, used by the
+/// parser, automaton and feed test suites alike.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
+pub(crate) mod fixtures {
     /// The `grammar:` block of the canonical Arma profile.
-    fn arma_grammar() -> String {
+    pub fn arma_source() -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma.yaml");
         let raw = std::fs::read_to_string(path).expect("profiles/arma.yaml should be readable");
         let profile: serde_yaml::Value =
@@ -146,6 +149,12 @@ mod tests {
             .expect("profiles/arma.yaml should carry an inline grammar block")
             .to_owned()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::arma_source as arma_grammar;
+    use super::*;
 
     /// The canonical profile must stay honest: it parses and analyzes with no
     /// errors and no lint warnings.
