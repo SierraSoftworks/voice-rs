@@ -429,6 +429,185 @@ force-aligns *any* speech (including unrelated chatter on voice comms) onto the 
 phrase, causing false triggers; with it, out-of-grammar audio decodes as `[unk]` and the matcher
 discards it.
 
+## Grammar v2: composable command grammars
+
+> **Status: the standing design.** This section supersedes the phrase DSL above, the trie phrase
+> table below, and the `commands:` profile schema — each superseded section is updated or removed
+> as the implementation lands (the work plan is at the end of this section). Grammar v2 is a
+> **breaking profile change**: the phrase DSL, `keys:`/`events:` forms and the `commands:` list are
+> removed rather than maintained alongside it. `profiles/arma.yaml` is the canonical example and
+> must load once the engine lands.
+
+The phrase DSL describes single phrases; it cannot share structure between commands. Articulate-
+style grammars need exactly that: forty commands which all start with the same *subject* rule
+("two and three fall back"), direct objects whose keys depend on context, and repetition. Grammar
+v2 is a rule-based grammar language in which commands compose:
+
+```
+squad_number = ( "one" { f1 } | "two" { f2 } | "three" { f3 } )
+squad_selection = squad_number ("and"? squad_number)[0..9]
+subject = subject_all | squad_selection | team_selection
+
+Advance = subject ("advance" | "move up") { ..., 1, 2 }
+Watch = subject:sub ("watch" | "watch the") direction:dir { sub..., 3, 8, wait(20ms), dir... }
+```
+
+### Surface syntax
+
+A grammar is a sequence of rules. **TitleCase rules are published** (speakable commands, named in
+logs by their rule name plus captures, e.g. `Watch(two three, north)`); **lowercase rules are
+private** building blocks. `//` comments run to end of line. A rule is
+`name = expression [ { action-block } ]`; the expression grammar:
+
+```
+rule       = ident , "=" , alternation , [ actions ] ;
+alternation= sequence , { "|" , sequence } ;
+sequence   = term , { term } ;
+term       = atom , [ repeat ] , [ ":" , ident ] ;
+atom       = literal | ident | "(" , alternation , [ actions ] , ")" ;   (* inline actions bind
+                                                                            to the branch they
+                                                                            terminate *)
+repeat     = "?" | "*" | "+" | "[" , bounds , "]" ;
+bounds     = count | [ count ] , ".." , [ count ] ;
+actions    = "{" , action , { "," , action } , "}" ;
+action     = chord | "wait" , "(" , duration , ")"
+           | "hold" , "(" , chord , ")" | "release" , "(" , ( chord | "*" ) , ")"
+           | "..." | ident , "..." ;
+```
+
+- **Literals** are double-quoted spoken text; multi-word literals split on whitespace into word
+  tokens, lowercased (words may contain letters, digits, `'` and `-`, as in the v1 DSL).
+- **Repetition is always bounded.** `[n]` is exactly n, `[min..max]` a range, `[min..]` and
+  `[..max]` fill the missing end with `0` / the global cap. `?`, `*`, `+` are sugar for `[0..1]`,
+  `[0..cap]`, `[1..cap]`. The global cap (`MAX_REPETITION = 8`) makes every grammar finite by
+  construction; `validate` reports per-rule automaton size so a `*` at the cap is visible.
+- **No recursion.** A rule-reference cycle is a load error advising a bounded repetition instead.
+- **Rule termination.** The action block ends a rule when present; a rule without one ends at the
+  next `ident =` at the start of a line, and **implicitly propagates** its accumulated commands
+  (equivalent to `{ ... }`).
+
+### Command semantics
+
+Matching a published rule accumulates a **command vector**: walking the match left to right, each
+matched atom appends its commands (inline branch actions, referenced rules' vectors, nothing for
+plain literals). Repetition iterations append in spoken order. The rule's action block — evaluated
+only after the *whole published command* matches — then builds the vector the command actually
+runs:
+
+- a bare **chord** (`m`, `1`, `shift+f1`) is a key press;
+- **`wait(20ms)`** an explicit pause, **`hold(chord)`** / **`release(chord)`** press/release
+  without the paired edge, **`release(*)`** releases every key the virtual keyboard currently
+  holds (the executor's tracked set — also what makes a panic rule possible);
+- **`...`** splices the entire accumulated child vector, usable any number of times;
+- **`name...`** splices a **capture**: `term:name` names any term (including a group:
+  `("team"? assign_colour):colour`), and its commands accumulate into that capture's own
+  `Vec` as they are matched — a capture in an unmatched optional is empty, a capture inside a
+  repetition appends per iteration. Naming a capture does **not** remove it from `...`; a block
+  using both bare `...` and a `name...` splices those commands twice, which is legal but almost
+  always a mistake — lint it.
+
+`wait`, `hold` and `release` are reserved words in action position; every other bare identifier
+resolves against the `keys.rs` table (unknown names get the strsim "did you mean" treatment at
+load). **Pacing**: the assembled vector is flattened, then `defaults.duration` is applied to each
+press and `defaults.interval` between consecutive presses (across splice boundaries too); `hold`/
+`release` carry no implicit pacing, and an explicit `wait` *replaces* the implicit interval at
+that point.
+
+### Parsing: chumsky + ariadne
+
+The v1 lexer/parser (and the `Pin<Box<String>>` self-referential owner, the only unsafe in the
+crate) are replaced by the pattern proven in
+[optimist's squiggle module](https://github.com/SierraSoftworks/optimist/blob/main/src/squiggle/mod.rs):
+**chumsky 0.13** for a two-stage parse (lexer → spanned token stream → parser over
+`Stream::from_iter`, `into_output_errors()` accumulating rather than aborting) and **ariadne 0.6**
+for rendering. The AST is owned (`String` words, byte-offset `Span`s) — no borrowed lifetimes, no
+unsafe. Errors are collected as `Diagnostic { kind, message, span, help }` values (syntax /
+analysis / lint), rendered by ariadne with the source excerpt into plain UTF-8 text and carried to
+the user inside a `human_errors::user` error, so `crate::Error` remains the only error type and
+the advice-array convention is untouched. Every diagnostic keeps the second-person voice and
+worked examples of the v1 error table.
+
+### Static analysis (load-time, all reported in one pass)
+
+Errors: reference to an undefined rule; duplicate rule definition; rule-reference cycles; a
+published rule that can match the empty word sequence; two published rules accepting the same word
+sequence with different assembled outputs (the v1 duplicate-phrase error, now checked on the
+automaton — identical outputs may silently collapse); automaton size above `MAX_AUTOMATON_STATES`;
+unknown key names or malformed chords in actions. Lints (warnings): a private rule referenced by
+nothing; bare `...` alongside `name...` in one block; a `hold` with no `release` on some accepting
+path (path-sensitive — checked per rule, with `release(*)` discharging it); prefix-relation notes
+naming the completion-timeout cost ("saying \"two\" waits 350ms in case you continue"); adjacent-
+slot homophone confusability ("to"/"two", "four"/"for") where both are valid continuations of the
+same state. Vocabulary checking walks the rule graph's literal set linearly, exactly as
+`word_set` does today.
+
+### Compilation: a word-level transducer
+
+The rule graph compiles into a single NFA whose transitions consume one word and carry **output
+ops** (`Emit(fragment)`, `OpenCapture(name)`/`CloseCapture`), with published rules marked on
+accepting states alongside their action program (`Press`/`Hold`/`Release`/`ReleaseAll`/`Wait`/
+`SpliceAll`/`SpliceCapture(name)` items). The v1 trie is the degenerate case of this automaton.
+Determinization is deliberately **not** attempted (the same word can carry different outputs by
+context — "red" is shift+F1 as a subject, plain 1 as an assign object): the matcher instead walks
+a small **set of alive hypotheses**, each carrying its state, accumulated vector and captures.
+Utterances are short and the grammar word-branching is low, so the alive set stays small in
+practice; a `MAX_HYPOTHESES` guard turns pathological grammars into a load-time error rather than
+a runtime stall.
+
+The matcher's semantics are unchanged, restated over hypothesis sets: *ambiguous* now means "some
+alive hypothesis is accepting while any hypothesis can consume more words"; greedy longest-match
+segmentation, re-sync from the root, `Pending` + completion timeout, eager partial-driven firing
+and reconciliation, and confidence gating all port — with `CommandId` comparisons becoming
+comparisons of assembled action vectors, which is what the n-best gating design already specifies.
+`CommandAction` gains the per-match assembled plan and a synthesized display name
+(`Watch(two three, north)`); the executor is untouched apart from `release(*)` (a `ReleaseAll`
+`KeyEvent` played from the already-tracked pressed-key set).
+
+### Feeding Vosk
+
+Full per-command expansion is impossible under composition (`squad_selection` alone admits
+thousands of subject forms). The recognizer grammar is instead built per **published rule**: rules
+whose concrete expansion fits under `MAX_EXPANSIONS_PER_COMMAND` contribute whole phrases (best
+recognition — Vosk sees complete utterances); larger rules are **decomposed at referenced-rule
+boundaries** into fragment phrase lists (each private rule's own expansions), relying on the
+verified fact that Vosk chains grammar entries within one utterance — which is already how
+multi-command utterances reach the matcher today. The matcher's automaton, not Vosk, enforces
+which fragment sequences form a real command; invalid orderings decode as clean words and are
+dropped by the existing re-sync path. `"[unk]"` is always included. The decomposition is
+deterministic and reported by `validate` (which rules were decomposed and why), since it trades
+recognition accuracy for feasibility.
+
+### Profile schema v2
+
+```yaml
+name: Arma 3
+model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
+hotkey: { device: auto, key: leftctrl, mode: push-to-talk }
+completion_timeout: 350ms
+defaults: { duration: 30ms, interval: 30ms }   # press pacing, as before
+grammar: |
+  Map = "map" | "toggle map" { m }
+  ...
+```
+
+`grammar:` is an **inline block** — profiles stay single, URL-shareable files. The `commands:`
+list, `phrase:`/`keys:`/`events:` forms and the v1 phrase DSL are removed. The grammar parses
+during profile deserialization (the parse-during-load rule is unchanged: a bad grammar is a
+config-load error with an ariadne-rendered excerpt). `voice-orders new` scaffolds a commented
+grammar; `validate` runs the static analysis above plus vocabulary checks.
+
+### Work plan
+
+| # | Branch | Contents | Depends on |
+|---|---|---|---|
+| G1 | `grammar-v2-design` | This design section; `profiles/arma.yaml`. | — |
+| G2 | `grammar-v2-core` | `src/grammar/v2/`: token/lexer/parser/AST/diagnostics (chumsky + ariadne), static analysis, rule-graph word set. | — |
+| G3 | `grammar-v2-output` | `KeyEvent::ReleaseAll` + executor handling; assembly pacing helper (flatten + duration/interval/wait rules). | — |
+| G4 | `grammar-v2-automaton` | NFA transducer compiler, accepting-state action programs, expansion/decomposition for the Vosk feed, automaton-level duplicate detection. | G2 |
+| G5 | `grammar-v2-matcher` | Multi-hypothesis matcher walk; pending/eager/confidence gating over hypothesis sets; assembled `CommandAction`s. | G3, G4 |
+| G6 | `grammar-v2-profile` | Profile schema v2, wiring in `run`/`test`/`validate`/`new`, migrate `profiles/*.yaml` + `examples/profile.yaml`, delete the v1 DSL and flatten `grammar/v2/` → `grammar/`. | G5 |
+| G7 | `grammar-v2-docs` | VuePress grammar reference rewrite. | G6 |
+
 ## Matcher: trie + completion timeout
 
 ### Phrase table

@@ -1,0 +1,212 @@
+# Arma — voice-orders profile
+#
+# A transcription of Articulate's command grammar
+# (https://github.com/mpstark/articulate), exercising the composable grammar
+# format: shared subjects (squad numbers, teams, everyone), menu commands which
+# splice the subject's key presses ahead of their own, and direct objects whose
+# keys depend on context. Deviations from Articulate are marked NOTE: inline.
+#
+# TitleCase rules are published as speakable commands; lowercase rules are
+# private building blocks. A rule without a trailing `{ ... }` action block
+# implicitly propagates its children's commands. Named captures (`:name`)
+# collect their term's commands, spliced with `name...`. In action blocks a
+# bare chord ("m", "1", "shift+f1") is a press; `hold(..)`, `release(..)` and
+# `wait(..)` cover the uncommon cases.
+#
+# NOTE: this profile uses the v2 inline-grammar format, which is designed but
+# not yet implemented — it will not load until the grammar engine lands.
+#
+# Play with: voice-orders run profiles/arma.yaml -- %command%
+name: Arma 3
+model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
+
+hotkey:
+  device: auto
+  key: leftctrl
+  mode: push-to-talk
+
+completion_timeout: 350ms
+
+defaults:
+  duration: 30ms
+  interval: 30ms
+
+grammar: |
+  // ============================ General inputs ===============================
+
+  Map = "map" | "toggle map" | "show map" | "hide map" | "open map" | "close map" { m }
+  Inventory = "inventory" | "toggle inventory" | "show inventory" | "hide inventory" | "open inventory" | "close inventory" { i }
+  Lights = "lights" | "light" | "flashlight" | "torch" | "laser" { l }
+
+  // =============================== Subjects ==================================
+
+  squad_number = ( "one"   { f1 }
+                 | "two"   { f2 }
+                 | "three" { f3 }
+                 | "four"  { f4 }
+                 | "five"  { f5 }
+                 | "six"   { f6 }
+                 | "seven" { f7 }
+                 | "eight" { f8 }
+                 | "nine"  { f9 }
+                 | "ten"   { f10 } )
+
+  // Squad members chain: "one two and three" selects F1, F2, F3. Articulate
+  // bounds the selection at 10 members (SRGS SetRepeat(1, 10)); the bounded
+  // repetition matches it exactly, and each iteration's presses append in
+  // spoken order.
+  squad_selection = squad_number ("and"? squad_number)[0..9]
+
+  team_colour = ( "red"    { shift+f1 }
+                | "green"  { shift+f2 }
+                | "blue"   { shift+f3 }
+                | "yellow" { shift+f4 }
+                | "white"  { shift+f5 } )
+
+  // NOTE: Articulate only accepts "team red"; the trailing "red team" order is
+  // our addition.
+  team_selection = ("team" team_colour) | (team_colour "team")
+
+  // NOTE: "team" pulls triple duty — an alternate of subject_all (select
+  // everyone), the first word of team_selection ("team red"), and an optional
+  // word of the Assign object ("assign to team red"). The matcher must keep
+  // every reading alive until a later word or the completion timeout settles it.
+  subject_all = "all" | "everyone" | "team" | "squad" { tilde }
+
+  subject = subject_all | squad_selection | team_selection
+
+  // A subject spoken on its own just selects those units.
+  // NOTE: this makes every subject an ambiguous prefix of every subject-led
+  // command below, so Select only ever fires via the completion timeout.
+  Select = subject
+
+  // ============================= Move menu (1) ===============================
+
+  ReturnToFormation = subject ("return to formation" | "form up" | "fallback" | "fall back"
+                              | "regroup" | "join up" | "rally on me" | "rally to me") { ..., 1, 1 }
+  Advance = subject ("advance" | "move up") { ..., 1, 2 }
+  StayBack = subject ("stay back" | "go back" | "back up") { ..., 1, 3 }
+  FlankLeft = subject ("flank left" | "go left") { ..., 1, 4 }
+  FlankRight = subject ("flank right" | "go right") { ..., 1, 5 }
+  Stop = subject ("stop" | "hold position" | "halt" | "stay there" | "stay here") { ..., 1, 6 }
+  // NOTE: Articulate maps "wait" to 1-6 — the same entry as Stop, an apparent
+  // upstream bug ("wait for me" is its own move-menu entry). Reproduced for
+  // parity; same-keys-different-phrases is legal in our machinery.
+  WaitForMe = subject ("wait for me" | "wait up" | "wait") { ..., 1, 6 }
+  Cover = subject ("go for cover" | "look for cover" | "cover" | "find cover"
+                  | "get to cover" | "hide") { ..., 1, 7 }
+  NextWaypoint = subject ("next waypoint" | "go to the next waypoint") { ..., 1, 8 }
+  // NOTE: Articulate lists "move up" both here and under Advance. The same full
+  // phrase reaching two different commands is a hard error in our machinery,
+  // so MoveTo keeps only its unambiguous alternates.
+  MoveTo = subject ("move to" | "move" | "move there") { ..., space }
+
+  // ============================ Target menu (2) ==============================
+
+  OpenTargetMenu = subject ("show targets" | "target menu" | "open target menu" | "targets") { ..., 2 }
+  CancelTarget = subject ("cancel target" | "cancel targets" | "no target") { ..., 2, 1 }
+
+  // ============================ Engage menu (3) ==============================
+
+  OpenFire = subject ("open fire" | "go loud" | "fire at will") { ..., 3, 1 }
+  HoldFire = subject ("hold fire" | "go quiet" | "cease fire") { ..., 3, 2 }
+  // NOTE: "fire" is a strict prefix of "fire at will" (OpenFire), so "two fire"
+  // waits out the completion timeout before firing.
+  Fire = subject ("fire" | "take the shot") { ..., 3, 3 }
+  // NOTE: "engage" is likewise a prefix of "engage at will", and "move to
+  // engage" overlaps MoveTo's "move to" — both resolved by the matcher's
+  // longest-match walk plus the completion timeout.
+  Engage = subject ("engage" | "move to engage") { ..., 3, 4 }
+  EngageAtWill = subject "engage at will" { ..., 3, 5 }
+  Disengage = subject "disengage" { ..., 3, 6 }
+  ScanHorizon = subject ("scan horizon" | "scan the horizon") { ..., 3, 7 }
+
+  // NOTE: "north" is a strict prefix of "north east"/"north west" (same for
+  // "south") — a completion-timeout point in the middle of a command.
+  direction = ( "north"      { 1 }
+              | "north east" { 2 }
+              | "east"       { 3 }
+              | "south east" { 4 }
+              | "south"      { 5 }
+              | "south west" { 6 }
+              | "west"       { 7 }
+              | "north west" { 8 } )
+
+  // Named captures place each part of the vector around the menu presses:
+  // `sub...` first, then the menu, a beat for it to open, then `dir...`.
+  // A bare `...` would splice both in spoken order with the menu presses in
+  // the wrong place.
+  Watch = subject:sub ("watch" | "watch the") direction:dir { sub..., 3, 8, wait(20ms), dir... }
+
+  // NOTE: Articulate spells this alternate "suppresive fire"; the typo would
+  // fail vocabulary validation, so it is corrected here.
+  Suppress = subject ("suppressive fire" | "suppress") { ..., 3, 9 }
+
+  // ============================= Mount menu (4) ==============================
+
+  OpenMountMenu = subject ("show mount menu" | "open mount menu" | "show vehicles"
+                          | "mount menu" | "get in vehicle") { ..., 4 }
+  Dismount = subject ("dismount" | "get out") { ..., 4, 1 }
+
+  // ============================ Status menu (5) ==============================
+  // NOTE: Articulate requires a subject on status reports too ("all bingo
+  // fuel"), which reads oddly but is kept for parity; a capture inside an
+  // unmatched optional splices empty, so `subject?` is a safe one-token
+  // change if we ever want to relax it.
+
+  LowFuel = subject ("fuel low" | "bingo fuel" | "be advised bingo fuel"
+                    | "be advised low fuel" | "be advised fuel low") { ..., 5, 2 }
+  LowAmmo = subject ("i'm running low on ammo" | "running low on ammo" | "ammo low") { ..., 5, 3 }
+  Injured = subject ("i'm injured" | "injured" | "medic" | "i need a medic" | "i need some help"
+                    | "i need some help now" | "somebody help me" | "wounded" | "i'm hit") { ..., 5, 4 }
+  Sitrep = subject ("report in over" | "sitrep" | "report status" | "report in") { ..., 5, 5 }
+  UnderFire = subject ("i'm under fire" | "taking fire" | "under fire" | "enemy fire") { ..., 5, 6 }
+  HostileDown = subject ("hostile down" | "target down" | "scratch one" | "he is down"
+                        | "target neutralized" | "tango down") { ..., 5, 7 }
+  ManDown = subject ("we have lost one" | "man down" | "he is hit" | "we have got a man down") { ..., 5, 8 }
+
+  // ============================ Action menu (6) ==============================
+
+  OpenActionMenu = subject ("show actions" | "action menu" | "perform action" | "do action"
+                           | "open action menu" | "actions") { ..., 6 }
+
+  // =========================== Combat modes (7) ==============================
+
+  Stealth = subject ("stealth" | "stealthy" | "stealth mode") { ..., 7, 1 }
+  CombatMode = subject ("combat" | "danger" | "combat mode") { ..., 7, 2 }
+  Aware = subject ("aware" | "alert" | "aware mode" | "stay sharp" | "stay frosty" | "stay alert") { ..., 7, 3 }
+  Relax = subject ("relax" | "relaxed mode" | "safe") { ..., 7, 4 }
+  StandUp = subject ("stand up" | "get up" | "stand") { ..., 7, 6 }
+  Crouch = subject ("get low" | "crouch" | "stay crouched" | "stay low") { ..., 7, 7 }
+  Prone = subject ("go prone" | "get down" | "prone" | "hit the dirt" | "down") { ..., 7, 8 }
+  CopyMyStance = subject ("copy my stance" | "default stance") { ..., 7, 9 }
+
+  // ============================ Formations (8) ===============================
+
+  formation_shape = ( "column"           { 1 }
+                    | "staggered column" { 2 }
+                    | "wedge"            { 3 }
+                    | "echelon left"     { 4 }
+                    | "echelon right"    { 5 }
+                    | "vee"              { 6 }
+                    | "line"             { 7 }
+                    | "file"             { 8 }
+                    | "diamond"          { 9 } )
+
+  Formation = subject:sub ("formation" | "form") formation_shape:shape { sub..., 8, shape... }
+
+  // ========================== Team assignment (9) ============================
+  // The same colour words as team_colour, but with *different* keys — a
+  // direct-object colour presses the unshifted menu number. Context (being
+  // after "assign …") decides which output "red" carries.
+
+  assign_colour = ( "red"    { 1 }
+                  | "green"  { 2 }
+                  | "blue"   { 3 }
+                  | "yellow" { 4 }
+                  | "white"  { 5 } )
+
+  // "two assign to team red", "all add to red", "three switch to team blue" …
+  // The group capture `(...):colour` aliases the whole term; the optional
+  // "team" contributes no commands, so `colour...` is just the number press.
+  Assign = subject:sub ("assign" | "assign to" | "add to" | "switch to") ("team"? assign_colour):colour { sub..., 9, colour... }
