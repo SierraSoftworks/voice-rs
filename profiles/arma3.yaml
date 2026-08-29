@@ -13,9 +13,6 @@
 # bare chord ("m", "1", "leftshift+f1") is a press; `hold(..)`, `release(..)` and
 # `wait(..)` cover the uncommon cases.
 #
-# NOTE: this profile uses the v2 inline-grammar format, which is designed but
-# not yet implemented — it will not load until the grammar engine lands.
-#
 # Play with: voice-orders run profiles/arma3.yaml -- %command%
 name: Arma 3
 model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph

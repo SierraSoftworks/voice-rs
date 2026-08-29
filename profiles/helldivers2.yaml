@@ -9,8 +9,13 @@
 # continuing with "sentry" calls the sentry instead.
 #
 # Where a name is a compound the speech model has never heard — "autocannon",
-# "hellbomb", "meltagun" — the phrase splits it into words the model does know and
-# a `name:` carries the real spelling into the logs and the validate report.
+# "hellbomb", "meltagun" — the spoken literal splits it into words the model does
+# know and the rule's TitleCase name carries the real spelling into the logs and
+# the validate report.
+#
+# TitleCase rules are published as speakable commands; `"word"?` may be left
+# unsaid, and `("either" | "or")` groups the alternatives — the v2 spellings of
+# the old `[optional]` and `{alternate, choices}` forms.
 #
 # Play with: voice-orders run profiles/helldivers2.yaml -- %command%
 name: Helldivers 2
@@ -27,378 +32,134 @@ defaults:
   duration: 30ms
   interval: 30ms
 
-commands:
-  # ── Mission stratagems: ship ──────────────────────────────────────────
-  - phrase: "{reinforce, reinforcements}"
-    keys: [up, down, right, left, up]
-
-  - phrase: "{resupply, supplies}"
-    keys: [down, down, up, right]
-
-  - phrase: "[eagle] rearm"
-    keys: [up, up, left, up, right]
-
-  - phrase: "[call in] super destroyer"
-    keys: [up, up, down, down, left, right, left, right]
-
-  - name: SOS beacon
-    phrase: "sos beacon"
-    keys: [up, down, right, up]
-
-  # ── Mission stratagems: objectives ────────────────────────────────────
-  - name: Hellbomb
-    phrase: "hell bomb"
-    keys: [down, up, left, down, up, right, down, up]
-
-  - phrase: "cargo container"
-    keys: [up, up, down, down, right, down]
-
-  - phrase: "prospecting drill"
-    keys: [down, down, left, right, down, down]
-
-  - name: SEAF artillery
-    phrase: "artillery"
-    keys: [right, up, up, down]
-
-  - phrase: "seismic probe"
-    keys: [up, up, left, right, down, down]
-
-  - name: SSSD delivery
-    phrase: "{ssd, hard drive}"
-    keys: [down, down, down, down, down, up, up]
-
-  - phrase: "[raise] [super earth] flag"
-    keys: [down, up, down, up]
-
-  - phrase: "tectonic drill"
-    keys: [up, down, up, down, up, down]
-
-  - phrase: "{upload data, reinforcement pods}"
-    keys: [left, right, up, up, up]
-
-  - phrase: "hive breaker drill"
-    keys: [left, up, down, right, down, down]
-
-  - phrase: "dark fluid vessel"
-    keys: [up, left, right, down, up, up]
-
-  - phrase: "tactical video camera"
-    keys: [right, down, down, up, left, left, up]
-
-  - phrase: "aquifer drill"
-    keys: [left, left, left, up, down, right, down, down]
-
-  - phrase: "[portable] comms relay"
-    keys: [up, up, down, down, left, left, down]
-
-  # Mission-issued only: no permit buys this one.
-  - phrase: "[orbital] illumination flare"
-    keys: [right, right, left, left]
-
-  # ── Support weapons ───────────────────────────────────────────────────
-  - name: Machine gun
-    phrase: "machine gun"
-    keys: [down, left, down, up, right]
-
-  - phrase: "stalwart"
-    keys: [down, left, down, up, up, left]
-
-  - phrase: "heavy machine gun"
-    keys: [down, left, up, down, down]
-
-  - name: Bullet Storm
-    phrase: "bullet storm"
-    keys: [down, left, down, right, up, left]
-
-  - name: Maxigun
-    phrase: "maxi gun"
-    keys: [down, left, right, down, up, up]
-
-  - name: Anti-Materiel Rifle
-    phrase: "anti {materiel, material} rifle"
-    keys: [down, left, right, up, down]
-
-  - name: Autocannon
-    phrase: "auto cannon"
-    keys: [down, left, down, up, up, right]
-
-  - phrase: "laser cannon"
-    keys: [down, left, down, up, left]
-
-  - phrase: "quasar cannon"
-    keys: [down, down, up, left, right]
-
-  - name: Railgun
-    phrase: "rail gun"
-    keys: [down, right, down, up, left, right]
-
-  - phrase: "{recoil less rifle, recoil rifle}"
-    keys: [down, left, right, right, left]
-
-  - phrase: "expendable anti tank"
-    keys: [down, down, left, up, right]
-
-  - phrase: "expendable napalm"
-    keys: [down, down, left, up, left]
-
-  - name: Leveller
-    phrase: "leveller"
-    keys: [down, down, left, up, down]
-
-  - phrase: "spear"
-    keys: [down, down, up, down, down]
-
-  - name: W.A.S.P. launcher
-    phrase: "wasp [launcher]"
-    keys: [down, down, up, down, right]
-
-  - phrase: "commando"
-    keys: [down, left, up, down, right]
-
-  - name: Airburst rocket launcher
-    phrase: "airburst rocket launcher"
-    keys: [down, up, up, left, right]
-
-  - phrase: "grenade launcher"
-    keys: [down, left, up, left, down]
-
-  - phrase: "belt fed grenade launcher"
-    keys: [down, left, up, left, up, up]
-
-  - phrase: "arc thrower"
-    keys: [down, right, down, up, left, left]
-
-  - name: Speargun
-    phrase: "speargun"
-    keys: [down, right, down, left, up, right]
-
-  - phrase: "flame thrower"
-    keys: [down, left, up, down, up]
-
-  - phrase: "sterilizer"
-    keys: [down, left, up, down, left]
-
-  - name: Cremator
-    phrase: "{crema tor, cremate or}"
-    keys: [down, down, right, down, up, up]
-
-  - name: Meltagun
-    phrase: "melt a gun"
-    keys: [down, left, up, left, left, down]
-
-  - name: Epoch
-    phrase: "epoch"
-    keys: [down, left, up, left, right]
-
-  - name: De-Escalator
-    phrase: "de escalator"
-    keys: [down, right, up, left, right]
-
-  - name: C4 pack
-    phrase: "c four pack"
-    keys: [down, right, up, up, right, up]
-
-  - phrase: "solo silo"
-    keys: [down, up, right, down, down]
-
-  - phrase: "one true flag"
-    keys: [down, left, right, right, up]
-
-  - phrase: "breaching hammer"
-    keys: [down, left, right, left, up]
-
-  - phrase: "defoliation tool"
-    keys: [down, left, right, right, down]
-
-  # ── Backpacks ─────────────────────────────────────────────────────────
-  - phrase: "guard dog"
-    keys: [down, up, left, up, right, down]
-
-  - phrase: "[guard dog] rover"
-    keys: [down, up, left, up, right, right]
-
-  - name: K-9
-    phrase: "[guard dog] {k nine, canine}"
-    keys: [down, up, left, up, right, left]
-
-  - name: Hot Dog
-    phrase: "[guard dog] hot dog"
-    keys: [down, up, left, up, left, left]
-
-  - name: Dog Breath
-    phrase: "[guard dog] dog breath"
-    keys: [down, up, left, up, right, up]
-
-  - phrase: "supply pack"
-    keys: [down, left, down, up, up, down]
-
-  - phrase: "jump pack"
-    keys: [down, up, up, down, up]
-
-  - phrase: "hover pack"
-    keys: [down, up, up, down, left, right]
-
-  - phrase: "warp pack"
-    keys: [down, left, right, down, left, right]
-
-  - phrase: "shield [generator] pack"
-    keys: [down, up, left, right, left, right]
-
-  - phrase: "ballistic shield [backpack]"
-    keys: [down, left, down, down, up, left]
-
-  - phrase: "directional shield"
-    keys: [down, up, left, right, up, up]
-
-  - name: Portable hellbomb
-    phrase: "portable hell bomb"
-    keys: [down, right, up, up, up]
-
-  # ── Vehicles ──────────────────────────────────────────────────────────
-  - phrase: "patriot [exo suit]"
-    keys: [left, down, right, up, left, down, down]
-
-  - phrase: "emancipator [exo suit]"
-    keys: [left, down, right, up, left, down, up]
-
-  - phrase: "lumberer [exo suit]"
-    keys: [left, down, right, up, right, left, up]
-
-  - phrase: "breakthrough [exo suit]"
-    keys: [left, down, right, left, right, down, up]
-
-  - name: Gunner FRV
-    phrase: "gunner {f r v, buggy}"
-    keys: [left, down, right, down, right, down, up]
-
-  - name: Supply FRV
-    phrase: "supply {f r v, buggy}"
-    keys: [left, down, left, left, down, up, right]
-
-  - name: Incinerator FRV
-    phrase: "incinerator {f r v, buggy}"
-    keys: [left, down, right, left, down, up, up]
-
-  - name: Bastion
-    phrase: "{tank, bastion}"
-    keys: [left, down, right, down, left, down, up, down, up]
-
-  # ── Orbitals ──────────────────────────────────────────────────────────
-  - phrase: "[orbital] precision strike"
-    keys: [right, right, up]
-
-  - phrase: "[orbital] gatling barrage"
-    keys: [right, down, left, up, up]
-
-  - phrase: "[orbital] air burst [strike]"
-    keys: [right, right, right]
-
-  - phrase: "[orbital] gas strike"
-    keys: [right, right, down, right]
-
-  - name: Orbital EMS strike
-    phrase: "[orbital] ems [strike]"
-    keys: [right, right, left, down]
-
-  - phrase: "[orbital] smoke [strike]"
-    keys: [right, right, down, up]
-
-  - phrase: "[orbital] {one twenty, one hundred twenty} [millimeter] barrage"
-    keys: [right, right, down, left, right, down]
-
-  - phrase: "[orbital] walking barrage"
-    keys: [right, down, right, down, right, down]
-
-  - phrase: "[orbital] {three eighty, three hundred eighty} [millimeter] barrage"
-    keys: [right, down, up, up, left, down, down]
-
-  - phrase: "[orbital] napalm barrage"
-    keys: [right, right, down, left, right, up]
-
-  - name: Orbital railcannon strike
-    phrase: "[orbital] rail cannon [strike]"
-    keys: [right, up, down, down, right]
-
-  - phrase: "orbital laser"
-    keys: [right, down, up, right, down]
-
-  # ── Eagles ────────────────────────────────────────────────────────────
-  - phrase: "[eagle] strafing run"
-    keys: [up, right, right]
-
-  - phrase: "[eagle] airstrike"
-    keys: [up, right, down, right]
-
-  - phrase: "[eagle] cluster bomb"
-    keys: [up, right, down, down, right]
-
-  - phrase: "eagle napalm [{strike, airstrike}]"
-    keys: [up, right, down, up]
-
-  - phrase: "eagle smoke [strike]"
-    keys: [up, right, up, down]
-
-  - name: Eagle 110mm rocket pods
-    phrase: "[eagle] {one ten, one hundred ten} [millimeter] rocket pods"
-    keys: [up, right, up, left]
-
-  - phrase: "[eagle] five hundred [kilo] [bomb]"
-    keys: [up, right, down, down, down]
-
-  # ── Sentries (natural order — ambiguous with the support weapons) ─────
-  - phrase: "machine gun sentry"
-    keys: [down, up, right, right, up]
-
-  - phrase: "gatling sentry"
-    keys: [down, up, right, left]
-
-  - name: Autocannon sentry
-    phrase: "auto cannon sentry"
-    keys: [down, up, right, up, left, up]
-
-  - phrase: "mortar sentry"
-    keys: [down, up, right, right, down]
-
-  - phrase: "ems mortar sentry"
-    keys: [down, up, right, down, right]
-
-  - phrase: "gas mortar sentry"
-    keys: [down, up, right, down, left]
-
-  - phrase: "rocket sentry"
-    keys: [down, up, right, right, left]
-
-  - phrase: "tesla tower"
-    keys: [down, up, right, up, left, right]
-
-  - phrase: "laser sentry"
-    keys: [down, up, right, down, up, right]
-
-  - phrase: "flame sentry"
-    keys: [down, up, right, down, up, up]
-
-  # ── Emplacements & mines ──────────────────────────────────────────────
-  - phrase: "{anti personnel mines, anti personnel minefield}"
-    keys: [down, left, up, right]
-
-  - phrase: "{anti tank mines, anti tank minefield}"
-    keys: [down, left, up, up]
-
-  - phrase: "incendiary {mines, minefield}"
-    keys: [down, left, left, down]
-
-  - phrase: "gas {mines, minefield}"
-    keys: [down, left, left, right]
-
-  - phrase: "shield [generator] relay"
-    keys: [down, down, left, right, left, right]
-
-  - phrase: "grenadier battlement"
-    keys: [down, right, down, left, right]
-
-  - name: HMG emplacement
-    phrase: "[heavy] machine gun emplacement"
-    keys: [down, up, left, right, right, left]
-
-  - phrase: "anti tank emplacement"
-    keys: [down, up, left, right, right, right]
+grammar: |
+  // ── Mission stratagems: ship ──────────────────────────────────────────
+  Reinforce = "reinforce" | "reinforcements" | "call in reinforcements" { up, down, right, left, up }
+  Resupply = "resupply" | "supplies" { down, down, up, right }
+  Rearm = "eagle"? "rearm" { up, up, left, up, right }
+  SuperDestroyer = "call in"? "super destroyer" { up, up, down, down, left, right, left, right }
+  SosBeacon = "sos beacon" { up, down, right, up }
+
+  // ── Mission stratagems: objectives ────────────────────────────────────
+  Hellbomb = "hell bomb" { down, up, left, down, up, right, down, up }
+  CargoContainer = "cargo container" { up, up, down, down, right, down }
+  ProspectingDrill = "prospecting drill" { down, down, left, right, down, down }
+  SeafArtillery = "artillery" { right, up, up, down }
+  SeismicProbe = "seismic probe" { up, up, left, right, down, down }
+  SssdDelivery = "ssd" | "hard drive" { down, down, down, down, down, up, up }
+  Flag = "raise"? "super earth"? "flag" { down, up, down, up }
+  TectonicDrill = "tectonic drill" { up, down, up, down, up, down }
+  UploadData = "upload data" | "reinforcement pods" { left, right, up, up, up }
+  HiveBreakerDrill = "hive breaker drill" { left, up, down, right, down, down }
+  DarkFluidVessel = "dark fluid vessel" { up, left, right, down, up, up }
+  TacticalVideoCamera = "tactical video camera" { right, down, down, up, left, left, up }
+  AquiferDrill = "aquifer drill" { left, left, left, up, down, right, down, down }
+  CommsRelay = "portable"? "comms relay" { up, up, down, down, left, left, down }
+
+  // Mission-issued only: no permit buys this one.
+  IlluminationFlare = "orbital"? "illumination flare" { right, right, left, left }
+
+  // ── Support weapons ───────────────────────────────────────────────────
+  MachineGun = "machine gun" { down, left, down, up, right }
+  Stalwart = "stalwart" { down, left, down, up, up, left }
+  HeavyMachineGun = "heavy machine gun" { down, left, up, down, down }
+  BulletStorm = "bullet storm" { down, left, down, right, up, left }
+  Maxigun = "maxi gun" { down, left, right, down, up, up }
+  AntiMaterielRifle = "anti" ("materiel" | "material") "rifle" { down, left, right, up, down }
+  Autocannon = "auto cannon" { down, left, down, up, up, right }
+  LaserCannon = "laser cannon" { down, left, down, up, left }
+  QuasarCannon = "quasar cannon" { down, down, up, left, right }
+  Railgun = "rail gun" { down, right, down, up, left, right }
+  RecoillessRifle = "recoil less rifle" | "recoil rifle" { down, left, right, right, left }
+  ExpendableAntiTank = "expendable anti tank" { down, down, left, up, right }
+  ExpendableNapalm = "expendable napalm" { down, down, left, up, left }
+  Leveller = "leveller" { down, down, left, up, down }
+  Spear = "spear" { down, down, up, down, down }
+  WaspLauncher = "wasp" "launcher"? { down, down, up, down, right }
+  Commando = "commando" { down, left, up, down, right }
+  AirburstRocketLauncher = "airburst rocket launcher" { down, up, up, left, right }
+  GrenadeLauncher = "grenade launcher" { down, left, up, left, down }
+  BeltFedGrenadeLauncher = "belt fed grenade launcher" { down, left, up, left, up, up }
+  ArcThrower = "arc thrower" { down, right, down, up, left, left }
+  Speargun = "speargun" { down, right, down, left, up, right }
+  FlameThrower = "flame thrower" { down, left, up, down, up }
+  Sterilizer = "sterilizer" { down, left, up, down, left }
+  Cremator = "crema tor" | "cremate or" { down, down, right, down, up, up }
+  Meltagun = "melt a gun" { down, left, up, left, left, down }
+  Epoch = "epoch" { down, left, up, left, right }
+  DeEscalator = "de escalator" { down, right, up, left, right }
+  C4Pack = "c four pack" { down, right, up, up, right, up }
+  SoloSilo = "solo silo" { down, up, right, down, down }
+  OneTrueFlag = "one true flag" { down, left, right, right, up }
+  BreachingHammer = "breaching hammer" { down, left, right, left, up }
+  DefoliationTool = "defoliation tool" { down, left, right, right, down }
+
+  // ── Backpacks ─────────────────────────────────────────────────────────
+  GuardDog = "guard dog" { down, up, left, up, right, down }
+  Rover = "guard dog"? "rover" { down, up, left, up, right, right }
+  K9 = "guard dog"? ("k nine" | "canine") { down, up, left, up, right, left }
+  HotDog = "guard dog"? "hot dog" { down, up, left, up, left, left }
+  DogBreath = "guard dog"? "dog breath" { down, up, left, up, right, up }
+  SupplyPack = "supply pack" { down, left, down, up, up, down }
+  JumpPack = "jump pack" { down, up, up, down, up }
+  HoverPack = "hover pack" { down, up, up, down, left, right }
+  WarpPack = "warp pack" { down, left, right, down, left, right }
+  ShieldPack = "shield" "generator"? "pack" { down, up, left, right, left, right }
+  BallisticShield = "ballistic shield" "backpack"? { down, left, down, down, up, left }
+  DirectionalShield = "directional shield" { down, up, left, right, up, up }
+  PortableHellbomb = "portable hell bomb" { down, right, up, up, up }
+
+  // ── Vehicles ──────────────────────────────────────────────────────────
+  Patriot = "patriot" "exo suit"? { left, down, right, up, left, down, down }
+  Emancipator = "emancipator" "exo suit"? { left, down, right, up, left, down, up }
+  Lumberer = "lumberer" "exo suit"? { left, down, right, up, right, left, up }
+  Breakthrough = "breakthrough" "exo suit"? { left, down, right, left, right, down, up }
+  GunnerFrv = "gunner" ("f r v" | "buggy") { left, down, right, down, right, down, up }
+  SupplyFrv = "supply" ("f r v" | "buggy") { left, down, left, left, down, up, right }
+  IncineratorFrv = "incinerator" ("f r v" | "buggy") { left, down, right, left, down, up, up }
+  Bastion = "tank" | "bastion" { left, down, right, down, left, down, up, down, up }
+
+  // ── Orbitals ──────────────────────────────────────────────────────────
+  PrecisionStrike = "orbital"? "precision strike" { right, right, up }
+  GatlingBarrage = "orbital"? "gatling barrage" { right, down, left, up, up }
+  AirburstStrike = "orbital"? "air burst" "strike"? { right, right, right }
+  GasStrike = "orbital"? "gas strike" { right, right, down, right }
+  OrbitalEmsStrike = "orbital"? "ems" "strike"? { right, right, left, down }
+  SmokeStrike = "orbital"? "smoke" "strike"? { right, right, down, up }
+  OneTwentyBarrage = "orbital"? ("one twenty" | "one hundred twenty") "millimeter"? "barrage" { right, right, down, left, right, down }
+  WalkingBarrage = "orbital"? "walking barrage" { right, down, right, down, right, down }
+  ThreeEightyBarrage = "orbital"? ("three eighty" | "three hundred eighty") "millimeter"? "barrage" { right, down, up, up, left, down, down }
+  NapalmBarrage = "orbital"? "napalm barrage" { right, right, down, left, right, up }
+  RailcannonStrike = "orbital"? "rail cannon" "strike"? { right, up, down, down, right }
+  OrbitalLaser = "orbital laser" { right, down, up, right, down }
+
+  // ── Eagles ────────────────────────────────────────────────────────────
+  StrafingRun = "eagle"? "strafing run" { up, right, right }
+  Airstrike = "eagle"? "airstrike" { up, right, down, right }
+  ClusterBomb = "eagle"? "cluster bomb" { up, right, down, down, right }
+  EagleNapalm = "eagle" "napalm" ("strike" | "airstrike")? { up, right, down, up }
+  EagleSmoke = "eagle" "smoke" "strike"? { up, right, up, down }
+  RocketPods = "eagle"? ("one ten" | "one hundred ten") "millimeter"? "rocket pods" { up, right, up, left }
+  FiveHundredKilo = "eagle"? "five hundred" "kilo"? "bomb"? { up, right, down, down, down }
+
+  // ── Sentries (natural order — ambiguous with the support weapons) ─────
+  MachineGunSentry = "machine gun sentry" { down, up, right, right, up }
+  GatlingSentry = "gatling sentry" { down, up, right, left }
+  AutocannonSentry = "auto cannon sentry" { down, up, right, up, left, up }
+  MortarSentry = "mortar sentry" { down, up, right, right, down }
+  EmsMortarSentry = "ems mortar sentry" { down, up, right, down, right }
+  GasMortarSentry = "gas mortar sentry" { down, up, right, down, left }
+  RocketSentry = "rocket sentry" { down, up, right, right, left }
+  TeslaTower = "tesla tower" { down, up, right, up, left, right }
+  LaserSentry = "laser sentry" { down, up, right, down, up, right }
+  FlameSentry = "flame sentry" { down, up, right, down, up, up }
+
+  // ── Emplacements & mines ──────────────────────────────────────────────
+  AntiPersonnelMines = "anti personnel" ("mines" | "minefield") { down, left, up, right }
+  AntiTankMines = "anti tank" ("mines" | "minefield") { down, left, up, up }
+  IncendiaryMines = "incendiary" ("mines" | "minefield") { down, left, left, down }
+  GasMines = "gas" ("mines" | "minefield") { down, left, left, right }
+  ShieldRelay = "shield" "generator"? "relay" { down, down, left, right, left, right }
+  GrenadierBattlement = "grenadier battlement" { down, right, down, left, right }
+  HmgEmplacement = "heavy"? "machine gun emplacement" { down, up, left, right, right, left }
+  AntiTankEmplacement = "anti tank emplacement" { down, up, left, right, right, right }
