@@ -1,6 +1,6 @@
 # voice-orders
 
-**Speak a phrase, press the keys: a Linux-native voice macro tool.**
+**Speak a phrase, press the keys: a Linux-native voice macro tool, with a Windows build in beta.**
 
 [![Rust](https://github.com/SierraSoftworks/voice-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/SierraSoftworks/voice-rs/actions/workflows/rust.yml)
 [![Documentation](https://github.com/SierraSoftworks/voice-rs/actions/workflows/docs-website.yml/badge.svg)](https://sierrasoftworks.github.io/voice-rs/)
@@ -9,6 +9,11 @@
 voice-orders is a voice macro tool for Linux in the spirit of VoiceAttack and LinVAM: you say a command phrase, and it
 presses keys in your game for you. It listens only for the phrases your profile defines, it types through the kernel
 rather than through the display server, and it gets out of the way when your game exits.
+
+Windows is supported and every feature is there — `SendInput` keystrokes, a system-wide hotkey, the Steam wrapper — but
+it is **beta** until someone has run it on real Windows hardware in a real game; see the
+[installation guide](https://sierrasoftworks.github.io/voice-rs/guide/installation.html#windows) for the zip and its
+one caveat.
 
 📖 **[Read the documentation →](https://sierrasoftworks.github.io/voice-rs/)**
 

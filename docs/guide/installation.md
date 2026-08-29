@@ -99,7 +99,47 @@ check is silent and time-limited, so an unreachable GitHub costs you nothing —
 happen when output is piped or redirected, which includes launching through Steam: nothing gets
 between you and your game.
 
+## Windows
+
+Windows is packaged as a single zip, because the binary and libvosk have to travel together there:
+
+```
+voice-orders-windows-amd64.zip
+├── voice-orders.exe
+├── libvosk.dll
+├── libstdc++-6.dll
+├── libgcc_s_seh-1.dll
+└── libwinpthread-1.dll
+```
+
+Unzip it **anywhere** — a folder in your user profile is fine, and nothing is installed, registered or elevated.
+Windows looks for a DLL in the executable's own directory first, so voice-orders finds `libvosk.dll` wherever the
+folder happens to be, and `libvosk.dll` finds the three MinGW runtime DLLs beside it the same way. Keep all five files
+together and it works; separate them and it will not.
+
+There is also a plain `voice-orders-windows-amd64.exe` asset on the [releases page][releases]. That one is what
+`voice-orders update` downloads to replace an installed binary — it carries no DLLs, so it is not the file to start
+with.
+
+::: warning
+The Windows build of libvosk is frozen at **0.3.45**, which predates Vosk's endpointer controls. Two consequences:
+
+- [`recognition.silence`](../profiles/README.md#recognition-silence) has no effect: Vosk's stock trailing-silence
+  behaviour decides when an utterance has ended. voice-orders says so once, at startup — *"this libvosk build does not
+  support endpointer tuning; recognition.silence has no effect"* — rather than letting the option quietly do nothing.
+- Commands still fire from partial results the moment the phrase is unambiguous, so what you wait for is eager
+  matching's latency and not the full end-of-utterance one. It is the reason the frozen library is liveable.
+:::
+
+Permissions need nothing on Windows; see the [permissions guide](./permissions.md#on-windows). Everything below about
+models applies unchanged, except that the models directory a bare `model:` name is resolved against is
+`%LOCALAPPDATA%\voice-orders\models`, and the configuration file is `%APPDATA%\voice-orders\config.yaml`.
+
 ## libvosk
+
+::: tip
+Windows users can skip this section — `libvosk.dll` is in the zip above.
+:::
 
 Download the prebuilt library from the [Vosk API releases][vosk-releases] — the file is named
 `vosk-linux-x86_64-<version>.zip` (or `vosk-linux-aarch64-<version>.zip` on ARM):

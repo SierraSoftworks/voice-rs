@@ -83,6 +83,32 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Setup Cache
+        uses: Swatinem/rust-cache@v2
+
+      # The same suite the Linux job runs, and for the same reason: the tests
+      # which need a Vosk model, a microphone or a real virtual keyboard are
+      # gated behind `pure_tests`, which is what makes them skip on a runner
+      # that has none of the three. Nothing links libvosk (it is loaded with
+      # LoadLibrary at runtime), so there is no DLL to install to compile or to
+      # run these.
+      #
+      # No coverage instrumentation here: grcov's report is uploaded from the
+      # Linux job, and the point of this one is that the *behaviour* is the same
+      # on both platforms.
+      - name: Run tests
+        run: cargo test --features pure_tests --no-fail-fast
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -200,21 +226,32 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux builds only - the evdev/uinput layer is deliberately
-          # Linux-first, so there are no Windows or macOS targets. Both arches
-          # build natively on a runner of their own architecture, which keeps
-          # the ALSA and libudev headers, libvosk and the linker all in the
-          # same place rather than juggling them across a cross container.
+          # Every row builds natively on a runner of its own architecture and
+          # operating system, which keeps the headers, libvosk and the linker
+          # all in the same place rather than juggling them across a cross
+          # container. macOS is still deliberately absent: there is no output
+          # backend for it.
+          #
+          # `rustflags` is per-row because the rpath the Linux rows need is a
+          # GNU-ld flag which the MSVC linker would reject outright.
           - arch: amd64
             os: linux
             run_on: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             vosk_arch: x86_64
+            rustflags: "-C link-args=-Wl,-rpath,$ORIGIN,-rpath,$ORIGIN/../lib,-rpath,$ORIGIN/../../../../lib"
           - arch: arm64
             os: linux
             run_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             vosk_arch: aarch64
+            rustflags: "-C link-args=-Wl,-rpath,$ORIGIN,-rpath,$ORIGIN/../lib,-rpath,$ORIGIN/../../../../lib"
+          - arch: amd64
+            os: windows
+            run_on: windows-latest
+            target: x86_64-pc-windows-msvc
+            vosk_arch: win64
+            rustflags: ""
 
     steps:
       - name: Check out code
@@ -228,6 +265,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install build dependencies
+        if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
       - name: Cache libvosk
@@ -237,6 +275,7 @@ jobs:
           key: libvosk-${{ matrix.vosk_arch }}-${{ env.VOSK_VERSION }}
 
       - name: Install libvosk
+        if: matrix.os == 'linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -254,6 +293,29 @@ jobs:
           test -f "$dir/libvosk.so"
           echo "VOSK_LIB_DIR=$dir" >> "$GITHUB_ENV"
 
+      # The Windows build of libvosk is a MinGW one, so it arrives with the
+      # three runtime DLLs it imports. All four have to travel together — the
+      # loader flag voice-orders uses (LOAD_WITH_ALTERED_SEARCH_PATH) looks for
+      # them beside libvosk.dll — so all four are asserted here rather than
+      # discovered missing by somebody's game launch.
+      - name: Install libvosk (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/vosk/lib"
+          dir="$root/vosk-win64-${VOSK_VERSION}"
+          if [ ! -f "$dir/libvosk.dll" ]; then
+            mkdir -p "$root"
+            curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/libvosk.zip \
+              "https://github.com/alphacep/vosk-api/releases/download/v${VOSK_VERSION}/vosk-win64-${VOSK_VERSION}.zip"
+            unzip -q -o /tmp/libvosk.zip -d "$root"
+          fi
+          for dll in libvosk.dll libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+            test -f "$dir/$dll" || { echo "vosk-win64-${VOSK_VERSION} is missing $dll" >&2; exit 1; }
+          done
+          echo "VOSK_LIB_DIR=$dir" >> "$GITHUB_ENV"
+
       - name: Setup Cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -264,7 +326,7 @@ jobs:
         with:
           name: cargofile
 
-      # libvosk.so is dlopen'd by name, and dlopen searches the calling
+      # On Linux, libvosk.so is dlopen'd by name and dlopen searches the calling
       # binary's RUNPATH — so the rpath is what lets an installed voice-orders
       # find the library in each layout the release assets end up in:
       #   $ORIGIN                    - the two files unpacked side by side
@@ -273,17 +335,20 @@ jobs:
       #                                Cellar/voice-orders/<version>/bin
       # A single -Wl argument carries all three because RUSTFLAGS is split on
       # spaces, so each entry has to be comma-separated rather than a flag of
-      # its own.
+      # its own. It comes from the matrix because it is a GNU-ld flag: Windows
+      # needs no equivalent (a DLL is looked for beside the .exe first) and the
+      # MSVC linker would reject it, so that row's `rustflags` is empty.
       - name: cargo build
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          RUSTFLAGS: "-C link-args=-Wl,-rpath,$ORIGIN,-rpath,$ORIGIN/../lib,-rpath,$ORIGIN/../../../../lib"
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       # Release assets are published raw rather than as a tarball so they can be
       # dropped straight onto a PATH, and so the Homebrew tap (which downloads
       # and hashes a single binary named {app}-{os}-{arch}) can consume them.
       # libvosk.so travels as its own asset for the same reason.
       - name: Stage release artifacts
+        if: matrix.os == 'linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -291,9 +356,44 @@ jobs:
           cp "${VOSK_LIB_DIR}/libvosk.so" "libvosk-${{ matrix.os }}-${{ matrix.arch }}.so"
           chmod +x "voice-orders-${{ matrix.os }}-${{ matrix.arch }}"
 
+      # Windows ships twice, because two different things download it:
+      #
+      #   voice-orders-windows-amd64.exe  the raw binary, which is the asset
+      #                                   `voice-orders update` looks for — the
+      #                                   name is update-rs' Go-style
+      #                                   convention (`naming::go`), including
+      #                                   the `.exe`, and src/update.rs pins it.
+      #   voice-orders-windows-amd64.zip  the binary and the four libvosk DLLs
+      #                                   side by side, which is the layout a
+      #                                   person wants: unzip it anywhere and it
+      #                                   works, because Windows looks for a
+      #                                   DLL in the executable's own directory
+      #                                   first.
+      #
+      # 7-Zip rather than `zip`, which the Windows runner image does not have.
+      - name: Stage release artifacts (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="voice-orders-${{ matrix.os }}-${{ matrix.arch }}"
+          built="target/${{ matrix.target }}/release/voice-orders.exe"
+
+          cp "$built" "${asset}.exe"
+
+          mkdir -p "$asset"
+          cp "$built" "$asset/voice-orders.exe"
+          for dll in libvosk.dll libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+            cp "${VOSK_LIB_DIR}/$dll" "$asset/"
+          done
+          7z a -tzip -bso0 "${asset}.zip" "./$asset/*"
+
+          test -f "${asset}.exe"
+          test -f "${asset}.zip"
+
       - name: Upload GitHub Release Artifacts
         uses: SierraSoftworks/gh-releases@v1.0.10
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' && matrix.os == 'linux'
         with:
           files: |
             voice-orders-${{ matrix.os }}-${{ matrix.arch }}
@@ -301,7 +401,18 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           overwrite: "true"
 
+      - name: Upload GitHub Release Artifacts (Windows)
+        uses: SierraSoftworks/gh-releases@v1.0.10
+        if: github.event_name == 'release' && matrix.os == 'windows'
+        with:
+          files: |
+            voice-orders-${{ matrix.os }}-${{ matrix.arch }}.exe
+            voice-orders-${{ matrix.os }}-${{ matrix.arch }}.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
+          overwrite: "true"
+
       - name: Upload build artifacts
+        if: matrix.os == 'linux'
         uses: actions/upload-artifact@v7
         with:
           name: voice-orders-${{ matrix.os }}-${{ matrix.arch }}
@@ -309,10 +420,24 @@ jobs:
             voice-orders-${{ matrix.os }}-${{ matrix.arch }}
             libvosk-${{ matrix.os }}-${{ matrix.arch }}.so
 
+      - name: Upload build artifacts (Windows)
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: voice-orders-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            voice-orders-${{ matrix.os }}-${{ matrix.arch }}.exe
+            voice-orders-${{ matrix.os }}-${{ matrix.arch }}.zip
+
   # Fan in once every target's assets are published, so the tap never holds a
   # formula which only covers half the platforms. The repository is `voice-rs`
   # but the binary (and therefore the formula and asset prefix) is
   # `voice-orders`, hence the explicit name.
+  #
+  # The Windows row is fanned in here too — `needs` names a job, not a matrix
+  # row — but it contributes nothing: with no `os`/`arch` input the action scans
+  # the platforms Homebrew has, and the Windows assets are neither named
+  # `voice-orders-{os}-{arch}` nor a platform it looks for.
   tap:
     name: Update Homebrew Tap
     runs-on: ubuntu-latest

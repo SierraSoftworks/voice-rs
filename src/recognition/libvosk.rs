@@ -780,29 +780,47 @@ mod tests {
         assert_eq!(DecodingState::from_c_int(-1), DecodingState::Failed);
     }
 
+    /// The candidates every platform ends with: the bare SONAME, plus — on
+    /// Windows only — the bundled `vosk/` directory beside the executable.
+    fn common_tail() -> Vec<PathBuf> {
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut tail = vec![PathBuf::from(LIB_NAME)];
+
+        #[cfg(windows)]
+        if let Some(directory) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        {
+            tail.push(directory.join(WINDOWS_BUNDLE_DIR).join(LIB_NAME));
+        }
+
+        tail
+    }
+
     #[test]
     fn candidates_prefer_the_configured_path() {
         // The env var is process-global, so this test owns it for its duration
         // and puts it back; `cargo test` runs tests in threads.
         let dir = tempfile::tempdir().unwrap();
 
+        let expected: Vec<PathBuf> = std::iter::once(dir.path().join(LIB_NAME))
+            .chain(common_tail())
+            .collect();
         assert_eq!(
             with_lib_path(Some(dir.path().as_os_str()), candidates),
-            vec![dir.path().join(LIB_NAME), PathBuf::from(LIB_NAME)],
+            expected,
             "a directory should be joined with the library's name"
         );
 
         let file = dir.path().join("vosk-custom.so");
+        let expected: Vec<PathBuf> = std::iter::once(file.clone()).chain(common_tail()).collect();
         assert_eq!(
             with_lib_path(Some(file.as_os_str()), candidates),
-            vec![file, PathBuf::from(LIB_NAME)],
+            expected,
             "a path which is not a directory should be used as-is"
         );
 
-        assert_eq!(
-            with_lib_path(None, candidates),
-            vec![PathBuf::from(LIB_NAME)]
-        );
+        assert_eq!(with_lib_path(None, candidates), common_tail());
     }
 
     /// Runs `body` with [`LIB_PATH_ENV`] set to `value`, restoring it after.
