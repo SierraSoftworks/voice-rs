@@ -106,6 +106,16 @@ impl UiEvent {
         }
     }
 
+    fn extra_text(&self) -> Option<String> {
+        match self {
+            UiEvent::Matched { utterance, .. } => utterance.map(|seq| format!("# {seq}")),
+            UiEvent::Heard { seq, .. } | UiEvent::Hearing { seq, .. } | UiEvent::Muted { seq } => {
+                Some(format!("# {seq}"))
+            }
+            _ => None,
+        }
+    }
+
     /// The color of the dot this event leads its log line with.
     fn color(&self) -> Color {
         match self {
@@ -141,19 +151,21 @@ impl UiEvent {
     /// should depend on. The one exception is a recognition, which the log
     /// merges into a single live entry ([`Entry::Recognition`]).
     fn line(&self, at: SystemTime) -> Line<'static> {
-        log_line(at, self.color(), self.plain_line(), self.text_style())
+        log_line(at, self.color(), self.plain_line(), self.text_style(), self.extra_text())
     }
 }
 
 /// One log line: the time it happened, a dot in the entry's color, and its
 /// text.
-fn log_line(at: SystemTime, dot: Color, text: String, style: Style) -> Line<'static> {
+fn log_line(at: SystemTime, dot: Color, text: String, style: Style, extra_text: Option<String>) -> Line<'static> {
     Line::from(vec![
         Span::styled(clock_time(at), Style::new().fg(Color::DarkGray)),
         Span::raw(" "),
         Span::styled(DOT, Style::new().fg(dot)),
         Span::raw(" "),
         Span::styled(text, style),
+        Span::raw(" "),
+        Span::styled(extra_text.unwrap_or_default(), style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
     ])
 }
 
@@ -342,20 +354,18 @@ impl Entry {
             return event.line(at);
         };
 
-        // An abandoned entry says what happened to it; the others speak for
-        // themselves.
-        let mut said = match stage {
-            Stage::Abandoned => format!("{text:?} (muted)"),
-            _ => format!("{text:?}"),
+        let extra_text = match (stage, matches) {
+            (Stage::Abandoned, _) => Some("(muted)".to_string()),
+            (_, matches) if !matches.is_empty() => {
+                let resolved = matches
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!("({resolved})"))
+            },
+            _ => None,
         };
-        if !matches.is_empty() {
-            let resolved = matches
-                .iter()
-                .map(|m| format!("{} ({})", m.name, m.plan))
-                .collect::<Vec<_>>()
-                .join(", ");
-            said = format!("{said} → {resolved}");
-        }
 
         // The dot keeps the severity vocabulary: green the moment anything
         // fires, grey while nothing has, yellow for an utterance a mute cut
@@ -379,7 +389,7 @@ impl Entry {
             (Stage::Settled, false) => (Color::Green, Style::new()),
             (Stage::Abandoned, _) => (Color::Yellow, Style::new().fg(Color::DarkGray)),
         };
-        log_line(at, dot, said, style)
+        log_line(at, dot, format!("{text:?}"), style, extra_text)
     }
 }
 
