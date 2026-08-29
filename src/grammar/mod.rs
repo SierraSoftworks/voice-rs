@@ -7,6 +7,7 @@ mod lexer;
 mod location;
 mod parser;
 mod token;
+pub mod v2;
 
 #[allow(unused_imports)] // consumed as the wave-2 config/matcher modules land
 pub use expr::{Node, PhraseExpr};
