@@ -537,7 +537,7 @@ impl<'a> Engine<'a> {
                 .collect();
             let message = format!(
                 "eager mismatch: fired {} from a partial hypothesis, but the utterance settled as {:?} — the keys were already pressed, and the rest of the utterance was dropped",
-                quoted_list(&pressed),
+                quoted_list(pressed),
                 utterance.text
             );
             self.warn_user(message);
@@ -798,7 +798,17 @@ pub async fn engine_task(
             .and_then(|ctx| ctx.resting.as_ref().map(|rest| rest.deadline))
             .or(state.deadline());
 
+        // `biased` so the arms are polled in a deliberate order: an event
+        // which has already been *heard* — a mute above all, but equally a
+        // continuation partial still in flight — must always be drained
+        // before a timer is trusted. Every event spends real time in the
+        // audio and recognition pipeline before it reaches this channel, so
+        // whenever an event and an elapsed deadline are ready together, the
+        // event describes something which physically happened first; an
+        // unbiased select would let the timer win that race half the time
+        // and fire a command the user had already muted (or superseded).
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 // Cancellation is a shutdown demanded from outside the
                 // pipeline (signal, child exit): like a mute, it must not
@@ -816,30 +826,6 @@ pub async fn engine_task(
                 }
                 debug!("Shutdown requested, stopping the matcher.");
                 return Ok(());
-            }
-            _ = deadline_elapsed(deadline) => {
-                if let Some(ctx) = eager.as_mut() {
-                    // The partial hypothesis held still long enough: the
-                    // resting command fires, and the utterance stays open —
-                    // later partials may still extend it, and the eventual
-                    // Final reconciles against `fired`.
-                    if let Some(rest) = ctx.resting.take() {
-                        ctx.fired.push(Match {
-                            position: rest.position,
-                            accept: rest.accept.clone(),
-                        });
-                        if !engine.fire(&rest.accept).await {
-                            return Ok(());
-                        }
-                    }
-                } else if let MatchState::Pending { accept, .. } =
-                    std::mem::replace(&mut state, MatchState::Idle)
-                    && !engine.fire(&accept).await
-                {
-                    // The speaker paused long enough: the pending command is
-                    // the one they meant.
-                    return Ok(());
-                }
             }
             event = events.recv() => match event {
                 Some(RecognitionEvent::Final(utterance)) => {
@@ -871,7 +857,7 @@ pub async fn engine_task(
                             if !probe.is_dead() {
                                 *deadline = Instant::now() + engine.options.completion_timeout;
                             }
-                        }
+                       }
                     }
                 }
                 Some(RecognitionEvent::Failed) => {
@@ -926,6 +912,30 @@ pub async fn engine_task(
                     debug!("The recognition channel was closed, stopping the matcher.");
                     return Ok(());
                 }
+            },
+            _ = deadline_elapsed(deadline) => {
+                if let Some(ctx) = eager.as_mut() {
+                    // The partial hypothesis held still long enough: the
+                    // resting command fires, and the utterance stays open —
+                    // later partials may still extend it, and the eventual
+                    // Final reconciles against `fired`.
+                    if let Some(rest) = ctx.resting.take() {
+                        ctx.fired.push(Match {
+                            position: rest.position,
+                            accept: rest.accept.clone(),
+                        });
+                        if !engine.fire(&rest.accept).await {
+                            return Ok(());
+                        }
+                    }
+                } else if let MatchState::Pending { accept, .. } =
+                    std::mem::replace(&mut state, MatchState::Idle)
+                    && !engine.fire(&accept).await
+                {
+                    // The speaker paused long enough: the pending command is
+                    // the one they meant.
+                    return Ok(());
+                }
             }
         }
     }
@@ -953,15 +963,22 @@ fn words_of(text: &str) -> Vec<String> {
 /// Renders a list of command names for a warning line: `"a", "b"` —
 /// `(nothing)` when empty, which cannot happen for a mismatch but should not
 /// panic if it somehow does.
-fn quoted_list(names: &[String]) -> String {
-    if names.is_empty() {
+fn quoted_list(names: impl IntoIterator<Item = String>) -> String {
+    let names = names.into_iter();
+    if matches!(names.size_hint(), (0, Some(0))) {
         return "(nothing)".to_string();
     }
-    names
-        .iter()
+
+    let list = names
         .map(|name| format!("{name:?}"))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+
+    if list.is_empty() {
+        "(nothing)".to_string()
+    } else {
+        list
+    }
 }
 
 #[cfg(test)]
@@ -1287,6 +1304,28 @@ mod tests {
         h.nothing_fired();
         h.hear_final("deploy sentry").await;
         assert_eq!(h.fired(), vec!["DeploySentry"]);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_muted_already_heard_beats_an_elapsed_deadline() {
+        // The mute is already sitting in the events channel when the pending
+        // deadline elapses — the physical mute happened first, and its event
+        // merely took time to travel. The engine must drain what it has heard
+        // before trusting any timer, every time: an unbiased select would let
+        // the timer win this race about half the time.
+        let mut h = Harness::start(arsenal());
+
+        for _ in 0..32 {
+            h.hear_final("autocannon").await;
+            h.nothing_fired();
+
+            h.events
+                .try_send(RecognitionEvent::Muted)
+                .expect("the engine should still be listening");
+            h.advance(TIMEOUT * 2).await;
+            h.nothing_fired();
+        }
         h.shutdown().await;
     }
 
@@ -1717,6 +1756,75 @@ mod tests {
         // Matching still works from a clean slate.
         h.hear_final("deploy sentry").await;
         assert_eq!(h.fired(), vec!["DeploySentry"]);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eager_muted_partials_never_combine_with_later_words() {
+        // The paused-PTT case: a half-matched prefix heard before the mute
+        // must neither fire nor combine with anything said after listening
+        // resumes — only the post-mute command may fire.
+        let mut h = Harness::start_with(arsenal(), eager_options());
+
+        h.hear_partial("autocannon").await; // rests on the ambiguous accept
+        h.mute().await;
+
+        // Nothing from before the mute may fire, however long we wait...
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+
+        // ...and the words spoken after it start from a clean root: "sentry"
+        // continues nothing.
+        h.hear_partial("sentry").await;
+        h.advance(EAGER_DELAY + TIMEOUT).await;
+        h.hear_final("sentry").await;
+        h.nothing_fired();
+        h.no_warnings();
+
+        // Only a complete post-mute command fires.
+        h.hear_final("deploy sentry").await;
+        assert_eq!(h.fired(), vec!["DeploySentry"]);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eager_muted_pending_command_never_fires_or_combines() {
+        // A command left Pending by its Final, then muted: it must not fire
+        // from its timer, and its resting walk must not carry into whatever is
+        // said after the mute.
+        let mut h = Harness::start_with(arsenal(), eager_options());
+
+        h.hear_final("autocannon").await; // Pending
+        h.mute().await;
+
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+
+        h.hear_partial("sentry").await;
+        h.advance(EAGER_DELAY + TIMEOUT).await;
+        h.hear_final("sentry").await;
+        h.nothing_fired();
+        h.no_warnings();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eager_muted_absorbed_pending_is_dropped_with_the_context() {
+        // The pending command was absorbed into an open context by the next
+        // utterance's partial; the mute must drop both the context and the
+        // absorbed command.
+        let mut h = Harness::start_with(arsenal(), eager_options());
+
+        h.hear_final("autocannon").await; // Pending
+        h.hear_partial("sentry").await; // absorbed into the context
+        h.mute().await;
+
+        h.advance(EAGER_DELAY + TIMEOUT * 2).await;
+        h.nothing_fired();
+
+        h.hear_final("sentry").await;
+        h.nothing_fired();
+        h.no_warnings();
         h.shutdown().await;
     }
 
