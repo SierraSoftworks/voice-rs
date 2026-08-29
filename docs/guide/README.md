@@ -45,7 +45,7 @@ quietly degrading.
 
 | Model | Size | Dynamic graph | Verdict |
 |---|---|---|---|
-| [`vosk-model-en-us-0.22-lgraph`][lgraph] | ~128 MB | yes | **Recommended.** A much larger vocabulary, so far fewer of your phrase words come back as unknown, and it still ships the word list which powers nearest-word suggestions. |
+| [`vosk-model-en-us-0.22-lgraph`][lgraph] | ~128 MB | yes | **Recommended.** A much larger vocabulary, so far fewer of your grammar's words come back as unknown, and it still ships the word list which powers nearest-word suggestions. |
 | [`vosk-model-small-en-us-0.15`][small] | ~40 MB | yes | The lightweight option. Works fine, but its smaller vocabulary rejects more words, and it ships no readable `graph/words.txt`, so `validate` cannot suggest nearby words. |
 | `vosk-model-en-us-0.22` (static) | ~1.8 GB | no | Rejected — grammar mode is unavailable, which defeats the design. |
 
@@ -144,34 +144,49 @@ means the profile you share with a friend works on their machine and on yours wi
 
 ## Step #4: Write your first profile
 
-`voice-orders new` writes a profile with every option present as a comment, plus one worked command per output form:
+`voice-orders new` writes a profile with every option present as a comment, plus a small worked grammar — two
+speakable commands, a private building block and a capture:
 
 ```sh
 voice-orders new drg.yaml
 ```
 
-Open it and set `model:` to the model you unpacked, then add the commands you want. A minimal, complete profile looks
+Open it and set `model:` to the model you unpacked, then write the commands you want. A minimal, complete profile looks
 like this:
 
-```yaml{2,5-6}
+```yaml{2,4-5}
 name: Deep Rock Galactic
 model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
 
-commands:
-  - phrase: deploy [the] {autocannon, auto cannon} [sentry]
-    keys: ["4"]
+grammar: |
+  Autocannon = "deploy"? "the"? ("autocannon" | "auto cannon") "sentry"? { 4 }
 ```
 
-Phrases are written in a [small DSL](../grammar/README.md): plain words are required in order, `[optional]` groups may
-be left unsaid, and `{alternate, choices}` groups require exactly one of their branches. The keys you may press are
-listed in the [key reference](../keys/README.md), and every profile option is documented in the
+Commands are [grammar rules](../grammar/README.md). A **TitleCase** rule is a speakable command and a lowercase one is
+a private building block other rules reuse; `"quoted words"` are what you say, `?` marks a word you may leave unsaid,
+`( | )` groups alternatives, and the `{ ... }` block says what a match presses. The keys you may press are listed in
+the [key reference](../keys/README.md), and every profile option is documented in the
 [profile reference](../profiles/README.md).
+
+Rules compose, which is the point of writing them this way — one private rule can carry the words *and* the keys that a
+dozen commands share:
+
+```yaml
+grammar: |
+  direction = ( "north" { up }
+              | "south" { down }
+              | "east"  { right }
+              | "west"  { left } )
+
+  // "look north", ... — the capture places the direction's press after the
+  // map key and its settle time.
+  Look = "look" direction:dir { m, wait(20ms), dir... }
+```
 
 ## Step #5: Validate it
 
-`validate` is the fastest feedback loop you have. It checks the structure, compiles every phrase, lints the output
-plans, and looks up every word of every phrase in the model's vocabulary — reporting **everything it finds in one
-pass**:
+`validate` is the fastest feedback loop you have. It compiles your grammar, lints it, looks up every word of it in the
+model's vocabulary, and tells you how the profile will behave — reporting **everything it finds in one pass**:
 
 ```sh
 voice-orders validate drg.yaml
@@ -180,8 +195,9 @@ voice-orders validate drg.yaml
 ```
 drg.yaml — Deep Rock Galactic
 
-deploy [the] {autocannon, auto cannon} [sentry]
-  ok
+Autocannon
+  note: compiles into 30 automaton states
+  note: saying "autocannon" will wait 350ms in case you continue with "autocannon sentry"
 
 1 command checked — 0 errors, 0 warnings.
 ```
@@ -189,7 +205,7 @@ deploy [the] {autocannon, auto cannon} [sentry]
 When a word is not in the model's vocabulary you get an error naming the word, with suggestions: a spelling fix, a
 compound split (`autocannon` → `auto cannon`), or the nearest words the model actually knows. The exit code is `1` if
 anything was an error, and `0` when there were only warnings and notes — so it drops straight into CI if you keep your
-profiles in a repository.
+profiles in a repository. The [validation guide](./validation.md) covers every finding it can report.
 
 ## Step #6: Rehearse it
 
@@ -202,20 +218,20 @@ voice-orders test drg.yaml
 
 ```
 listening: on
-heard: deploy the auto cannon
-matched: Deploy the autocannon
-  down 4, wait 30ms, up 4
+heard: "deploy the auto cannon"
+matched: "Autocannon" → 4
 listening: off
 ```
 
 Talk to it. Every utterance it recognizes appears as a `heard:` line, every command it matches appears as a `matched:`
-line with the exact key plan it *would* have played, and pressing your hotkey shows the listening state changing. Ctrl-C
-exits.
+line named by the rule which matched — with whatever it captured in parentheses — and the exact key plan it *would*
+have played. Pressing your hotkey shows the listening state changing. Ctrl-C exits. In an interactive terminal the same
+information is drawn as a full-screen view instead; piped output stays line-oriented, exactly as above.
 
 Because it presses nothing, it is safe to run over a terminal you are reading — and because it needs no uinput
 permissions, you can rehearse a profile before you have finished setting your system up. It is also the quickest way to
-answer "is it hearing me at all?": a `heard:` line with no `matched:` line means your phrases do not cover what you
-said, while no `heard:` line at all points at the audio device or the listening state instead.
+answer "is it hearing me at all?": a `heard:` line with no `matched:` line means no rule in your grammar covers what
+you said, while no `heard:` line at all points at the audio device or the listening state instead.
 
 ## Step #7: Run it
 

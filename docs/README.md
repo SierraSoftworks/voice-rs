@@ -11,7 +11,7 @@ actions:
 features:
     - title: Grammar Constrained Accuracy
       details: |
-        Your profile is compiled into a Vosk recognition grammar containing only the phrases it can act on, so the
+        Your profile is compiled into a Vosk recognition grammar containing only what it can act on, so the
         recognizer never has to guess between "deploy the sentry" and the rest of the English language.
 
     - title: Works Inside Games
@@ -19,10 +19,10 @@ features:
         Hotkeys are read from evdev and keystrokes are typed through a uinput virtual keyboard, both of which sit below
         the display server — so voice-orders behaves identically on X11, on Wayland, and in fullscreen.
 
-    - title: Ambiguity Handled For You
+    - title: Commands Which Compose
       details: |
-        When one command's phrase is a prefix of another's, a configurable completion timeout waits to see whether you
-        are still talking, instead of firing the wrong macro underneath you.
+        Rules build on rules, so forty commands can share one spoken subject — and when a short command is the prefix
+        of a longer one, a configurable completion timeout waits to see whether you are still talking.
 
     - title: Shareable YAML Profiles
       details: |
@@ -51,7 +51,7 @@ voice-orders doctor
 # Scaffold a profile with every option documented in comments
 voice-orders new drg.yaml
 
-# Edit it, then check the phrases against your model's vocabulary
+# Edit it, then check the grammar against your model's vocabulary
 voice-orders validate drg.yaml
 
 # Rehearse it out loud — no keys are pressed, no uinput needed
@@ -85,24 +85,17 @@ defaults:
   duration: 30ms
   interval: 25ms
 
-commands:
-  - name: Deploy the autocannon
-    phrase: deploy [the] {autocannon, auto cannon} [sentry]
-    keys: ["4"]
+# TitleCase rules are published as speakable commands; lowercase rules are
+# private building blocks. `//` comments run to the end of the line.
+grammar: |
+  Autocannon = "deploy"? "the"? ("autocannon" | "auto cannon") "sentry"? { 4 }
 
-  - name: Open the terminal
-    phrase: open [the] terminal
-    keys: ["leftctrl+leftalt+t"]
+  Terminal = "open" "the"? "terminal" { leftctrl+leftalt+t }
 
-  - name: Salute
-    phrase: salute
-    events:
-      - down: x
-      - wait: 750ms
-      - up: x
+  Salute = "salute" { hold(x), wait(750ms), release(x) }
 ```
 
-Every option in that file is documented in the [profile reference](./profiles/README.md), the phrase syntax is covered
+Every option in that file is documented in the [profile reference](./profiles/README.md), the rule language is covered
 in the [grammar reference](./grammar/README.md), and every key name you may write is listed in the
 [key reference](./keys/README.md).
 

@@ -42,6 +42,7 @@ export default defineUserConfig({
           '/guide/README.md',
           '/guide/installation.md',
           '/guide/permissions.md',
+          '/guide/validation.md',
           '/guide/steam.md',
         ]
       },
@@ -77,6 +78,7 @@ export default defineUserConfig({
             '/guide/README.md',
             '/guide/installation.md',
             '/guide/permissions.md',
+            '/guide/validation.md',
             '/guide/steam.md',
           ]
         }
