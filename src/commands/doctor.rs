@@ -1200,7 +1200,7 @@ mod tests {
         // A profile which names one wins.
         let profile = Profile::parse(&crate::config::LoadedProfile {
             source: "test-profile.yaml".to_string(),
-            content: "audio:\n  device: Yeti\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n"
+            content: "audio:\n  device: Yeti\ngrammar: |\n  Salute = \"salute\" { x }\n"
                 .to_string(),
         })
         .expect("the profile should load");
@@ -1214,7 +1214,7 @@ mod tests {
         let profile = Profile::parse(&crate::config::LoadedProfile {
             source: "test-profile.yaml".to_string(),
             content:
-                "name: Keyless\nhotkey:\n  device: auto\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n"
+                "name: Keyless\nhotkey:\n  device: auto\ngrammar: |\n  Salute = \"salute\" { x }\n"
                     .to_string(),
         })
         .expect("the profile should load — a missing key is a resolution problem, not a parse one");
@@ -1310,7 +1310,7 @@ mod tests {
     fn test_a_profile_without_a_hotkey_passes_without_touching_dev_input() {
         let profile = Profile::parse(&crate::config::LoadedProfile {
             source: "test-profile.yaml".to_string(),
-            content: "name: Quiet\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n".to_string(),
+            content: "name: Quiet\ngrammar: |\n  Salute = \"salute\" { x }\n".to_string(),
         })
         .expect("the profile should load");
 
@@ -1340,8 +1340,7 @@ mod tests {
     fn test_the_profile_model_is_used_when_a_profile_is_given() {
         let profile = Profile::parse(&crate::config::LoadedProfile {
             source: "test-profile.yaml".to_string(),
-            content: "model: /profile/model\ncommands:\n  - phrase: salute\n    keys: [\"x\"]\n"
-                .to_string(),
+            content: "model: /profile/model\ngrammar: |\n  Salute = \"salute\" { x }\n".to_string(),
         })
         .expect("the profile should load");
 

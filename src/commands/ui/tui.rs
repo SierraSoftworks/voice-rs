@@ -585,7 +585,7 @@ mod tests {
         let profile = Profile::parse(&crate::config::LoadedProfile {
             source: "profiles/helldivers2.yaml".to_string(),
             content: format!(
-                "name: Helldivers 2\nmodel: /models/en\n{yaml}commands:\n  - phrase: salute\n    keys: [\"x\"]\n"
+                "name: Helldivers 2\nmodel: /models/en\n{yaml}grammar: |\n  Salute = \"salute\" {{ x }}\n"
             ),
         })
         .expect("the profile should load");
