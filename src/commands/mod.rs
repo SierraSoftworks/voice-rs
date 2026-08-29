@@ -7,6 +7,7 @@ mod run;
 mod setup;
 mod test;
 mod ui;
+mod update;
 mod validate;
 
 #[derive(Subcommand, Debug)]
@@ -25,6 +26,8 @@ pub enum Command {
     Doctor(doctor::DoctorArgs),
     /// List this machine's microphones and input devices, as audio.device and hotkey.device see them.
     Devices(devices::DevicesArgs),
+    /// Update voice-orders itself to the latest release from GitHub.
+    Update(update::UpdateArgs),
 }
 
 /// Dispatches the parsed CLI arguments to the matching subcommand, returning
@@ -38,5 +41,6 @@ pub async fn dispatch(args: crate::Args) -> Result<i32, crate::Error> {
         Command::Setup(args) => setup::run(args).await,
         Command::Doctor(args) => doctor::run(args).await,
         Command::Devices(args) => devices::run(args).await,
+        Command::Update(args) => update::run(args).await,
     }
 }
