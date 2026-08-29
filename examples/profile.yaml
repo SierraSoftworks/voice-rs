@@ -13,19 +13,20 @@ hotkey:
 
 completion_timeout: 350ms  # ambiguous-prefix settle time (default: 300ms)
 
-defaults:                  # applies to the `keys:` shorthand form
-  duration: 30ms           # how long each chord is held down
-  interval: 25ms           # gap between chords
+defaults:                  # pacing for assembled key plans
+  duration: 30ms           # how long each press is held down
+  interval: 25ms           # gap between consecutive presses
 
-commands:
-  - phrase: deploy [the] {autocannon, auto cannon} [sentry]
-    keys: ["4"]                        # shorthand: press sequence
+# TitleCase rules are published as speakable commands; lowercase rules are
+# private building blocks. `//` comments run to the end of the line.
+grammar: |
+  // "deploy the autocannon", "auto cannon sentry", ... — `?` marks a word you
+  // may leave unsaid, `( | )` groups the alternatives, and the `{ ... }` block
+  // says what a match presses.
+  Autocannon = "deploy"? "the"? ("autocannon" | "auto cannon") "sentry"? { 4 }
 
-  - phrase: open [the] terminal
-    keys: ["leftctrl+leftalt+t"]       # chord: all down in listed order, all up in reverse
+  // A `+`-joined chord goes down together and comes up in reverse order.
+  Terminal = "open" "the"? "terminal" { leftctrl+leftalt+t }
 
-  - phrase: salute
-    events:                            # explicit form: full control
-      - down: x
-      - wait: 750ms
-      - up: x
+  // hold/wait/release cover the uncommon cases needing explicit timing.
+  Salute = "salute" { hold(x), wait(750ms), release(x) }

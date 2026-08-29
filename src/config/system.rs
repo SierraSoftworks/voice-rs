@@ -355,7 +355,7 @@ mod tests {
     fn profile(content: &str) -> Profile {
         Profile::parse(&crate::config::LoadedProfile {
             source: "test-profile.yaml".to_string(),
-            content: format!("{content}commands:\n  - phrase: salute\n    keys: [\"x\"]\n"),
+            content: format!("{content}grammar: |\n  Salute = \"salute\" {{ x }}\n"),
         })
         .expect("the profile should load")
     }

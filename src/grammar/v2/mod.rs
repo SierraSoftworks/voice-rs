@@ -10,9 +10,6 @@
 //! with errors accumulated across lexing, parsing *and* analysis, so loading a
 //! grammar once reports every problem it has.
 
-// Consumed as the automaton compiler, matcher and profile wiring (G4–G6) land.
-#![allow(dead_code)]
-
 mod analysis;
 mod ast;
 mod automaton;
@@ -24,17 +21,10 @@ mod token;
 
 use std::collections::BTreeSet;
 
-#[allow(unused_imports)] // the remainder is consumed as the profile wiring (G6) lands
-pub use ast::{
-    Action, ActionBlock, ActionKind, Alternation, Atom, Branch, Capture, Chord, ChordSegment,
-    MAX_REPETITION, Repeat, Rule, Span, Term,
-};
-#[allow(unused_imports)] // consumed as the matcher (G5) lands
-pub use automaton::{Accept, Automaton, MAX_AUTOMATON_STATES, MAX_HYPOTHESES, Walk};
-#[allow(unused_imports)] // consumed as the profile wiring (G6) lands
-pub use diagnostic::{Diagnostic, DiagnosticKind, user_error};
-#[allow(unused_imports)] // consumed as the profile wiring (G6) lands
-pub use feed::{Decomposition, Feed, MAX_EXPANSIONS_PER_RULE, feed};
+pub use ast::{ActionBlock, ActionKind, Alternation, Atom, Branch, Rule, Term};
+pub use automaton::{Accept, Automaton, Walk};
+pub use diagnostic::{Diagnostic, user_error};
+pub use feed::{Feed, MAX_EXPANSIONS_PER_RULE, feed};
 
 /// A parsed and analyzed grammar: the spanned rule list plus everything the
 /// automaton compiler and `validate` need to know about it.
@@ -90,11 +80,6 @@ impl Grammar {
         &self.source
     }
 
-    /// Every rule, in definition order.
-    pub fn rules(&self) -> &[Rule] {
-        &self.rules
-    }
-
     /// Looks up a rule by name.
     pub fn rule(&self, name: &str) -> Option<&Rule> {
         self.rules.iter().find(|rule| rule.name == name)
@@ -137,6 +122,18 @@ impl Grammar {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for Grammar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Parsing during deserialization makes a bad grammar a config-load
+        // error rather than a runtime surprise; the folded error — every
+        // ariadne report, with its source excerpt — travels through as the
+        // custom message.
+        let source = String::deserialize(deserializer)?;
+        Grammar::parse(&source)
+            .map_err(|diagnostics| serde::de::Error::custom(user_error(&diagnostics, &source)))
+    }
+}
+
 /// Shared test fixtures: the canonical Arma profile's grammar, used by the
 /// parser, automaton and feed test suites alike.
 #[cfg(test)]
@@ -156,6 +153,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    use super::diagnostic::DiagnosticKind;
     use super::fixtures::arma_source as arma_grammar;
     use super::*;
 
@@ -233,7 +231,7 @@ mod tests {
                 .expect("should load");
         let published: Vec<&str> = grammar.published().map(|rule| rule.name.as_str()).collect();
         assert_eq!(published, vec!["Map", "Select"]);
-        assert_eq!(grammar.rules().len(), 3);
+        assert_eq!(grammar.rules.len(), 3);
     }
 
     #[test]
@@ -241,6 +239,40 @@ mod tests {
         let source = "Map = \"map\" { notakey }";
         let diagnostics = Grammar::parse(source).expect_err("the key should be rejected");
         let error = user_error(&diagnostics, source);
+        let message = error.to_string();
+        assert!(message.contains("notakey"), "got: {message}");
+        assert!(
+            message.contains("Your grammar has a problem"),
+            "got: {message}"
+        );
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Doc {
+        name: String,
+        grammar: Grammar,
+    }
+
+    #[test]
+    fn test_deserialize_parses_during_load() {
+        let doc: Doc = serde_yaml::from_str("name: Arma\ngrammar: |\n  Map = \"map\" { m }\n")
+            .expect("the document should load");
+
+        assert_eq!(doc.name, "Arma");
+        assert_eq!(
+            doc.grammar
+                .published()
+                .map(|rule| rule.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Map"]
+        );
+    }
+
+    #[test]
+    fn test_deserialize_surfaces_rendered_diagnostics_at_load_time() {
+        let error =
+            serde_yaml::from_str::<Doc>("name: broken\ngrammar: |\n  Map = \"map\" { notakey }\n")
+                .expect_err("the document should fail to load");
         let message = error.to_string();
         assert!(message.contains("notakey"), "got: {message}");
         assert!(
