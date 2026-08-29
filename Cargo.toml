@@ -7,6 +7,8 @@ license = "MIT"
 repository = "https://github.com/SierraSoftworks/voice-rs"
 
 [dependencies]
+ariadne = "0.6"
+chumsky = "0.13"
 clap = { version = "4.6", features = ["derive"] }
 cpal = "0.16"
 human-errors = { version = "0.2.3", features = ["pretty"] }
