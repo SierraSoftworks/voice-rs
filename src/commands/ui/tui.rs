@@ -875,9 +875,7 @@ mod tests {
         // Row 2 is the rule under the header, so the log starts at row 3.
         let lines: Vec<String> = (3..6).map(|y| row(&buffer, y)).collect();
         assert!(
-            lines[0].contains(&format!(
-                "{DOT} \"deploy the autocannon\" → Autocannon (leftctrl+4)"
-            )),
+            lines[0].contains(&format!("{DOT} \"deploy the autocannon\" (Autocannon)")),
             "the utterance and its match share one upgraded entry: {lines:?}"
         );
         assert!(
@@ -1023,7 +1021,7 @@ mod tests {
 
         let buffer = screen(&app, 90, 12);
         assert!(
-            row(&buffer, 3).contains("\"auto cannon sentry\" → AutocannonSentry (5)"),
+            row(&buffer, 3).contains("\"auto cannon sentry\" (AutocannonSentry)"),
             "the eager fire is visible with no Final in sight: {:?}",
             row(&buffer, 3)
         );

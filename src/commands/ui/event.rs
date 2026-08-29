@@ -161,8 +161,12 @@ impl UiEvent {
     }
 }
 
-/// One log line: the time it happened, a dot in the entry's color, and its
-/// text.
+/// One log line: the time it happened, a dot in the entry's color, its text,
+/// and — where the event has one — a dimmed suffix carrying the detail which
+/// should not compete with the words for attention.
+///
+/// The suffix is only appended when there is one, so a line without one does
+/// not end in a stray space.
 fn log_line(
     at: SystemTime,
     dot: Color,
@@ -170,18 +174,21 @@ fn log_line(
     style: Style,
     extra_text: Option<String>,
 ) -> Line<'static> {
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(clock_time(at), Style::new().fg(Color::DarkGray)),
         Span::raw(" "),
         Span::styled(DOT, Style::new().fg(dot)),
         Span::raw(" "),
         Span::styled(text, style),
-        Span::raw(" "),
-        Span::styled(
-            extra_text.unwrap_or_default(),
+    ];
+    if let Some(extra_text) = extra_text.filter(|extra| !extra.is_empty()) {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            extra_text,
             style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        ),
-    ])
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The columns a log line spends before its text starts: `HH:MM:SS`, a space,
@@ -189,9 +196,17 @@ fn log_line(
 /// so the timestamp+dot gutter keeps entries visually distinct.
 const GUTTER: usize = 11;
 
-/// Wraps one log line to `width` columns: the text is word-wrapped (long
+/// How many spans of a [`log_line`] make up that gutter: the timestamp, the
+/// dot, and the spaces around it. Everything after them is content to wrap.
+const GUTTER_SPANS: usize = 4;
+
+/// Wraps one log line to `width` columns: the content is word-wrapped (long
 /// words hard-broken) and every continuation line is indented past the
-/// timestamp+dot gutter, keeping the entry's style on every piece.
+/// timestamp+dot gutter.
+///
+/// The content is not one span — an entry's dimmed suffix is styled
+/// differently from the words it follows — so wrapping carries each word's own
+/// style with it, and a row which straddles the boundary keeps both.
 ///
 /// A terminal too narrow to fit anything past the gutter gets the line
 /// unwrapped — ratatui truncates it, which is the best a six-column terminal
@@ -202,83 +217,88 @@ pub(crate) fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
         return vec![line];
     };
 
-    // Every log line is built by `log_line`: gutter spans first, the text
-    // last. Anything else (defensively) passes through unwrapped.
-    let Some((text_span, gutter_spans)) = line.spans.split_last() else {
+    // Every log line is built by `log_line`: the gutter spans first, then the
+    // content. Anything else (defensively) passes through unwrapped.
+    if line.spans.len() <= GUTTER_SPANS {
         return vec![line];
-    };
-    if text_span.content.chars().count() <= room {
+    }
+    let (gutter_spans, content) = line.spans.split_at(GUTTER_SPANS);
+    let measured: usize = content
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    if measured <= room {
         return vec![line];
     }
 
-    let pieces = wrap_text(&text_span.content, room);
-    let style = text_span.style;
-    let mut lines = Vec::with_capacity(pieces.len());
-    for (index, piece) in pieces.into_iter().enumerate() {
+    let rows = wrap_words(content, room);
+    let mut lines = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
         let mut spans: Vec<Span<'static>> = if index == 0 {
             gutter_spans.to_vec()
         } else {
             vec![Span::raw(" ".repeat(GUTTER))]
         };
-        spans.push(Span::styled(piece, style));
+        for (position, (word, style)) in row.into_iter().enumerate() {
+            if position > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(word, style));
+        }
         lines.push(Line::from(spans));
     }
     lines
 }
 
-/// Greedy word wrap to `width` columns: breaks at spaces where it can, and
-/// hard-breaks a word longer than a whole line where it must.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
+/// Greedy word wrap of styled content to `width` columns: breaks at spaces
+/// where it can, hard-breaks a word longer than a whole row where it must, and
+/// keeps each word with the style of the span it came from.
+fn wrap_words(content: &[Span<'static>], width: usize) -> Vec<Vec<(String, Style)>> {
+    let mut rows: Vec<Vec<(String, Style)>> = Vec::new();
+    let mut current: Vec<(String, Style)> = Vec::new();
     let mut current_len = 0usize;
 
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        let needed = if current_len == 0 {
-            word_len
-        } else {
-            current_len + 1 + word_len
-        };
+    let words = content.iter().flat_map(|span| {
+        span.content
+            .split_whitespace()
+            .map(|word| (word.to_owned(), span.style))
+            .collect::<Vec<_>>()
+    });
 
-        if needed <= width {
+    for (word, style) in words {
+        let mut word = word;
+        loop {
+            let word_len = word.chars().count();
+            let needed = if current_len == 0 {
+                word_len
+            } else {
+                current_len + 1 + word_len
+            };
+
+            if needed <= width {
+                current_len = needed;
+                current.push((word, style));
+                break;
+            }
+
+            // Anything already on this row goes out, and the whole word is
+            // retried against a fresh one.
             if current_len > 0 {
-                current.push(' ');
-                current_len += 1;
+                rows.push(std::mem::take(&mut current));
+                current_len = 0;
+                continue;
             }
-            current.push_str(word);
-            current_len += word_len;
-            continue;
-        }
 
-        if current_len > 0 {
-            lines.push(std::mem::take(&mut current));
-        }
-
-        // The word alone fits a fresh line, or it has to be broken.
-        if word_len <= width {
-            current.push_str(word);
-            current_len = word_len;
-        } else {
-            let mut chunk = String::new();
-            let mut chunk_len = 0usize;
-            for character in word.chars() {
-                if chunk_len == width {
-                    lines.push(std::mem::take(&mut chunk));
-                    chunk_len = 0;
-                }
-                chunk.push(character);
-                chunk_len += 1;
-            }
-            current = chunk;
-            current_len = chunk_len;
+            // The word does not fit a row of its own either: break it.
+            rows.push(vec![(word.chars().take(width).collect(), style)]);
+            word = word.chars().skip(width).collect();
         }
     }
 
-    if current_len > 0 || lines.is_empty() {
-        lines.push(current);
+    if !current.is_empty() {
+        rows.push(current);
     }
-    lines
+    rows
 }
 
 /// Where a session's events go.
@@ -369,18 +389,16 @@ impl Entry {
             return event.line(at);
         };
 
-        let extra_text = match (stage, matches) {
-            (Stage::Abandoned, _) => Some("(muted)".to_string()),
-            (_, matches) if !matches.is_empty() => {
-                let resolved = matches
-                    .iter()
-                    .map(|m| m.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Some(format!("({resolved})"))
-            }
-            _ => None,
-        };
+        // The dimmed suffix: what happened to the utterance, then what it
+        // ran. A mute does not hide the second half — an eager fire the entry
+        // had already attached pressed real keys, and dropping it from the
+        // line would be a lie about what the session did.
+        let mut detail: Vec<&str> = Vec::new();
+        if matches!(stage, Stage::Abandoned) {
+            detail.push("muted");
+        }
+        detail.extend(matches.iter().map(|matched| matched.name.as_str()));
+        let extra_text = (!detail.is_empty()).then(|| format!("({})", detail.join(", ")));
 
         // The dot keeps the severity vocabulary: green the moment anything
         // fires, grey while nothing has, yellow for an utterance a mute cut
@@ -711,9 +729,13 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
     }
 
-    /// The text of a rendered line, without its timestamp or dot.
+    /// The text of a rendered line, without its timestamp or dot: the words
+    /// themselves plus the dimmed suffix, exactly as they read on screen.
     fn text(line: &Line<'static>) -> String {
-        line.spans[4].content.to_string()
+        line.spans[GUTTER_SPANS..]
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 
     /// Every entry the log holds, as `(dot color, text)`.
@@ -996,6 +1018,20 @@ mod tests {
         assert_eq!(wrap_line(line.clone(), 6), vec![line]);
     }
 
+    /// [`wrap_words`] over one unstyled span, as rows of text.
+    fn wrapped_rows(text: &str, width: usize) -> Vec<String> {
+        let content = [Span::raw(text.to_owned())];
+        wrap_words(&content, width)
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|(word, _)| word)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
     #[rstest]
     #[case("a b c", 10, &["a b c"])]
     #[case("one two three four", 9, &["one two", "three", "four"])]
@@ -1004,8 +1040,41 @@ mod tests {
     #[case("hi abcdefgh", 5, &["hi", "abcde", "fgh"])]
     // Exact fits stay whole.
     #[case("exact", 5, &["exact"])]
-    fn test_wrap_text(#[case] text: &str, #[case] width: usize, #[case] expected: &[&str]) {
-        assert_eq!(wrap_text(text, width), expected);
+    fn test_wrap_words(#[case] text: &str, #[case] width: usize, #[case] expected: &[&str]) {
+        assert_eq!(wrapped_rows(text, width), expected);
+    }
+
+    #[test]
+    fn test_wrapping_carries_each_span_s_own_style_across_rows() {
+        // An entry's dimmed suffix is a different span from the words it
+        // follows, so a row which straddles the boundary has to keep both
+        // styles rather than repainting the whole row in one of them.
+        let dim = Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let content = [
+            Span::styled("hello there world".to_owned(), Style::new()),
+            Span::raw(" "),
+            Span::styled("(Salute)".to_owned(), dim),
+        ];
+
+        let rows = wrap_words(&content, 14);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row
+                    .iter()
+                    .map(|(word, _)| word.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "))
+                .collect::<Vec<_>>(),
+            vec!["hello there", "world (Salute)"]
+        );
+        assert_eq!(
+            rows[1].iter().map(|(_, style)| *style).collect::<Vec<_>>(),
+            vec![Style::new(), dim],
+            "the suffix stays dimmed on the row it wrapped onto"
+        );
     }
 
     // --- The live recognition entry ----------------------------------------
@@ -1091,7 +1160,7 @@ mod tests {
             rendered(&log),
             vec![(
                 Color::Green,
-                "\"auto cannon sentry\" → AutocannonSentry (5)".to_string()
+                "\"auto cannon sentry\" (AutocannonSentry)".to_string()
             )],
             "the fire lands on the live entry at once"
         );
@@ -1106,7 +1175,7 @@ mod tests {
             rendered(&log),
             vec![(
                 Color::Green,
-                "\"auto cannon sentry\" → AutocannonSentry (5)".to_string()
+                "\"auto cannon sentry\" (AutocannonSentry)".to_string()
             )]
         );
         assert_eq!(newest_style(&log), Style::new());
@@ -1127,7 +1196,7 @@ mod tests {
             rendered(&log),
             vec![(
                 Color::Yellow,
-                "\"deploy sentry reload\" (muted) → DeploySentry (6)".to_string()
+                "\"deploy sentry reload\" (muted, DeploySentry)".to_string()
             )]
         );
 
@@ -1169,8 +1238,8 @@ mod tests {
         assert_eq!(
             rendered(&log),
             vec![
-                (Color::Green, "\"autocannon\" → Autocannon (4)".to_string()),
-                (Color::Green, "\"reload\" → Reload (r)".to_string()),
+                (Color::Green, "\"autocannon\" (Autocannon)".to_string()),
+                (Color::Green, "\"reload\" (Reload)".to_string()),
             ],
             "each match lands on the utterance which produced it"
         );
@@ -1194,7 +1263,7 @@ mod tests {
             rendered(&log),
             vec![(
                 Color::Green,
-                "\"auto cannon sentry\" → AutocannonSentry (5)".to_string()
+                "\"auto cannon sentry\" (AutocannonSentry)".to_string()
             )],
             "the fire is visible ~600ms before the Final arrives"
         );
@@ -1211,9 +1280,9 @@ mod tests {
             vec![
                 (
                     Color::Green,
-                    "\"auto cannon sentry\" → AutocannonSentry (5)".to_string()
+                    "\"auto cannon sentry\" (AutocannonSentry)".to_string()
                 ),
-                (Color::Green, "\"auto cannon\" → Autocannon (4)".to_string()),
+                (Color::Green, "\"auto cannon\" (Autocannon)".to_string()),
             ]
         );
     }
@@ -1234,7 +1303,7 @@ mod tests {
             rendered(&log),
             vec![(
                 Color::Green,
-                "\"auto cannon sentry\" → Autocannon sentry (4)".to_string()
+                "\"auto cannon sentry\" (Autocannon sentry)".to_string()
             )],
             "the match upgrades the utterance rather than adding a line under it"
         );
@@ -1252,7 +1321,7 @@ mod tests {
         assert_eq!(
             rendered(&log),
             vec![
-                (Color::Green, "\"salute\" → Salute (x)".to_string()),
+                (Color::Green, "\"salute\" (Salute)".to_string()),
                 (Color::Gray, "\"deploy the thing\"".to_string()),
             ]
         );
@@ -1274,7 +1343,7 @@ mod tests {
             rendered(&log),
             vec![
                 (Color::Gray, "\"deploy the thing\"".to_string()),
-                (Color::Green, "\"salute\" → Salute (x)".to_string()),
+                (Color::Green, "\"salute\" (Salute)".to_string()),
             ],
             "the match belongs to the utterance which produced it"
         );
@@ -1298,11 +1367,11 @@ mod tests {
             vec![
                 (
                     Color::Green,
-                    "\"auto cannon sentry\" → AutocannonSentry (down up right)".to_string()
+                    "\"auto cannon sentry\" (AutocannonSentry)".to_string()
                 ),
                 (
                     Color::Green,
-                    "matched: \"Autocannon\" → down left down".to_string()
+                    "matched: \"Autocannon\" → down left down # 2".to_string()
                 ),
             ],
             "the stray match keeps its own line rather than stealing entry 1"
@@ -1323,8 +1392,8 @@ mod tests {
         assert_eq!(
             rendered(&log),
             vec![
-                (Color::Green, "\"autocannon\" → Autocannon (4)".to_string()),
-                (Color::Green, "\"reload\" → Reload (r)".to_string()),
+                (Color::Green, "\"autocannon\" (Autocannon)".to_string()),
+                (Color::Green, "\"reload\" (Reload)".to_string()),
             ],
             "each match should land on the utterance which produced it"
         );
@@ -1344,7 +1413,7 @@ mod tests {
             rendered(&log),
             vec![(
                 Color::Green,
-                "\"salute reload\" → Salute (x), Reload (r)".to_string()
+                "\"salute reload\" (Salute, Reload)".to_string()
             )]
         );
     }
@@ -1363,7 +1432,7 @@ mod tests {
         let lines = rendered(&log);
         assert_eq!(
             lines.last(),
-            Some(&(Color::Green, "matched: \"Salute\" → x".to_string())),
+            Some(&(Color::Green, "matched: \"Salute\" → x # 1".to_string())),
             "unexpected log: {lines:?}"
         );
 
@@ -1397,7 +1466,7 @@ mod tests {
         assert_eq!(
             rendered(&log),
             vec![
-                (Color::Green, "\"sprint\" → Sprint (w (held))".to_string()),
+                (Color::Green, "\"sprint\" (Sprint)".to_string()),
                 (Color::Yellow, "interrupted: \"Sprint\"".to_string()),
                 (Color::Yellow, "discarded: \"Reload\"".to_string()),
             ]
