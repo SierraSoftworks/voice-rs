@@ -934,7 +934,10 @@ only in what they put into the stream. Layout, kept deliberately simple:
 - **Header** — the active profile name (left-aligned) with its stats (command count, phrase count,
   hotkey mode) and the profile source (the resolved file path or https URL). Under `run` with a
   wrapped application, the source line also carries `wrapping: <app> (pid …)` on the right.
-- **Body** — a scrolling event log where each line leads with a colored severity dot.
+- **Body** — a scrolling event log where each line leads with a colored severity dot. Entries wrap
+  within the body's width (a long warning must be readable, not cut off at the edge), with
+  continuation lines indented past the timestamp+dot gutter; the tail is trimmed from the top so
+  the newest entry's last line is always visible at the bottom.
 - **Footer** — the live listening state, and the loaded model name right-aligned.
 
 `q`/`Ctrl-C` exits. When stdout is not a TTY — piped output, CI, and (crucially) a Steam launch —

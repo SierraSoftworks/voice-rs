@@ -152,6 +152,103 @@ fn log_line(at: SystemTime, dot: Color, text: String, style: Style) -> Line<'sta
     ])
 }
 
+/// The columns a log line spends before its text starts: `HH:MM:SS`, a space,
+/// the dot, a space. Continuation lines of a wrapped entry indent this far,
+/// so the timestamp+dot gutter keeps entries visually distinct.
+const GUTTER: usize = 11;
+
+/// Wraps one log line to `width` columns: the text is word-wrapped (long
+/// words hard-broken) and every continuation line is indented past the
+/// timestamp+dot gutter, keeping the entry's style on every piece.
+///
+/// A terminal too narrow to fit anything past the gutter gets the line
+/// unwrapped — ratatui truncates it, which is the best a six-column terminal
+/// can hope for.
+pub(crate) fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let Some(room) = width.checked_sub(GUTTER).filter(|room| *room >= 1) else {
+        return vec![line];
+    };
+
+    // Every log line is built by `log_line`: gutter spans first, the text
+    // last. Anything else (defensively) passes through unwrapped.
+    let Some((text_span, gutter_spans)) = line.spans.split_last() else {
+        return vec![line];
+    };
+    if text_span.content.chars().count() <= room {
+        return vec![line];
+    }
+
+    let pieces = wrap_text(&text_span.content, room);
+    let style = text_span.style;
+    let mut lines = Vec::with_capacity(pieces.len());
+    for (index, piece) in pieces.into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = if index == 0 {
+            gutter_spans.to_vec()
+        } else {
+            vec![Span::raw(" ".repeat(GUTTER))]
+        };
+        spans.push(Span::styled(piece, style));
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Greedy word wrap to `width` columns: breaks at spaces where it can, and
+/// hard-breaks a word longer than a whole line where it must.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let needed = if current_len == 0 {
+            word_len
+        } else {
+            current_len + 1 + word_len
+        };
+
+        if needed <= width {
+            if current_len > 0 {
+                current.push(' ');
+                current_len += 1;
+            }
+            current.push_str(word);
+            current_len += word_len;
+            continue;
+        }
+
+        if current_len > 0 {
+            lines.push(std::mem::take(&mut current));
+        }
+
+        // The word alone fits a fresh line, or it has to be broken.
+        if word_len <= width {
+            current.push_str(word);
+            current_len = word_len;
+        } else {
+            let mut chunk = String::new();
+            let mut chunk_len = 0usize;
+            for character in word.chars() {
+                if chunk_len == width {
+                    lines.push(std::mem::take(&mut chunk));
+                    chunk_len = 0;
+                }
+                chunk.push(character);
+                chunk_len += 1;
+            }
+            current = chunk;
+            current_len = chunk_len;
+        }
+    }
+
+    if current_len > 0 || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 /// Where a session's events go.
 ///
 /// Cloned into every part of the pipeline which reports something, so the
@@ -730,6 +827,95 @@ mod tests {
             }),
             "unexpected timestamp: {stamp:?}"
         );
+    }
+
+    // --- Wrapping -----------------------------------------------------------
+
+    #[test]
+    fn test_a_long_line_wraps_within_the_width_with_the_gutter_indented() {
+        let line = UiEvent::Warning(
+            "eager mismatch: fired \"Autocannon\" from a partial hypothesis, but the utterance settled as \"auto cannon sentry\"".to_string(),
+        )
+        .line(at());
+
+        let wrapped = wrap_line(line, 40);
+
+        assert!(wrapped.len() > 1, "the line should need several rows");
+        for (index, row) in wrapped.iter().enumerate() {
+            let text = row.to_string();
+            assert!(
+                text.chars().count() <= 40,
+                "row {index} overflows the width: {text:?}"
+            );
+            if index > 0 {
+                assert!(
+                    text.starts_with("           "),
+                    "continuation rows indent past the timestamp+dot gutter: {text:?}"
+                );
+            }
+        }
+        assert!(
+            wrapped[0].to_string().contains(DOT),
+            "the first row keeps the timestamp and dot"
+        );
+
+        // Nothing is lost: the rows re-join into the original text.
+        let rejoined = wrapped
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let text = row.to_string();
+                if index == 0 {
+                    text.chars().skip(11).collect::<String>()
+                } else {
+                    text.trim_start().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rejoined.contains("the utterance settled as \"auto cannon sentry\""),
+            "the tail of the message must survive the wrap: {rejoined:?}"
+        );
+    }
+
+    #[test]
+    fn test_wrapped_continuations_keep_the_entrys_style() {
+        let line = UiEvent::Warning("w".repeat(120)).line(at());
+
+        let wrapped = wrap_line(line, 40);
+
+        assert!(wrapped.len() > 1);
+        for row in &wrapped[1..] {
+            let text_span = row.spans.last().expect("a continuation has text");
+            assert_eq!(
+                text_span.style.fg,
+                Some(Color::Yellow),
+                "a warning stays yellow on every row"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_short_line_and_a_tiny_terminal_pass_through_unwrapped() {
+        let line = UiEvent::Warning("short".to_string()).line(at());
+        assert_eq!(wrap_line(line.clone(), 80), vec![line.clone()]);
+
+        // Too narrow to fit anything past the gutter: unwrapped (and left to
+        // the terminal to truncate) beats an empty body.
+        assert_eq!(wrap_line(line.clone(), 6), vec![line]);
+    }
+
+    #[rstest]
+    #[case("a b c", 10, &["a b c"])]
+    #[case("one two three four", 9, &["one two", "three", "four"])]
+    // A word longer than the whole line is hard-broken rather than dropped.
+    #[case("abcdefghij", 4, &["abcd", "efgh", "ij"])]
+    #[case("hi abcdefgh", 5, &["hi", "abcde", "fgh"])]
+    // Exact fits stay whole.
+    #[case("exact", 5, &["exact"])]
+    fn test_wrap_text(#[case] text: &str, #[case] width: usize, #[case] expected: &[&str]) {
+        assert_eq!(wrap_text(text, width), expected);
     }
 
     // --- One entry per recognition ----------------------------------------

@@ -483,10 +483,12 @@ fn render_header(frame: &mut Frame, area: Rect, overview: &Overview) {
 
 /// The event log, newest at the bottom, between two rules.
 ///
-/// Only as many lines as there are rows are built, so a full scrollback costs
-/// no more to draw than an empty one. Lines are not wrapped: a wrapped line
-/// would push the newest event off the bottom of the region it was measured
-/// for, which is the one line that must always be visible.
+/// Only as many entries as there are rows are built, so a full scrollback
+/// costs no more to draw than an empty one. Entries wrap within the body's
+/// width — a long warning must be readable, not cut off at the edge — with
+/// continuation lines indented past the timestamp+dot gutter so entries stay
+/// visually distinct; the tail is then trimmed from the top so the newest
+/// entry's last line is always the bottom line of the region.
 fn render_body(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::new()
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -505,8 +507,13 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let lines: Vec<Line<'static>> = app.log.tail(inner.height as usize).collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+    let mut lines: Vec<Line<'static>> = app
+        .log
+        .tail(inner.height as usize)
+        .flat_map(|line| super::event::wrap_line(line, inner.width))
+        .collect();
+    let overflow = lines.len().saturating_sub(inner.height as usize);
+    frame.render_widget(Paragraph::new(lines.split_off(overflow)), inner);
 }
 
 /// The live listening state, which model is doing the listening, and — once the
@@ -924,6 +931,68 @@ mod tests {
         assert!(
             body[6].contains("utterance 49"),
             "the newest event should be the bottom line: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_long_entry_wraps_within_the_body() {
+        // The field-reported truncation: a long warning was cut off at the
+        // terminal's edge. It has to wrap, with continuations indented past
+        // the timestamp+dot gutter.
+        let mut app = App::new(overview());
+        app.record_at(
+            at(),
+            UiEvent::Warning(
+                "eager mismatch: fired \"Autocannon\", \"Autocannon sentry\" from a partial hypothesis, but the utterance settled as \"auto cannon sentry\"".to_string(),
+            ),
+        );
+
+        let buffer = screen(&app, 60, 12);
+        let body: Vec<String> = (3..10).map(|y| row(&buffer, y)).collect();
+
+        assert!(
+            body[0].contains("warning: eager mismatch"),
+            "the entry starts on the first body row: {body:?}"
+        );
+        assert!(
+            body[1].starts_with("           ") && !body[1].trim().is_empty(),
+            "continuation rows indent past the gutter: {body:?}"
+        );
+        assert!(
+            body.iter().any(|line| line.contains("auto cannon sentry")),
+            "the tail of the message must be visible, not cut off: {body:?}"
+        );
+    }
+
+    #[test]
+    fn test_wrapping_keeps_the_newest_entry_at_the_bottom() {
+        // A long entry above must not push the newest one out of the body:
+        // the tail is trimmed from the top instead.
+        let mut app = App::new(overview());
+        for i in 0..6u64 {
+            app.record_at(
+                at(),
+                UiEvent::Heard {
+                    text: format!("utterance number {i} with quite a few extra words to say"),
+                    seq: i + 1,
+                },
+            );
+        }
+        app.record_at(
+            at(),
+            UiEvent::Heard {
+                text: "the newest utterance".to_string(),
+                seq: 7,
+            },
+        );
+
+        // 40 columns: every utterance wraps onto two rows, far more rows than
+        // the 7-row body can hold.
+        let buffer = screen(&app, 40, 12);
+        let bottom = row(&buffer, 9);
+        assert!(
+            bottom.contains("the newest utterance"),
+            "the newest entry's last line must be the bottom row: {bottom:?}"
         );
     }
 
