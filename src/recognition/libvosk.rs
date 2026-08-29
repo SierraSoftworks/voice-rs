@@ -8,18 +8,24 @@
 //! explain what is missing. All the user gets is
 //! `error while loading shared libraries: libvosk.so`.
 //!
-//! Binding the fifteen entry points ourselves and `dlopen`ing the library on
-//! first use moves that failure into the program, where it becomes an ordinary
+//! Binding the fifteen entry points ourselves and loading the library on first
+//! use moves that failure into the program, where it becomes an ordinary
 //! [`crate::Error`] carrying advice — and leaves every command which does not
 //! recognize speech working normally.
 //!
 //! The library is opened once per process and never closed: [`API`] holds both
-//! the handle and the function pointers into it, and lives for the life of the
-//! program.
+//! the [`Library`] and the function pointers into it, and lives for the life of
+//! the program.
+//!
+//! **Two entry points are optional.** The last published Windows build of
+//! libvosk is 0.3.45, which predates `vosk_recognizer_set_endpointer_delays`
+//! and `vosk_recognizer_set_endpointer_mode`; a build which does not export
+//! them is not broken, it simply cannot have its endpointer tuned. Those two
+//! resolve to `None` rather than failing the whole load, and the recognizer
+//! says so once instead of refusing to start.
 
 use std::{
-    ffi::{CStr, CString, c_char, c_int, c_void},
-    os::unix::ffi::OsStrExt,
+    ffi::{CStr, CString, c_char, c_int},
     path::PathBuf,
     ptr::NonNull,
     sync::OnceLock,
@@ -28,20 +34,50 @@ use std::{
 use serde::Deserialize;
 use tracing_batteries::prelude::*;
 
-/// An environment variable naming `libvosk.so` directly, or the directory it
+/// The platform's `libloading` library type. The OS-specific types rather than
+/// the portable `libloading::Library` because each platform needs its own
+/// loader flags: `RTLD_NOW | RTLD_LOCAL` on unix, and — on Windows —
+/// `LOAD_WITH_ALTERED_SEARCH_PATH`, which makes libvosk.dll's *own* directory
+/// the first place its MinGW runtime imports (libstdc++-6.dll, libgcc_s_seh-1.dll,
+/// libwinpthread-1.dll) are looked for.
+#[cfg(unix)]
+use libloading::os::unix::Library;
+#[cfg(windows)]
+use libloading::os::windows::Library;
+
+/// An environment variable naming the library directly, or the directory it
 /// lives in. The escape hatch for a library which is installed somewhere the
 /// dynamic loader does not look.
 pub const LIB_PATH_ENV: &str = "VOSK_LIB_PATH";
 
-/// The library's SONAME, which is what the loader is asked for when
+/// The library's file name, which is what the loader is asked for when
 /// [`LIB_PATH_ENV`] is not set.
+#[cfg(unix)]
 const LIB_NAME: &str = "libvosk.so";
+#[cfg(windows)]
+const LIB_NAME: &str = "libvosk.dll";
+
+/// The directory, relative to the executable, that the Windows release layout
+/// unpacks the Vosk DLLs into.
+#[cfg(windows)]
+const WINDOWS_BUNDLE_DIR: &str = "vosk";
 
 /// How to get libvosk onto this machine, offered whenever it cannot be loaded.
 /// Literal rather than formatted because `human_errors` advice is `&'static`.
+#[cfg(unix)]
 const MISSING_LIBRARY_ADVICE: &[&str] = &[
     "Download 'libvosk-linux-amd64.so' (or 'libvosk-linux-arm64.so' on ARM) from https://github.com/SierraSoftworks/voice-rs/releases/latest, then install it with 'sudo install -m 0644 libvosk-linux-amd64.so /usr/local/lib/libvosk.so && sudo ldconfig'.",
     "If you installed voice-orders with Homebrew, put that file at \"$(brew --prefix)/lib/libvosk.so\" instead; if you unpacked it yourself, a 'libvosk.so' next to the binary is enough.",
+    "If libvosk is already installed somewhere else, set VOSK_LIB_PATH to it (or to the directory holding it).",
+    "The installation guide at https://sierrasoftworks.github.io/voice-rs/guide/installation.html covers all of this in full.",
+];
+
+/// As above, for Windows: the official build ships as a zip of DLLs which have
+/// to stay together, because libvosk.dll imports the MinGW runtime beside it.
+#[cfg(windows)]
+const MISSING_LIBRARY_ADVICE: &[&str] = &[
+    "Download 'vosk-win64-0.3.45.zip' from https://github.com/alphacep/vosk-api/releases and unzip its DLLs next to voice-orders.exe (libvosk.dll, libstdc++-6.dll, libgcc_s_seh-1.dll and libwinpthread-1.dll all have to stay together).",
+    "A 'vosk' folder next to voice-orders.exe works too: unzip the DLLs into it and they will be found there.",
     "If libvosk is already installed somewhere else, set VOSK_LIB_PATH to it (or to the directory holding it).",
     "The installation guide at https://sierrasoftworks.github.io/voice-rs/guide/installation.html covers all of this in full.",
 ];
@@ -89,12 +125,12 @@ pub struct VoskRecognizer {
 /// The entry points we resolve out of `libvosk.so`, plus the handle they point
 /// into. Field names drop the `vosk_` prefix the C API carries.
 struct Api {
-    /// The `dlopen` handle. Never passed to `dlclose`: the function pointers
-    /// below are addresses inside the library, and this struct is owned by a
-    /// `static` which is never dropped.
-    _handle: *mut c_void,
+    /// The open library. Never dropped: the function pointers below are
+    /// addresses inside it, and this struct is owned by a `static` which lives
+    /// for the life of the process.
+    _library: Library,
 
-    /// What we asked `dlopen` for, so `doctor` can report where it came from.
+    /// What we asked the loader for, so `doctor` can report where it came from.
     source: String,
 
     set_log_level: unsafe extern "C" fn(c_int),
@@ -107,8 +143,13 @@ struct Api {
         unsafe extern "C" fn(*mut VoskModel, f32, *const c_char) -> *mut VoskRecognizer,
     recognizer_free: unsafe extern "C" fn(*mut VoskRecognizer),
     recognizer_set_max_alternatives: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
-    recognizer_set_endpointer_mode: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
-    recognizer_set_endpointer_delays: unsafe extern "C" fn(*mut VoskRecognizer, f32, f32, f32),
+    /// Optional: absent from libvosk builds older than 0.3.46, which is every
+    /// published Windows build. See [`Recognizer::set_endpointer_mode`].
+    recognizer_set_endpointer_mode: Option<unsafe extern "C" fn(*mut VoskRecognizer, c_int)>,
+    /// Optional, for the same reason as
+    /// [`Api::recognizer_set_endpointer_mode`].
+    recognizer_set_endpointer_delays:
+        Option<unsafe extern "C" fn(*mut VoskRecognizer, f32, f32, f32)>,
     recognizer_set_words: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
     recognizer_set_partial_words: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
     recognizer_set_nlsml: unsafe extern "C" fn(*mut VoskRecognizer, c_int),
@@ -119,11 +160,6 @@ struct Api {
     recognizer_final_result: unsafe extern "C" fn(*mut VoskRecognizer) -> *const c_char,
     recognizer_reset: unsafe extern "C" fn(*mut VoskRecognizer),
 }
-
-// SAFETY: every field is an immutable address into a library which is never
-// unloaded, so sharing `&Api` across threads hands out nothing but constants.
-unsafe impl Send for Api {}
-unsafe impl Sync for Api {}
 
 /// The loaded library, or the reasons every candidate path failed. Resolved at
 /// most once; a machine without libvosk does not pay for a `dlopen` per call.
@@ -171,10 +207,11 @@ fn load() -> Result<Api, String> {
         let name = candidate.to_string_lossy().into_owned();
 
         match unsafe { open(&candidate) } {
-            Ok(handle) => {
+            Ok(library) => {
                 debug!(library = %name, "Loaded the Vosk speech recognition library.");
-                // SAFETY: `handle` is a live library handle from `dlopen`.
-                return unsafe { Api::resolve(handle, name) };
+                // SAFETY: `library` is open, and only ever dropped by dropping
+                // the `Api` it is about to be moved into.
+                return unsafe { Api::resolve(library, name) };
             }
             Err(e) => attempts.push(format!("'{name}' ({e})")),
         }
@@ -184,10 +221,15 @@ fn load() -> Result<Api, String> {
 }
 
 /// The paths to try, in order: an explicit `$VOSK_LIB_PATH` (either the library
-/// itself or the directory holding it), then the bare SONAME, which lets the
+/// itself or the directory holding it), then the bare file name, which lets the
 /// dynamic loader search the binary's `RUNPATH` — `$ORIGIN`, `$ORIGIN/../lib`
 /// and the Homebrew prefix — followed by `$LD_LIBRARY_PATH`, the `ldconfig`
 /// cache and the system directories.
+///
+/// On Windows the bare name searches the executable's own directory first (the
+/// standard search order), and one more candidate is appended: a `vosk`
+/// subfolder beside the executable, which is where the release layout unpacks
+/// the official zip's DLLs.
 fn candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -201,52 +243,50 @@ fn candidates() -> Vec<PathBuf> {
     }
 
     candidates.push(PathBuf::from(LIB_NAME));
+
+    #[cfg(windows)]
+    if let Some(directory) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        candidates.push(directory.join(WINDOWS_BUNDLE_DIR).join(LIB_NAME));
+    }
+
     candidates
 }
 
-/// `dlopen`s a library, returning `dlerror`'s explanation on failure.
+/// Opens a library, returning the loader's own explanation on failure.
 ///
 /// # Safety
 ///
 /// Loading a library runs its initializers, so `path` must name a library
 /// which is safe to bring into this process.
-unsafe fn open(path: &std::path::Path) -> Result<*mut c_void, String> {
-    let name = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "the path contains a NUL byte".to_string())?;
-
-    // SAFETY: `name` is a valid NUL-terminated string which outlives the call.
-    // RTLD_LOCAL keeps libvosk's symbols out of the global namespace, and
+unsafe fn open(path: &std::path::Path) -> Result<Library, String> {
+    // SAFETY: the caller guarantees the library is safe to load.
+    //
+    // unix: RTLD_LOCAL keeps libvosk's symbols out of the global namespace, and
     // RTLD_NOW resolves everything up front so a truncated or mismatched
     // library fails here rather than mid-utterance.
-    let handle = unsafe {
-        // `dlerror` is only meaningful immediately after a failed call, so the
-        // previous error is cleared first.
-        libc::dlerror();
-        libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL)
+    #[cfg(unix)]
+    let opened = unsafe {
+        Library::open(
+            Some(path),
+            libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL,
+        )
     };
 
-    if handle.is_null() {
-        return Err(last_error().unwrap_or_else(|| "could not be loaded".to_string()));
-    }
+    // SAFETY: as above.
+    //
+    // windows: LOAD_WITH_ALTERED_SEARCH_PATH makes the *DLL's* directory the
+    // first place its own imports are resolved from, which is what lets the
+    // official zip's MinGW runtime DLLs (libstdc++-6, libgcc_s_seh-1,
+    // libwinpthread-1) sit beside libvosk.dll and be found.
+    #[cfg(windows)]
+    let opened = unsafe {
+        Library::load_with_flags(path, libloading::os::windows::LOAD_WITH_ALTERED_SEARCH_PATH)
+    };
 
-    Ok(handle)
-}
-
-/// `dlerror`, as an owned string.
-fn last_error() -> Option<String> {
-    // SAFETY: `dlerror` returns either NULL or a NUL-terminated string owned by
-    // the loader, which we copy immediately.
-    let message = unsafe { libc::dlerror() };
-    if message.is_null() {
-        return None;
-    }
-
-    // SAFETY: non-NULL `dlerror` output is a valid C string.
-    Some(
-        unsafe { CStr::from_ptr(message) }
-            .to_string_lossy()
-            .into_owned(),
-    )
+    opened.map_err(|e| e.to_string())
 }
 
 impl Api {
@@ -254,39 +294,38 @@ impl Api {
     ///
     /// # Safety
     ///
-    /// `handle` must be a live handle returned by `dlopen`, and the library it
-    /// names must be libvosk — the signatures below are asserted, not checked.
-    // Each `symbol!` result is assigned straight into a field whose type spells
-    // the signature out, so annotating the transmute again at every call site
-    // would only add a second place for the two to disagree.
-    #[allow(clippy::missing_transmute_annotations)]
-    unsafe fn resolve(handle: *mut c_void, source: String) -> Result<Self, String> {
-        /// Resolves one symbol, transmuting it to the declared signature.
+    /// `library` must be libvosk — the signatures below are asserted, not
+    /// checked.
+    unsafe fn resolve(library: Library, source: String) -> Result<Self, String> {
+        /// Resolves one required symbol, or gives up on the whole library.
         macro_rules! symbol {
             ($name:literal) => {{
-                // SAFETY: the caller guarantees a live handle; the symbol name
-                // is a NUL-terminated literal.
-                let address = unsafe {
-                    libc::dlerror();
-                    libc::dlsym(handle, concat!($name, "\0").as_ptr().cast())
-                };
-
-                if address.is_null() {
-                    return Err(format!(
-                        "'{source}' does not export {}{}",
-                        $name,
-                        last_error().map(|e| format!(" ({e})")).unwrap_or_default()
-                    ));
+                // SAFETY: the caller guarantees the library is libvosk, which
+                // exports this symbol as a function with the signature of the
+                // field it is assigned to.
+                match unsafe { library.get(concat!($name, "\0").as_bytes()) } {
+                    Ok(symbol) => *symbol,
+                    Err(e) => return Err(format!("'{source}' does not export {} ({e})", $name)),
                 }
-
-                // SAFETY: libvosk exports this symbol as a function with the
-                // signature the field it is assigned to declares.
-                unsafe { std::mem::transmute(address) }
             }};
         }
 
-        Ok(Self {
-            _handle: handle,
+        /// Resolves one *optional* symbol: a build without it is older, not
+        /// broken, and the caller degrades rather than refusing to run.
+        macro_rules! optional_symbol {
+            ($name:literal) => {{
+                // SAFETY: as for `symbol!`.
+                match unsafe { library.get(concat!($name, "\0").as_bytes()) } {
+                    Ok(symbol) => Some(*symbol),
+                    Err(e) => {
+                        debug!("'{source}' does not export {} ({e}).", $name);
+                        None
+                    }
+                }
+            }};
+        }
+
+        let resolved = Self {
             set_log_level: symbol!("vosk_set_log_level"),
             model_new: symbol!("vosk_model_new"),
             model_free: symbol!("vosk_model_free"),
@@ -294,8 +333,10 @@ impl Api {
             recognizer_new_grm: symbol!("vosk_recognizer_new_grm"),
             recognizer_free: symbol!("vosk_recognizer_free"),
             recognizer_set_max_alternatives: symbol!("vosk_recognizer_set_max_alternatives"),
-            recognizer_set_endpointer_mode: symbol!("vosk_recognizer_set_endpointer_mode"),
-            recognizer_set_endpointer_delays: symbol!("vosk_recognizer_set_endpointer_delays"),
+            recognizer_set_endpointer_mode: optional_symbol!("vosk_recognizer_set_endpointer_mode"),
+            recognizer_set_endpointer_delays: optional_symbol!(
+                "vosk_recognizer_set_endpointer_delays"
+            ),
             recognizer_set_words: symbol!("vosk_recognizer_set_words"),
             recognizer_set_partial_words: symbol!("vosk_recognizer_set_partial_words"),
             recognizer_set_nlsml: symbol!("vosk_recognizer_set_nlsml"),
@@ -304,9 +345,28 @@ impl Api {
             recognizer_partial_result: symbol!("vosk_recognizer_partial_result"),
             recognizer_final_result: symbol!("vosk_recognizer_final_result"),
             recognizer_reset: symbol!("vosk_recognizer_reset"),
-            // Last, because every `symbol!` above borrows it for its error.
+            // Last, because every `symbol!` above borrows both of them.
+            _library: library,
             source,
-        })
+        };
+
+        Ok(resolved)
+    }
+}
+
+/// Calls an entry point the library only *might* export, reporting whether it
+/// was there.
+///
+/// Both endpointer setters route through this so that "this build is older
+/// than the feature" is one shape with one behaviour, rather than two
+/// hand-written `match`es which could disagree about what `false` means.
+fn optional<T>(entry: Option<T>, call: impl FnOnce(T)) -> bool {
+    match entry {
+        Some(entry) => {
+            call(entry);
+            true
+        }
+        None => false,
     }
 }
 
@@ -411,10 +471,26 @@ impl Recognizer {
         unsafe { (self.api.recognizer_set_max_alternatives)(self.handle.as_ptr(), count) }
     }
 
-    /// Selects one of the endpointer's response-length presets.
-    pub fn set_endpointer_mode(&mut self, mode: EndpointerMode) {
-        // SAFETY: our handle is live.
-        unsafe { (self.api.recognizer_set_endpointer_mode)(self.handle.as_ptr(), mode as c_int) }
+    /// Whether this build of libvosk can have its endpointer tuned at all.
+    ///
+    /// The two `set_endpointer_*` entry points arrived after 0.3.45, which is
+    /// the last build published for Windows — so a perfectly working library
+    /// may simply not have them, and the caller reports that once rather than
+    /// failing to start.
+    pub fn supports_endpointer_tuning(&self) -> bool {
+        self.api.recognizer_set_endpointer_delays.is_some()
+            && self.api.recognizer_set_endpointer_mode.is_some()
+    }
+
+    /// Selects one of the endpointer's response-length presets, returning
+    /// whether this build of libvosk exports the entry point at all.
+    pub fn set_endpointer_mode(&mut self, mode: EndpointerMode) -> bool {
+        let handle = self.handle.as_ptr();
+
+        optional(self.api.recognizer_set_endpointer_mode, |set| {
+            // SAFETY: our handle is live.
+            unsafe { set(handle, mode as c_int) }
+        })
     }
 
     /// Tunes the endpointer's silence thresholds, all in **seconds** (the
@@ -429,16 +505,16 @@ impl Recognizer {
     ///   the profile's `recognition.silence` shortens);
     /// * `t_max` — the hard cap on one utterance's length (vosk suggests
     ///   20–30).
-    pub fn set_endpointer_delays(&mut self, t_start_max: f32, t_end: f32, t_max: f32) {
-        // SAFETY: our handle is live.
-        unsafe {
-            (self.api.recognizer_set_endpointer_delays)(
-                self.handle.as_ptr(),
-                t_start_max,
-                t_end,
-                t_max,
-            )
-        }
+    ///
+    /// Returns whether this build of libvosk exports the entry point; `false`
+    /// leaves vosk's own defaults in place.
+    pub fn set_endpointer_delays(&mut self, t_start_max: f32, t_end: f32, t_max: f32) -> bool {
+        let handle = self.handle.as_ptr();
+
+        optional(self.api.recognizer_set_endpointer_delays, |set| {
+            // SAFETY: our handle is live.
+            unsafe { set(handle, t_start_max, t_end, t_max) }
+        })
     }
 
     /// Whether finalized results carry per-word metadata.
@@ -759,16 +835,49 @@ mod tests {
 
     #[test]
     fn missing_library_advises_how_to_install_it() {
-        let error = missing_library("'libvosk.so' (not found)");
+        let error = missing_library(&format!("'{LIB_NAME}' (not found)"));
         let rendered = human_errors::pretty(&error).to_string();
 
+        // Each platform's advice names the artifact that platform actually
+        // downloads: a release asset on Linux, the official zip on Windows.
+        let asset = if cfg!(windows) {
+            "vosk-win64-0.3.45.zip"
+        } else {
+            "libvosk-linux-amd64.so"
+        };
+
         assert!(
-            rendered.contains("libvosk-linux-amd64.so"),
-            "the advice should name the release asset: {rendered}"
+            rendered.contains(asset),
+            "the advice should name the download: {rendered}"
+        );
+        assert!(
+            rendered.contains(LIB_NAME),
+            "the message should name the library: {rendered}"
         );
         assert!(
             rendered.contains(LIB_PATH_ENV),
             "the advice should mention the override: {rendered}"
         );
+    }
+
+    /// The plumbing behind the two entry points a 0.3.45 library does not
+    /// have: present means "called, and say so", absent means "not called, and
+    /// say so" — which is exactly what lets the recognizer warn once and carry
+    /// on instead of refusing to start.
+    #[test]
+    fn an_optional_entry_point_is_called_only_when_the_library_has_it() {
+        let mut calls = 0;
+
+        assert!(
+            optional(Some(7), |value| calls += value),
+            "a resolved entry point should report that it was used"
+        );
+        assert_eq!(calls, 7, "a resolved entry point should have been called");
+
+        assert!(
+            !optional(None::<i32>, |value| calls += value),
+            "an unresolved entry point should report that it was not used"
+        );
+        assert_eq!(calls, 7, "an unresolved entry point must not be called");
     }
 }

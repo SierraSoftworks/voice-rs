@@ -2,7 +2,13 @@
 //! and the toggle / push-to-talk / push-to-mute listening logic.
 //! See DESIGN.md §"Runtime pipeline".
 //!
-//! **Privacy:** this module reads `/dev/input/event*`, which technically
+//! [`ListenMode`], [`transition`] and [`initial_listening`] are the whole of
+//! the *logic*, and are shared by every platform; how the key events reach them
+//! is not. [`watch`] is the seam between the two: on Linux it is evdev
+//! discovery plus an `EventStream` ([`discovery`], [`task`]), and on Windows a
+//! `WH_KEYBOARD_LL` hook ([`win`]).
+//!
+//! **Privacy:** on Linux this module reads `/dev/input/event*`, which technically
 //! carries every keystroke on the machine. We deliberately look at nothing but
 //! the single configured hotkey: every event whose type is not `EV_KEY`, or
 //! whose code is not the configured key, is discarded without its value ever
@@ -10,19 +16,61 @@
 
 #![allow(dead_code)] // consumed as the wave-2 `run` assembly lands
 
+#[cfg(target_os = "linux")]
 mod discovery;
+#[cfg(target_os = "linux")]
 mod task;
+#[cfg(not(target_os = "linux"))]
+mod win;
 
 // Re-exported for the `run` assembly, which lands in a later wave.
 #[allow(unused_imports)]
+#[cfg(target_os = "linux")]
 pub use discovery::discover_device;
 // The ranking and the enumeration behind it, so `voice-orders devices` can
 // show the same answer `device: auto` would arrive at. `Rank` travels inside
 // `ListedDevice`, so the listing rarely has to name it.
 #[allow(unused_imports)]
+#[cfg(target_os = "linux")]
 pub use discovery::{ListedDevice, Rank, auto_choice, list_devices};
 #[allow(unused_imports)]
+#[cfg(target_os = "linux")]
 pub use task::hotkey_task;
+
+/// Starts watching for the listen hotkey, returning the task which does it.
+///
+/// This is the seam the `run` assembly sits on, and the only part of the
+/// hotkey module which is not platform-specific. Everything a caller has to
+/// know is in the signature: *which* device (the profile's `hotkey.device`
+/// hint), which key, in which mode, where to publish listening changes, and
+/// when to stop.
+///
+/// Resolving a device is part of *starting*, not part of running: an
+/// unresolvable device is an error the assembly reports before it spins
+/// anything up, exactly as it did when `run` called `discover_device` itself.
+/// The returned future is what gets spawned.
+///
+/// On Linux this is evdev discovery plus the `/dev/input/event*` event stream.
+/// On Windows the low-level keyboard hook which replaces it arrives in W3, and
+/// this reports an honest error until then.
+#[cfg(target_os = "linux")]
+pub fn watch(
+    device_hint: &str,
+    key: crate::output::KeyCode,
+    mode: ListenMode,
+    listening: tokio::sync::watch::Sender<bool>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<
+    impl std::future::Future<Output = Result<(), crate::Error>> + Send + 'static,
+    crate::Error,
+> {
+    let device = discovery::discover_device(device_hint, key)?;
+
+    Ok(task::hotkey_task(device, key, mode, listening, cancel))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub use win::watch;
 
 /// How the listen hotkey affects the listening state.
 ///

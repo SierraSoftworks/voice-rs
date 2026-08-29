@@ -6,12 +6,27 @@
 #![allow(dead_code)]
 
 pub mod keys;
+
+// The virtual keyboard is `/dev/uinput` on Linux and `SendInput` on Windows.
+// Both are the same shape — a [`KeySink`] with an async `new()` — so the `run`
+// assembly names [`PlatformSink`] and never learns which one it got.
+#[cfg(not(target_os = "linux"))]
+pub mod sendinput;
+#[cfg(target_os = "linux")]
 pub mod uinput;
 
 pub use keys::KeyCode;
 // Re-exported for `commands/run.rs`; nothing reaches it until that lands.
 #[allow(unused_imports)]
+#[cfg(target_os = "linux")]
 pub use uinput::UinputSink;
+
+/// The keyboard sink this platform types through.
+#[cfg(not(target_os = "linux"))]
+pub use sendinput::WinKeySink as PlatformSink;
+/// The keyboard sink this platform types through.
+#[cfg(target_os = "linux")]
+pub use uinput::UinputSink as PlatformSink;
 
 use crate::Error;
 use crate::matcher::CommandAction;

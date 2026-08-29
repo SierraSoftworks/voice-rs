@@ -24,11 +24,14 @@ use tracing_batteries::prelude::*;
 
 use crate::audio::{self, InputDevice};
 use crate::config::SystemConfig;
+#[cfg(target_os = "linux")]
 use crate::hotkey::{self, ListedDevice};
+#[cfg(target_os = "linux")]
 use crate::output::keys;
 
 /// The key the hotkey listing ranks devices for: every keyboard has a left
 /// control, and `doctor` probes with the same one for the same reason.
+#[cfg(target_os = "linux")]
 const PROBE_KEY: &str = "leftctrl";
 
 #[derive(Args, Debug)]
@@ -181,6 +184,7 @@ fn matching(devices: &[InputDevice], hint: &str) -> Option<usize> {
 // ── Hotkey devices ──────────────────────────────────────────────────────────
 
 /// Prints the hotkey section, returning whether it could be listed at all.
+#[cfg(target_os = "linux")]
 fn print_hotkey() -> bool {
     let key = keys::from_name(PROBE_KEY).expect("the probe key must be in the key table");
 
@@ -197,9 +201,26 @@ fn print_hotkey() -> bool {
     }
 }
 
+/// Prints the hotkey section on Windows, where there is nothing to list.
+///
+/// `hotkey.device` picks between `/dev/input/event*` nodes, which is a Linux
+/// concept: the Windows hotkey is a system-wide low-level keyboard hook with no
+/// per-device view (DESIGN.md §"Windows support"). Saying so is a successful
+/// listing — the section answered the question — so it does not count towards
+/// the exit code.
+#[cfg(not(target_os = "linux"))]
+fn print_hotkey() -> bool {
+    println!("{HOTKEY_HEADING}");
+    println!(
+        "  Device selection is not available on Windows: the listen hotkey is watched system-wide rather than on one keyboard, so 'hotkey.device' has no effect here. Leave it out of your profile."
+    );
+    true
+}
+
 const HOTKEY_HEADING: &str = "Hotkey devices (hotkey.device)";
 
 /// Renders the hotkey section from the ranked device list alone.
+#[cfg(target_os = "linux")]
 fn render_hotkey(devices: &[ListedDevice]) -> String {
     let mut out = format!("{HOTKEY_HEADING}\n");
 
@@ -262,6 +283,7 @@ fn render_error(error: &crate::Error) -> String {
 mod tests {
     use super::*;
     use rstest::rstest;
+    #[cfg(target_os = "linux")]
     use std::path::PathBuf;
 
     fn input(name: &str, is_default: bool) -> InputDevice {
@@ -271,6 +293,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn listed(event: u32, name: &str, rank: hotkey::Rank, reports_key: bool) -> ListedDevice {
         ListedDevice {
             path: PathBuf::from(format!("/dev/input/event{event}")),
@@ -366,6 +389,7 @@ mod tests {
 
     // --- Hotkey -----------------------------------------------------------
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_the_hotkey_listing_marks_what_auto_would_pick() {
         let rendered = render_hotkey(&[
@@ -402,6 +426,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_a_device_which_does_not_report_the_key_is_never_picked() {
         // The listing shows every readable device, but `auto` only ever
@@ -418,6 +443,7 @@ mod tests {
         assert!(!rendered.contains("* /dev/input/event0"), "{rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_nothing_reporting_the_key_is_explained() {
         let rendered = render_hotkey(&[listed(
@@ -431,11 +457,13 @@ mod tests {
         assert!(!rendered.contains('*'), "nothing was picked: {rendered}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_an_empty_hotkey_listing_says_so() {
         assert!(render_hotkey(&[]).contains("(none"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_the_paths_line_up() {
         let rendered = render_hotkey(&[
@@ -481,15 +509,18 @@ mod tests {
         let rendered = render_audio(&devices, None);
         assert!(rendered.starts_with(AUDIO_HEADING), "{rendered}");
 
-        let key = keys::from_name(PROBE_KEY).expect("the probe key");
-        match hotkey::list_devices(key) {
-            Ok(devices) => {
-                let rendered = render_hotkey(&devices);
-                assert!(rendered.starts_with(HOTKEY_HEADING), "{rendered}");
+        #[cfg(target_os = "linux")]
+        {
+            let key = keys::from_name(PROBE_KEY).expect("the probe key");
+            match hotkey::list_devices(key) {
+                Ok(devices) => {
+                    let rendered = render_hotkey(&devices);
+                    assert!(rendered.starts_with(HOTKEY_HEADING), "{rendered}");
+                }
+                // A machine where /dev/input is unreadable is a legitimate
+                // outcome; what matters is that it fails humanly.
+                Err(e) => assert!(e.is(human_errors::Kind::User), "{}", e.message()),
             }
-            // A machine where /dev/input is unreadable is a legitimate outcome;
-            // what matters is that it fails humanly.
-            Err(e) => assert!(e.is(human_errors::Kind::User), "{}", e.message()),
         }
     }
 }

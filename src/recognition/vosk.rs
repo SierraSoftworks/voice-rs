@@ -437,11 +437,20 @@ fn build_recognizer(
     // moved finalization from ~700ms to ~400ms after the last word with
     // unchanged transcripts. The other two thresholds keep vosk's own
     // suggested values (see the constants' comments).
-    recognizer.set_endpointer_delays(
+    //
+    // The entry point only exists in libvosk 0.3.46 and newer; an older build
+    // (which is every published Windows one) is not broken, it simply keeps
+    // vosk's stock trailing silence — worth saying once, not worth refusing to
+    // start over.
+    if !recognizer.set_endpointer_delays(
         ENDPOINTER_START_MAX_SECS,
         options.silence.as_secs_f32(),
         ENDPOINTER_MAX_UTTERANCE_SECS,
-    );
+    ) {
+        warn!(
+            "This libvosk build does not support endpointer tuning; recognition.silence has no effect."
+        );
+    }
 
     Ok(recognizer)
 }

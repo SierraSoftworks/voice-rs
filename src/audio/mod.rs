@@ -61,9 +61,16 @@ const FRAMES_PER_SECOND: u32 = 10;
 ///
 /// cpal's ALSA stream is `Send + Sync` (it owns its own audio thread and the
 /// ALSA library is assumed to be thread-safe), so `run` can park this handle
-/// wherever it likes on the Tokio side. A unit test pins that down, because
-/// cpal makes no such promise on other backends and voice-orders is
-/// Linux-only by design.
+/// wherever it likes on the Tokio side. A Linux-only unit test pins that down.
+///
+/// **cpal's WASAPI stream is not.** COM apartment state is per-thread, so a
+/// Windows `cpal::Stream` is `!Send`, and with it the whole pipeline future
+/// which owns this handle: on Windows `Pipeline::run()` must be awaited where
+/// it was built (`main`'s thread) and may never be `tokio::spawn`ed. The
+/// assembly already awaits it in place, so nothing has to change — but a
+/// future refactor which spawns it would compile on Linux and fail only on
+/// Windows, which is why this is written down here rather than left to be
+/// rediscovered.
 #[must_use = "capture stops as soon as the handle is dropped"]
 pub struct CaptureHandle {
     stream: cpal::Stream,
@@ -253,6 +260,12 @@ mod tests {
 
     /// `run` assembles the pipeline on the Tokio runtime and needs to be able
     /// to move the handle into a task, so this must keep holding on Linux.
+    ///
+    /// Linux-only: cpal's WASAPI stream is `!Send` (COM apartments are
+    /// per-thread), which is exactly what the type's own documentation
+    /// anticipates — asserting it on Windows would be asserting something
+    /// false.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_handle_can_be_moved_between_threads() {
         fn assert_send_sync<T: Send + Sync>() {}
