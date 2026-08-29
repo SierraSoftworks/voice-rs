@@ -10,11 +10,16 @@
 //!
 //! - **The asset name is pinned to what CI publishes.** `.github/workflows/rust.yml`
 //!   stages each build as `voice-orders-{os}-{arch}` (`voice-orders-linux-amd64`,
-//!   `voice-orders-linux-arm64`), which is exactly [`naming::go`]'s Go-style
-//!   convention, so no custom pattern is needed. The pattern is matched against
-//!   the *whole* asset name, which is what keeps the `libvosk-linux-amd64.so`
-//!   asset published alongside it out of the updater's way: updates replace the
-//!   voice-orders binary and never touch libvosk.
+//!   `voice-orders-linux-arm64`) and the Windows one as
+//!   `voice-orders-windows-amd64.exe`, which is exactly [`naming::go`]'s Go-style
+//!   convention — `{prefix}-{GOOS}-{GOARCH}` plus `std::env::consts::EXE_SUFFIX`,
+//!   so the `.exe` is part of the asset's *name* on Windows and not merely a
+//!   local convenience. No custom pattern is needed for either. The pattern is
+//!   matched against the *whole* asset name, which is what keeps the siblings
+//!   published alongside it — `libvosk-linux-amd64.so`, and the
+//!   `voice-orders-windows-amd64.zip` which carries the binary and its DLLs —
+//!   out of the updater's way: updates replace the voice-orders binary and
+//!   never touch libvosk.
 //! - **`update_rs::Error` *is* [`crate::Error`].** The crate re-exports
 //!   `human_errors::Error` as its own error type, so there is no conversion
 //!   boundary here and nothing for [`crate::errors::HumanizableError`] to do —
@@ -342,13 +347,37 @@ mod tests {
         // with `os: linux` and `arch: amd64` / `arm64`. If the workflow ever
         // renames its assets, this test fails rather than everybody's updater
         // silently finding nothing to install.
-        let expected = if cfg!(target_arch = "x86_64") {
-            "voice-orders-linux-amd64"
-        } else {
-            "voice-orders-linux-arm64"
+        //
+        // The Windows row stages the same binary twice; the one pinned here is
+        // the raw `.exe`, because the `.exe` is part of what `naming::go` asks
+        // for (`{prefix}-{GOOS}-{GOARCH}{EXE_SUFFIX}`) rather than a local
+        // nicety. The `.zip` beside it is for people, not for the updater.
+        let expected = match (cfg!(windows), cfg!(target_arch = "x86_64")) {
+            (true, true) => "voice-orders-windows-amd64.exe",
+            // The workflow has one Windows row, and it is amd64. A build for
+            // any other Windows architecture has no release to update from, so
+            // this fails rather than pretending otherwise.
+            (true, false) => "(the workflow publishes no Windows build for this architecture)",
+            (false, true) => "voice-orders-linux-amd64",
+            (false, false) => "voice-orders-linux-arm64",
         };
 
         assert_eq!(asset_name(), expected);
+    }
+
+    #[test]
+    fn test_the_asset_pattern_does_not_match_the_windows_zip() {
+        // A Windows release carries `voice-orders-windows-amd64.zip` — the
+        // binary and the four libvosk DLLs, side by side — as well as the raw
+        // binary. An update replaces the running executable; handing it an
+        // archive would replace a working install with a zip file.
+        let name = asset_name();
+
+        assert_ne!(name, "voice-orders-windows-amd64.zip");
+        assert!(
+            !name.ends_with(".zip"),
+            "the updater must never select an archive, got {name}"
+        );
     }
 
     #[test]
@@ -419,7 +448,9 @@ mod tests {
                         {{ "name": "libvosk-linux-amd64.so" }},
                         {{ "name": "libvosk-linux-arm64.so" }},
                         {{ "name": "voice-orders-linux-amd64" }},
-                        {{ "name": "voice-orders-linux-arm64" }}
+                        {{ "name": "voice-orders-linux-arm64" }},
+                        {{ "name": "voice-orders-windows-amd64.exe" }},
+                        {{ "name": "voice-orders-windows-amd64.zip" }}
                     ]
                 }},
                 {{

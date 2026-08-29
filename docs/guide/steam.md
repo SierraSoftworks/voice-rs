@@ -46,6 +46,29 @@ Signals are handled the way you would expect. `SIGINT` (Ctrl-C in a terminal) re
 the process group. `SIGTERM` — which is what Steam's "Stop" button sends — is forwarded to the child, followed by a
 short grace period before voice-orders exits regardless.
 
+### On Windows
+
+The launch option is the same, with the binary's name as Windows spells it:
+
+```
+voice-orders.exe run C:\Users\you\profiles\drg.yaml -- %command%
+```
+
+Everything above holds: the profile is validated before the game starts, the game inherits stdio, and voice-orders exits
+with the game's exit code. What differs is the *stopping*, and it is worth being plain about:
+
+- **Steam's "Stop" is a hard kill.** Windows has no SIGTERM, and there is no signal Steam could send us that we could
+  pass on politely. voice-orders asks a console child to stop with a `CTRL_BREAK` event, which a windowed game never
+  receives at all.
+- **So voice-orders terminates the game rather than asking it to quit.** When voice-orders goes away for any reason —
+  the Stop button, the console window closing, a crash, Task Manager — the game and everything it started go with it.
+  That is deliberate: the wrapper's contract is that the two live and die together, and the alternative is an orphaned
+  game with no wrapper left to stop it. Quit the game from its own menu when you want it to save.
+
+The mechanism is a **job object**: the game is placed in one at launch, and the kernel ends everything still inside it
+the moment voice-orders' handle closes. Nothing is left behind — no orphaned game, no leftover launcher, no anti-cheat
+service still running after the library says the game has stopped.
+
 ### Steam launches are never a terminal session
 
 Run from an interactive terminal, `voice-orders run` draws a full-screen view of what it is hearing (the same one

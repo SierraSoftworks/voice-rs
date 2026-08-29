@@ -72,6 +72,13 @@ const COMMAND_QUEUE_CAPACITY: usize = 32;
 /// stop waiting and shut down anyway.
 const SIGTERM_GRACE: Duration = Duration::from_secs(5);
 
+/// How long we wait for a child to disappear after a kill it cannot refuse.
+///
+/// Windows only: `TerminateJobObject` is unpostponable, so this is a bound on
+/// the kernel reaping the process rather than on the application's cooperation,
+/// and it is short for that reason.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Args, Debug)]
 pub struct RunArgs {
     /// The profile to run: a local path or an https:// URL.
@@ -862,6 +869,14 @@ pub(super) fn terminations() -> Result<impl Future<Output = ()>, crate::Error> {
 /// one is the same intent, so they are raced. `CTRL_BREAK_EVENT` is
 /// deliberately not among them — it is a user gesture like Ctrl-C, which
 /// [`interrupts`] already covers.
+///
+/// Both of these arrive on a **deadline**: Windows gives a console application
+/// roughly five seconds to handle `CTRL_CLOSE_EVENT` (and no more than that for
+/// a shutdown) before it kills the process where it stands. That is less than
+/// [`SIGTERM_GRACE`] plus a tidy pipeline shutdown, so the close-window path can
+/// end with us being killed part-way through — which is exactly the case
+/// [`contain_child`]'s job object exists to cover: our handles close as we die,
+/// and the wrapped application goes with us.
 #[cfg(not(target_os = "linux"))]
 pub(super) fn terminations() -> Result<impl Future<Output = ()>, crate::Error> {
     let mut close =
@@ -894,6 +909,10 @@ fn signal_handler_error(e: std::io::Error, signal: &str) -> crate::Error {
 /// change it. Under the terminal UI it is **piped** instead: an inherited child
 /// would write straight over the alternate screen, so its output is read and
 /// logged ([`forward_child_output`]).
+///
+/// The two platform hooks around the spawn — [`group_child`] before it and
+/// [`contain_child`] after it — do nothing at all on Linux, where a child
+/// already inherits our process group and a signal already reaches it.
 fn spawn_child(app: &[String], mode: ReportMode) -> Result<Option<Child>, crate::Error> {
     let Some((executable, arguments)) = app.split_first() else {
         return Ok(None);
@@ -906,10 +925,10 @@ fn spawn_child(app: &[String], mode: ReportMode) -> Result<Option<Child>, crate:
     if mode == ReportMode::Tui {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
+    group_child(&mut command);
 
-    command
+    let child = command
         .spawn()
-        .map(Some)
         .map_err(|e| {
             human_errors::wrap_user(
                 e,
@@ -919,7 +938,61 @@ fn spawn_child(app: &[String], mode: ReportMode) -> Result<Option<Child>, crate:
                     "Steam launch options should read `voice-orders run profile.yaml -- %command%`, with the '--' before %command%.",
                 ],
             )
-        })
+        })?;
+
+    contain_child(&child);
+
+    Ok(Some(child))
+}
+
+/// Nothing to do: a child we spawn is already in our process group, which is
+/// what makes a Ctrl-C at the terminal reach it without us lifting a finger.
+#[cfg(target_os = "linux")]
+fn group_child(_command: &mut tokio::process::Command) {}
+
+/// Starts the child in a process group of its own.
+///
+/// This is what makes a graceful stop possible at all on Windows:
+/// `GenerateConsoleCtrlEvent` addresses a process *group*, and the only group
+/// it can address other than "everybody on this console" is one created by
+/// `CREATE_NEW_PROCESS_GROUP`, whose identifier is the child's own process id.
+///
+/// It costs the child its inherited Ctrl-C: a process started this way begins
+/// with Ctrl-C handling disabled, which is precisely why [`send_signal`] sends
+/// `CTRL_BREAK_EVENT` (never `CTRL_C_EVENT`, which is silently discarded for a
+/// non-zero group) and why the job object below exists.
+///
+/// `tokio::process::Command` has its own inherent `creation_flags`, so this
+/// needs no import of `std::os::windows::process::CommandExt`.
+#[cfg(not(target_os = "linux"))]
+fn group_child(command: &mut tokio::process::Command) {
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+}
+
+/// Nothing to contain: on Linux the process group is the containment, and a
+/// child which outlives us is the user's business.
+#[cfg(target_os = "linux")]
+fn contain_child(_child: &Child) {}
+
+/// Puts the child — and everything it goes on to start — into a job object we
+/// hold the only handle to.
+///
+/// **This is the wrapper contract's backstop on Windows, and it is the one
+/// guarantee which survives everything.** The job is created with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which means the kernel terminates
+/// every process still in it the moment our last handle to it closes — and our
+/// handles close when this process exits, whether that is a clean shutdown, a
+/// panic, or somebody `TerminateProcess`-ing us from Task Manager. Steam's
+/// "Stop" button is an arbitrary kill of exactly that kind, so without this a
+/// stopped game would keep running with nothing left to supervise it.
+///
+/// A failure to assign is a warning rather than an error: a child which was
+/// launched into a job of its own (some launchers and anti-cheat services do
+/// this) cannot be adopted into ours, and refusing to run the session over it
+/// would be worse than running it without the backstop.
+#[cfg(not(target_os = "linux"))]
+fn contain_child(child: &Child) {
+    job::contain(child);
 }
 
 /// What to call the wrapped application in the UI: the executable's file name,
@@ -1149,18 +1222,140 @@ fn send_signal(pid: u32, signal: Signal) {
     }
 }
 
-/// Windows has no per-process signals: telling a child to wind down means
-/// either `GenerateConsoleCtrlEvent` (which only reaches a process *group*, so
-/// the child has to have been started in one) or a job object, both of which
-/// are W4's job. Until then the child is left alone and the grace period below
-/// simply elapses before we shut down around it.
+/// Asks a child to stop, as far as Windows lets us ask anything.
+///
+/// Windows has no per-process signals. The nearest thing is a console control
+/// event, and it comes with two honest caveats:
+///
+/// - `CTRL_BREAK_EVENT` is the only event which can be aimed at one process
+///   group. `CTRL_C_EVENT` cannot: for any non-zero group id it *succeeds* and
+///   delivers nothing at all, which is the worst possible failure mode, so it
+///   is never sent here.
+/// - It only reaches a **console** child sharing our console — one started by
+///   [`group_child`] with `CREATE_NEW_PROCESS_GROUP`. A GUI application (which
+///   is to say: a game) has no console control handler and receives nothing.
+///
+/// So this is a courtesy for the console case and a no-op everywhere else,
+/// which is why the plan behind [`forward_signal`] always ends in a kill on
+/// this platform rather than trusting the ask.
 #[cfg(not(target_os = "linux"))]
 fn send_signal(pid: u32, signal: Signal) {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+
     debug!(
         pid,
-        "Graceful child signalling lands in W4; not passing the {} on to the application.",
+        "Sending CTRL_BREAK to the application's process group ({}).",
         signal.what()
     );
+
+    // SAFETY: no memory is involved — the call takes two integers, and the
+    // group id is the child's own pid, which `CREATE_NEW_PROCESS_GROUP` made
+    // the identifier of a group containing exactly it and its descendants.
+    if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } == 0 {
+        let error = std::io::Error::last_os_error();
+        // Not a warning: a windowed application has no console control handler
+        // and this failing says nothing the user can act on. The kill which
+        // follows is what actually stops it.
+        debug!(
+            "The application did not accept the {} console event ({error}).",
+            signal.what()
+        );
+    }
+}
+
+/// Stops the child by force, along with everything it started.
+///
+/// Never reached on Linux: [`CONTAINMENT`] is [`Containment::Signals`] here, so
+/// no plan this platform builds contains a [`StopStep::Kill`]. It exists so the
+/// plan executor below can stay one shared function.
+#[cfg(target_os = "linux")]
+fn kill_contained() -> bool {
+    false
+}
+
+/// Terminates the job object the child was placed in when it was spawned.
+///
+/// `TerminateJobObject` is the one stop a process cannot postpone, argue with,
+/// or catch — and because it acts on the *job*, it takes the whole tree the
+/// application built (launchers, shader compilers, an anti-cheat service) rather
+/// than leaving orphans behind a stopped game.
+#[cfg(not(target_os = "linux"))]
+fn kill_contained() -> bool {
+    job::terminate()
+}
+
+/// What this platform can do about a wrapped application which will not stop
+/// when it is asked to.
+///
+/// The two are different in kind rather than in degree, which is why this is an
+/// enum and not a flag. On Linux the signal *is* the mechanism: a process which
+/// ignores SIGTERM has made a decision, and a wrapper which escalated to
+/// SIGKILL would be overruling the user's own program. On Windows the ask
+/// reaches console children only (see [`send_signal`]), so the job object is
+/// not an escalation at all — it is the only thing that ever guaranteed the
+/// application stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Containment {
+    /// Signals, and nothing beyond them.
+    Signals,
+    /// A job object holding the child and everything it started.
+    JobObject,
+}
+
+/// This platform's containment.
+///
+/// `cfg!` rather than `#[cfg]` deliberately: both arms are compiled everywhere,
+/// so the plan each of them produces can be asserted on the platform we develop
+/// on rather than only on the platform it ships to.
+const CONTAINMENT: Containment = if cfg!(windows) {
+    Containment::JobObject
+} else {
+    Containment::Signals
+};
+
+/// One step of stopping a wrapped application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopStep {
+    /// Ask it to stop.
+    Ask(Signal),
+    /// Give it this long to go on its own.
+    Wait(Duration),
+    /// Stop it ourselves, and everything it started with it.
+    Kill,
+}
+
+/// The ordered steps for stopping a wrapped application.
+///
+/// The choreography is the interesting half of child shutdown and the half
+/// which differs per platform, so it is derived here — from a [`Signal`] and a
+/// [`Containment`], with no process anywhere near it — and merely *performed*
+/// by [`forward_signal`]. Both platforms' plans are therefore asserted by unit
+/// tests on either platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildStopPlan(Vec<StopStep>);
+
+impl ChildStopPlan {
+    /// How this platform stops a child it is forwarding `signal` to.
+    fn new(signal: Signal, containment: Containment) -> Self {
+        let mut steps = vec![StopStep::Ask(signal), StopStep::Wait(SIGTERM_GRACE)];
+
+        if containment == Containment::JobObject {
+            steps.push(StopStep::Kill);
+        }
+
+        Self(steps)
+    }
+
+    /// The steps, in the order they are taken.
+    fn steps(&self) -> &[StopStep] {
+        &self.0
+    }
+
+    /// Whether the plan ends by stopping the application itself, which is what
+    /// the "it did not exit in time" message has to say honestly.
+    fn kills(&self) -> bool {
+        self.0.contains(&StopStep::Kill)
+    }
 }
 
 /// Forwards a signal to the child and gives it [`SIGTERM_GRACE`] to wind down.
@@ -1178,21 +1373,184 @@ async fn forward_signal(child: &mut Child, signal: Signal) -> bool {
         return true;
     };
 
-    send_signal(pid, signal);
+    let plan = ChildStopPlan::new(signal, CONTAINMENT);
+    let mut exited = false;
 
-    match tokio::time::timeout(SIGTERM_GRACE, child.wait()).await {
+    for step in plan.steps() {
+        match *step {
+            StopStep::Ask(signal) => send_signal(pid, signal),
+            StopStep::Wait(grace) => {
+                exited = wait_out(child, grace, plan.kills()).await;
+                if exited {
+                    break;
+                }
+            }
+            StopStep::Kill => {
+                if !kill_contained() {
+                    warn!("We could not stop the application ourselves; shutting down anyway.");
+                    break;
+                }
+
+                exited = matches!(
+                    tokio::time::timeout(KILL_GRACE, child.wait()).await,
+                    Ok(Ok(_))
+                );
+            }
+        }
+    }
+
+    exited
+}
+
+/// Waits `grace` for a child to exit on its own, saying so when it does not.
+///
+/// `escalating` says whether a [`StopStep::Kill`] follows, which is the only
+/// thing the message may not lie about: "shutting down anyway" is the truth on
+/// a platform which leaves the application alone, and would be a lie on one
+/// which is about to terminate it.
+async fn wait_out(child: &mut Child, grace: Duration, escalating: bool) -> bool {
+    match tokio::time::timeout(grace, child.wait()).await {
         Ok(Ok(_)) => true,
         Ok(Err(e)) => {
             warn!("We lost track of the application while it was shutting down ({e}).");
             false
         }
-        Err(_) => {
+        Err(_) if escalating => {
             warn!(
-                "The application has not exited {}s after we asked it to; shutting down anyway.",
-                SIGTERM_GRACE.as_secs()
+                "The application has not exited {}s after we asked it to; stopping it and everything it started.",
+                grace.as_secs()
             );
             false
         }
+        Err(_) => {
+            warn!(
+                "The application has not exited {}s after we asked it to; shutting down anyway.",
+                grace.as_secs()
+            );
+            false
+        }
+    }
+}
+
+/// The job object which holds the wrapped application, and the two syscalls
+/// which put it there and tear it down.
+///
+/// The handle lives in a `static` rather than in a value threaded through
+/// [`supervise`]: the supervisor is shared, platform-neutral code and stays
+/// that way, and the guarantee we are buying is a *process-lifetime* one —
+/// the job must outlive every path out of this program, including the ones
+/// which never run another line of our code. `Job`'s `Drop` closes the handle
+/// (and so kills whatever is still in the job) if the guard is ever replaced or
+/// taken; on the ordinary path the handle is closed by the kernel as the
+/// process goes away, which has exactly the same effect and is the reason this
+/// is a backstop rather than a courtesy.
+#[cfg(not(target_os = "linux"))]
+mod job {
+    use std::sync::Mutex;
+
+    use tokio::process::Child;
+    use tracing_batteries::prelude::*;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+
+    /// The exit code processes killed with the job report. It is never
+    /// propagated — a terminated child ends the session as
+    /// [`super::Ending::Terminated`], not as [`super::Ending::Child`].
+    const KILLED_EXIT_CODE: u32 = 1;
+
+    /// An owned job-object handle, closed on drop.
+    struct Job(HANDLE);
+
+    // SAFETY: a `HANDLE` is a kernel object identifier rather than a pointer
+    // into our address space; every job API is thread-safe and none of them
+    // cares which thread holds it.
+    unsafe impl Send for Job {}
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from `CreateJobObjectW`, is closed
+            // exactly once (here), and is not used afterwards.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// The job the wrapped application is in, for as long as we live.
+    static JOB: Mutex<Option<Job>> = Mutex::new(None);
+
+    /// Creates the job, sets kill-on-close, and adopts the child into it.
+    pub(super) fn contain(child: &Child) {
+        let Some(handle) = child.raw_handle() else {
+            // Already exited: there is nothing to contain.
+            return;
+        };
+
+        // SAFETY: an unnamed job with default security is two null pointers;
+        // the call allocates the object and returns a handle we own.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            warn!(
+                "We could not create the job object which stops the application when voice-orders does ({}).",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let job = Job(job);
+
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        // SAFETY: the information class and the struct we point at match, and
+        // the length we declare is that struct's own size.
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            warn!(
+                "We could not configure the job object which stops the application when voice-orders does ({}).",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // SAFETY: both handles are live — ours from `CreateJobObjectW`, the
+        // child's borrowed from a `Child` which has not been reaped.
+        if unsafe { AssignProcessToJobObject(job.0, handle) } == 0 {
+            // A child which was launched into a job of its own (some launchers
+            // and anti-cheat services do exactly this) cannot be adopted into
+            // ours. Worth saying out loud, because it is the one case where
+            // stopping voice-orders may leave the application running.
+            warn!(
+                "We could not take charge of the application's process tree ({}); if voice-orders is killed, the application may keep running.",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        debug!("The application is contained in a job object.");
+        *JOB.lock().unwrap_or_else(|e| e.into_inner()) = Some(job);
+    }
+
+    /// Terminates everything in the job, if we have one.
+    pub(super) fn terminate() -> bool {
+        let job = JOB.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(job) = job.as_ref() else {
+            debug!("There is no job object to terminate the application with.");
+            return false;
+        };
+
+        // SAFETY: the handle is ours and still open — nothing takes it out of
+        // the static — and terminating a job is safe at any time.
+        unsafe { TerminateJobObject(job.0, KILLED_EXIT_CODE) != 0 }
     }
 }
 
@@ -1538,11 +1896,21 @@ mod tests {
         std::future::pending()
     }
 
-    /// An interrupt which has already happened, of the given kind.
+    /// An interrupt which has already happened, of the given kind. Used only by
+    /// the `cfg(unix)` supervision tests below.
+    #[cfg(unix)]
     fn interrupted(shutdown: Shutdown) -> impl Future<Output = Shutdown> {
         std::future::ready(shutdown)
     }
 
+    /// Spawns a real process for the supervisor to supervise.
+    ///
+    /// The tests which use it are `cfg(unix)`: they are about what a *signal*
+    /// does to a real child, and they name real programs (`/bin/sleep`) to do
+    /// it. The platform-independent half of the same behaviour — which steps
+    /// each platform takes, in which order — is asserted from
+    /// [`ChildStopPlan`] below, on every platform.
+    #[cfg(unix)]
     async fn child(program: &str, args: &[&str]) -> Child {
         tokio::process::Command::new(program)
             .args(args)
@@ -1550,6 +1918,7 @@ mod tests {
             .expect("the test child should start")
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_a_successful_child_exits_zero() {
         let ending = supervise(Some(child("/bin/true", &[]).await), never(), never()).await;
@@ -1558,6 +1927,7 @@ mod tests {
         assert_eq!(ending.exit_code(), 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_a_failing_child_propagates_its_code() {
         let ending = supervise(Some(child("/bin/false", &[]).await), never(), never()).await;
@@ -1566,6 +1936,7 @@ mod tests {
         assert_eq!(ending.exit_code(), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_an_interrupt_does_not_touch_the_child() {
         // SIGINT reaches the child through the process group, so we must not
@@ -1612,6 +1983,7 @@ mod tests {
         assert_eq!(stopped_by_ui(quit, false).await, Shutdown::Quiet);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_a_keyboard_interrupt_is_forwarded_to_the_child() {
         // 'q' (or Ctrl-C) under the UI: the child gets the SIGINT the terminal
@@ -1636,6 +2008,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_a_keyboard_interrupt_without_a_child_signals_nothing() {
         let mut sleeping = child("/bin/sleep", &["30"]).await;
@@ -1650,6 +2023,7 @@ mod tests {
         sleeping.kill().await.expect("the child should be killable");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_a_termination_is_forwarded_to_the_child() {
         let started = std::time::Instant::now();
@@ -1674,6 +2048,68 @@ mod tests {
 
         assert_eq!(ending, Ending::Terminated { child_exited: true });
         assert_eq!(ending.exit_code(), 0);
+    }
+
+    // --- How a child is stopped, per platform ------------------------------
+    //
+    // The choreography is derived rather than performed here, which is what
+    // lets the Windows one be asserted from Linux: only the three one-line
+    // platform functions it names (`send_signal`, `kill_contained`,
+    // `contain_child`) are compiled for one platform each.
+
+    #[rstest::rstest]
+    #[case(Signal::Interrupt)]
+    #[case(Signal::Terminate)]
+    fn test_signals_are_the_whole_plan_where_signals_work(#[case] signal: Signal) {
+        // Linux: ask, wait, and then leave the application alone. A wrapper
+        // which escalated to SIGKILL would be overruling the user's program.
+        assert_eq!(
+            ChildStopPlan::new(signal, Containment::Signals).steps(),
+            &[StopStep::Ask(signal), StopStep::Wait(SIGTERM_GRACE)]
+        );
+        assert!(!ChildStopPlan::new(signal, Containment::Signals).kills());
+    }
+
+    #[rstest::rstest]
+    #[case(Signal::Interrupt)]
+    #[case(Signal::Terminate)]
+    fn test_a_job_object_ends_the_plan_where_the_ask_is_best_effort(#[case] signal: Signal) {
+        // Windows: the same ask and the same grace period, and then the kill —
+        // because a windowed application never received the ask at all.
+        assert_eq!(
+            ChildStopPlan::new(signal, Containment::JobObject).steps(),
+            &[
+                StopStep::Ask(signal),
+                StopStep::Wait(SIGTERM_GRACE),
+                StopStep::Kill
+            ]
+        );
+        assert!(ChildStopPlan::new(signal, Containment::JobObject).kills());
+    }
+
+    #[test]
+    fn test_the_plan_asks_before_it_waits_and_waits_before_it_kills() {
+        // The ordering is the whole point: a kill which preceded the grace
+        // period would make the grace period a lie.
+        let plan = ChildStopPlan::new(Signal::Terminate, Containment::JobObject);
+        let steps = plan.steps();
+
+        assert!(matches!(steps[0], StopStep::Ask(_)));
+        assert!(matches!(steps[1], StopStep::Wait(_)));
+        assert_eq!(steps[2], StopStep::Kill);
+    }
+
+    #[test]
+    fn test_this_platform_uses_the_containment_it_has() {
+        assert_eq!(
+            CONTAINMENT,
+            if cfg!(windows) {
+                Containment::JobObject
+            } else {
+                Containment::Signals
+            },
+            "a job object is Windows' only guarantee, and Linux needs none"
+        );
     }
 
     #[rstest::rstest]
@@ -1703,6 +2139,7 @@ mod tests {
         assert!(error.is(human_errors::Kind::User));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_only_a_ui_session_pipes_the_childs_output() {
         // The wrapper contract: with no UI the child writes to our stdout and

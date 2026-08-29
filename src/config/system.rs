@@ -20,6 +20,7 @@
 //! `test` and `doctor` all ask it rather than each reaching into the two
 //! structs themselves.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use tracing_batteries::prelude::*;
@@ -27,7 +28,8 @@ use tracing_batteries::prelude::*;
 use super::hotkey::{HotkeyConfig, ResolvedHotkey};
 use super::{Profile, default};
 
-/// The directory we own inside `$XDG_CONFIG_HOME` (or `~/.config`).
+/// The directory we own inside `$XDG_CONFIG_HOME` (or `~/.config`, or
+/// `%APPDATA%`).
 const CONFIG_DIR: &str = "voice-orders";
 
 /// The file itself.
@@ -36,6 +38,29 @@ const CONFIG_FILE: &str = "config.yaml";
 /// Where models are looked for when `models.path` does not say otherwise, and
 /// what the documentation tells people to unpack a model into.
 const DEFAULT_MODELS_PATH: &str = "~/.local/share/vosk";
+
+/// The Windows equivalent, under `%LOCALAPPDATA%`: models are large,
+/// machine-specific and emphatically not something to sync onto a roaming
+/// profile, which is the whole distinction between the two directories.
+const WINDOWS_MODELS_DIR: &str = "models";
+
+/// Where the environment says a user's per-machine data lives, when the
+/// variable we would read is missing.
+const WINDOWS_LOCAL_APP_DATA_FALLBACK: &str = "~/AppData/Local";
+
+/// How the environment is read.
+///
+/// A parameter rather than a direct `std::env::var_os` call for the reason the
+/// rest of this module takes its paths as parameters: it is what lets *both*
+/// platforms' path derivations be asserted, on either platform, without a test
+/// mutating the environment this whole process shares (which edition 2024
+/// makes `unsafe`, and which is racy besides).
+type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+/// The real environment.
+fn environment() -> impl Fn(&str) -> Option<OsString> {
+    |name: &str| std::env::var_os(name)
+}
 
 /// The files the system configuration is read from.
 ///
@@ -57,16 +82,62 @@ impl Default for Paths {
     }
 }
 
-/// Where the machine-level config file lives: `$XDG_CONFIG_HOME/voice-orders/
-/// config.yaml` when that variable is set, and `~/.config/voice-orders/
-/// config.yaml` otherwise.
+/// Where the machine-level config file lives.
+///
+/// On Linux: `$XDG_CONFIG_HOME/voice-orders/config.yaml` when that variable is
+/// set, and `~/.config/voice-orders/config.yaml` otherwise. On Windows:
+/// `%APPDATA%\voice-orders\config.yaml`, which is where a Windows user expects
+/// a program's settings to be and is what roams with a domain profile.
 pub fn config_path() -> PathBuf {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => PathBuf::from(shellexpand::tilde("~/.config").into_owned()),
-    };
+    config_path_for(cfg!(windows), &environment())
+}
+
+/// [`config_path`] for a named platform, with the environment injected.
+///
+/// `windows` selects the layout rather than `#[cfg]` doing it, so that both
+/// answers are compiled — and tested — on both platforms. The Windows arm falls
+/// back to the Linux one when `%APPDATA%` is not set: a machine that odd has
+/// already broken every other program's assumptions, and a home-relative path
+/// is a better answer than a panic.
+fn config_path_for(windows: bool, env: Env<'_>) -> PathBuf {
+    let base = windows
+        .then(|| env("APPDATA"))
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| match env("XDG_CONFIG_HOME") {
+            Some(value) if !value.is_empty() => PathBuf::from(value),
+            _ => PathBuf::from(shellexpand::tilde("~/.config").into_owned()),
+        });
 
     base.join(CONFIG_DIR).join(CONFIG_FILE)
+}
+
+/// The directory a bare model *name* is resolved against when nothing has said
+/// otherwise.
+///
+/// `~/.local/share/vosk` on Linux — the path the documentation, `voice-orders
+/// new` and every example profile use — and
+/// `%LOCALAPPDATA%\voice-orders\models` on Windows.
+fn default_models_path() -> PathBuf {
+    default_models_path_for(cfg!(windows), &environment())
+}
+
+/// [`default_models_path`] for a named platform, with the environment injected;
+/// see [`config_path_for`] for why the platform is a parameter.
+fn default_models_path_for(windows: bool, env: Env<'_>) -> PathBuf {
+    if !windows {
+        return PathBuf::from(shellexpand::tilde(DEFAULT_MODELS_PATH).into_owned());
+    }
+
+    let base = env("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || PathBuf::from(shellexpand::tilde(WINDOWS_LOCAL_APP_DATA_FALLBACK).into_owned()),
+            PathBuf::from,
+        );
+
+    base.join(CONFIG_DIR).join(WINDOWS_MODELS_DIR)
 }
 
 /// The machine-level configuration: the defaults a profile inherits when it
@@ -175,10 +246,7 @@ impl SystemConfig {
 
     /// The directory a bare model *name* is resolved against.
     pub fn models_path(&self) -> PathBuf {
-        self.models
-            .path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(shellexpand::tilde(DEFAULT_MODELS_PATH).into_owned()))
+        self.models.path.clone().unwrap_or_else(default_models_path)
     }
 }
 
@@ -384,8 +452,13 @@ mod tests {
     fn test_the_default_models_path_is_the_documented_one() {
         let config = SystemConfig::default();
 
+        let documented = if cfg!(windows) {
+            "voice-orders/models"
+        } else {
+            ".local/share/vosk"
+        };
         assert!(
-            config.models_path().ends_with(".local/share/vosk"),
+            config.models_path().ends_with(documented),
             "unexpected default: {}",
             config.models_path().display()
         );
@@ -567,8 +640,13 @@ mod tests {
             &SystemConfig::default(),
         );
 
+        let documented = if cfg!(windows) {
+            "voice-orders/models/vosk-model-small-en-us-0.15"
+        } else {
+            ".local/share/vosk/vosk-model-small-en-us-0.15"
+        };
         assert!(
-            resolved.ends_with(".local/share/vosk/vosk-model-small-en-us-0.15"),
+            resolved.ends_with(documented),
             "unexpected resolution: {}",
             resolved.display()
         );
@@ -580,7 +658,14 @@ mod tests {
         // mutating it is `unsafe` in edition 2024 (and racy besides).
         let path = config_path();
 
-        assert!(path.ends_with("voice-orders/config.yaml"), "{path:?}");
+        assert!(
+            path.ends_with(PathBuf::from(CONFIG_DIR).join(CONFIG_FILE)),
+            "{path:?}"
+        );
+
+        if cfg!(windows) {
+            return;
+        }
 
         match std::env::var_os("XDG_CONFIG_HOME") {
             Some(base) if !base.is_empty() => {
@@ -588,5 +673,139 @@ mod tests {
             }
             _ => assert!(path.to_string_lossy().contains("/.config/"), "{path:?}"),
         }
+    }
+
+    // --- Where each platform keeps its files -------------------------------
+    //
+    // Both derivations are compiled on both platforms and take the environment
+    // as a parameter, so the Windows answers below are asserted by the Linux
+    // suite too — which is the only place anybody runs the tests today.
+
+    /// An environment made of the pairs it is given, and nothing else.
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn test_the_windows_config_path_is_under_appdata() {
+        assert_eq!(
+            config_path_for(
+                true,
+                &env(&[(r"APPDATA", r"C:\Users\alice\AppData\Roaming")])
+            ),
+            PathBuf::from(r"C:\Users\alice\AppData\Roaming")
+                .join("voice-orders")
+                .join("config.yaml")
+        );
+    }
+
+    #[test]
+    fn test_the_windows_config_path_ignores_xdg() {
+        // A Windows machine which happens to have XDG_CONFIG_HOME set (a WSL
+        // shell, a ported tool) must not move our config out from under it.
+        let environment = env(&[
+            ("APPDATA", r"C:\Users\alice\AppData\Roaming"),
+            ("XDG_CONFIG_HOME", "/home/alice/.config"),
+        ]);
+
+        assert!(
+            config_path_for(true, &environment).starts_with(r"C:\Users\alice\AppData\Roaming"),
+            "%APPDATA% wins on Windows"
+        );
+    }
+
+    #[test]
+    fn test_a_windows_machine_without_appdata_falls_back_to_the_linux_layout() {
+        // Nothing sane gets here; the point is that it stays a path rather
+        // than becoming a panic.
+        let path = config_path_for(true, &env(&[]));
+
+        assert!(
+            path.ends_with(PathBuf::from(CONFIG_DIR).join(CONFIG_FILE)),
+            "{path:?}"
+        );
+        assert!(
+            path.to_string_lossy().contains(".config"),
+            "unexpected fallback: {}",
+            path.display()
+        );
+    }
+
+    #[rstest]
+    // An empty variable is not a value; both platforms treat it as unset.
+    #[case(&[("XDG_CONFIG_HOME", "")])]
+    #[case(&[])]
+    fn test_the_linux_config_path_falls_back_to_dot_config(#[case] pairs: &[(&str, &str)]) {
+        let path = config_path_for(false, &env(pairs));
+
+        // Compare components, not the rendered string: on Windows this same
+        // derivation joins with backslashes, and mixing separators is fine as
+        // long as the shape is right.
+        assert!(
+            path.ends_with(".config/voice-orders/config.yaml"),
+            "unexpected: {}",
+            path.display()
+        );
+        assert!(
+            path.ends_with(PathBuf::from(CONFIG_DIR).join(CONFIG_FILE)),
+            "{path:?}"
+        );
+    }
+
+    #[test]
+    fn test_the_linux_config_path_prefers_xdg() {
+        assert_eq!(
+            config_path_for(false, &env(&[("XDG_CONFIG_HOME", "/srv/config")])),
+            PathBuf::from("/srv/config/voice-orders/config.yaml")
+        );
+    }
+
+    #[test]
+    fn test_the_windows_models_path_is_under_local_appdata() {
+        // Local rather than roaming: a 128MB model has no business following
+        // somebody onto another machine.
+        assert_eq!(
+            default_models_path_for(
+                true,
+                &env(&[("LOCALAPPDATA", r"C:\Users\alice\AppData\Local")])
+            ),
+            PathBuf::from(r"C:\Users\alice\AppData\Local")
+                .join("voice-orders")
+                .join("models")
+        );
+    }
+
+    #[test]
+    fn test_a_windows_machine_without_local_appdata_still_names_a_directory() {
+        let path = default_models_path_for(true, &env(&[]));
+
+        assert!(
+            path.ends_with(PathBuf::from("voice-orders").join("models")),
+            "unexpected fallback: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn test_the_linux_models_path_is_the_documented_one() {
+        // The path in the docs, in `voice-orders new`'s scaffold and in every
+        // example profile. It must not move.
+        let path = default_models_path_for(false, &env(&[("LOCALAPPDATA", r"C:\nope")]));
+
+        assert!(
+            path.ends_with(".local/share/vosk"),
+            "unexpected: {}",
+            path.display()
+        );
     }
 }

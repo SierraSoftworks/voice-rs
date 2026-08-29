@@ -348,7 +348,16 @@ fn clock_time(at: SystemTime) -> String {
     // A clock we cannot localize (a timestamp beyond the C library's range, or
     // a platform we have no localization for yet): fall back to UTC arithmetic
     // rather than lose the timestamp.
-    let day = seconds % 86_400;
+    time_of_day(seconds as i64)
+}
+
+/// The `HH:MM:SS` of a Unix timestamp, with no timezone applied.
+///
+/// Pure, and shared by both platforms: [`clock_time`]'s UTC fallback is this
+/// with no offset, and the Windows clock below is this with one.
+fn time_of_day(seconds: i64) -> String {
+    let day = seconds.rem_euclid(86_400);
+
     format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
 }
 
@@ -377,11 +386,82 @@ fn local_clock(seconds: u64) -> Option<String> {
     ))
 }
 
-/// Windows has no `localtime_r`; localizing the session log's timestamps is
-/// W5's job, and until then [`clock_time`]'s UTC fallback carries them.
-#[cfg(not(target_os = "linux"))]
+/// The local `HH:MM:SS` for a Unix timestamp on Windows.
+///
+/// Windows has no `localtime_r`, and — more to the point — `GetLocalTime`
+/// answers a question we are not asking: it breaks down *now*, whereas a log
+/// line has to render the moment its entry was recorded, over and over, as the
+/// screen redraws. Using it directly would stamp every line in the scrollback
+/// with the current time.
+///
+/// So the timezone is what we take from Windows, not the time: `GetLocalTime`
+/// and `GetSystemTime` are read back to back and the difference between them is
+/// this machine's current offset from UTC, daylight saving included, which is
+/// then applied to the timestamp we were given. The two readings can straddle a
+/// second boundary, and it does not matter — [`zone_offset`] rounds to the
+/// minute, which is the finest granularity any real timezone has.
+#[cfg(windows)]
+fn local_clock(seconds: u64) -> Option<String> {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+
+    /// The seconds-since-midnight a `SYSTEMTIME` reads.
+    fn seconds_of_day(at: &SYSTEMTIME) -> i64 {
+        i64::from(at.wHour) * 3600 + i64::from(at.wMinute) * 60 + i64::from(at.wSecond)
+    }
+
+    let (mut local, mut utc) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+
+    // SAFETY: both calls only write a `SYSTEMTIME` into the storage we own and
+    // point them at; neither can fail and neither keeps the pointer.
+    unsafe {
+        GetLocalTime(&raw mut local);
+        GetSystemTime(&raw mut utc);
+    }
+
+    let offset = zone_offset(seconds_of_day(&local), seconds_of_day(&utc));
+
+    Some(time_of_day(seconds as i64 + offset))
+}
+
+/// Platforms we have no localization story for yet render timestamps in UTC:
+/// [`clock_time`] falls back to plain UTC arithmetic when this returns `None`.
+#[cfg(not(any(target_os = "linux", windows)))]
 fn local_clock(_seconds: u64) -> Option<String> {
     None
+}
+
+/// This machine's offset from UTC, in seconds, given the two wall clocks read
+/// at (as near as makes no difference) the same moment.
+///
+/// Both readings are seconds-since-midnight, so a clock which has already
+/// rolled over into another date shows up as a difference of nearly a whole
+/// day. That is folded back to the shortest way round, `-12:00 ..= +12:00`,
+/// which means the far-eastern zones are reported as their western
+/// equivalent — `+13:00` comes back as `-11:00`. It makes no difference to the
+/// only thing this feeds: a time of day is taken modulo a day, so an offset
+/// which is wrong by exactly 24 hours renders exactly the same clock.
+///
+/// Rounded to the minute because a stray second between the two readings must
+/// not turn `+02:00` into `+01:59:59`.
+///
+/// Compiled on Linux under `cfg(test)` so that the arithmetic the Windows clock
+/// depends on is tested on the platform this project is developed on.
+#[cfg(any(windows, test))]
+fn zone_offset(local: i64, utc: i64) -> i64 {
+    /// Half a day, the point at which the other way round is shorter. `-12:00`
+    /// itself is a real timezone, so only the eastern end is exclusive.
+    const HALF_DAY: i64 = 12 * 3600;
+
+    let difference = match local - utc {
+        raw if raw > HALF_DAY => raw - 86_400,
+        raw if raw < -HALF_DAY => raw + 86_400,
+        raw => raw,
+    };
+
+    // To the nearest minute: a second may have ticked over between the two
+    // readings, and no timezone is offset by one.
+    (difference + 30 * difference.signum()) / 60 * 60
 }
 
 #[cfg(test)]
@@ -500,6 +580,74 @@ mod tests {
         }
         .line(at());
         assert_eq!(line.spans[4].style.fg, None);
+    }
+
+    #[rstest]
+    #[case(0, "00:00:00")]
+    #[case(1, "00:00:01")]
+    #[case(1_700_000_000, "22:13:20")]
+    // A day boundary in either direction: the clock wraps, it never goes
+    // negative and it never overflows past 23:59:59.
+    #[case(86_399, "23:59:59")]
+    #[case(86_400, "00:00:00")]
+    #[case(-1, "23:59:59")]
+    fn test_the_time_of_day_is_a_wrapped_wall_clock(#[case] seconds: i64, #[case] expected: &str) {
+        assert_eq!(time_of_day(seconds), expected);
+    }
+
+    #[rstest]
+    // Both clocks in the same day: the plain difference, west and east.
+    #[case(12 * 3600, 12 * 3600, 0)]
+    #[case(14 * 3600, 12 * 3600, 2 * 3600)]
+    #[case(12 * 3600 + 1800, 12 * 3600, 1800)]
+    #[case(7 * 3600, 12 * 3600, -5 * 3600)]
+    // Local has already rolled into tomorrow (UTC+13, at 23:30 UTC)...
+    #[case(30 * 60, 23 * 3600 + 30 * 60, 60 * 60)]
+    // ...and local is still in yesterday (UTC-5, at 00:30 UTC).
+    #[case(19 * 3600 + 30 * 60, 30 * 60, -5 * 3600)]
+    // A second ticked over between the two readings: an offset is a whole
+    // number of minutes, so the odd second is rounded away rather than
+    // reported as 01:59:59.
+    #[case(14 * 3600 - 1, 12 * 3600, 2 * 3600)]
+    #[case(7 * 3600 + 1, 12 * 3600, -5 * 3600)]
+    // UTC-12, the westernmost zone there is, is not folded away.
+    #[case(0, 12 * 3600, -12 * 3600)]
+    fn test_the_zone_offset_is_the_difference_between_the_two_clocks(
+        #[case] local: i64,
+        #[case] utc: i64,
+        #[case] expected: i64,
+    ) {
+        assert_eq!(zone_offset(local, utc), expected);
+    }
+
+    #[test]
+    fn test_a_far_eastern_zone_is_reported_the_short_way_round() {
+        // Kiritimati is UTC+14: at 12:00 UTC its clocks read 02:00 tomorrow.
+        // The offset comes back as -10:00, the shortest way round — and it has
+        // to render the same time of day, which is the only thing it feeds.
+        let offset = zone_offset(2 * 3600, 12 * 3600);
+
+        assert_eq!(offset, -10 * 3600);
+        assert_eq!(
+            time_of_day(1_700_000_000 + offset),
+            time_of_day(1_700_000_000 + 14 * 3600),
+            "an offset a whole day out renders the same clock"
+        );
+    }
+
+    #[test]
+    fn test_a_localized_stamp_is_the_offset_applied_to_the_timestamp() {
+        // What the Windows clock does, with the syscalls' answers supplied:
+        // 22:13:20 UTC is a quarter past midnight in a UTC+02:00 zone.
+        let seconds = 1_700_000_000_i64;
+
+        assert_eq!(time_of_day(seconds), "22:13:20");
+        assert_eq!(time_of_day(seconds + zone_offset(2 * 3600, 0)), "00:13:20");
+        assert_eq!(
+            time_of_day(seconds + zone_offset(19 * 3600, 0)),
+            "17:13:20",
+            "UTC-05:00, expressed as a clock which is still on yesterday"
+        );
     }
 
     #[test]

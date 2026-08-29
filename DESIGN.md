@@ -1259,7 +1259,46 @@ required — a library missing those is not libvosk.
 `libc::kill(SIGINT/SIGTERM)` forwarding has no direct equivalent. `GenerateConsoleCtrlEvent` reaches
 a process *group* rather than a process, which means the child has to have been started in one; a
 job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is the reliable containment primitive and is
-what the wrapper contract (voice-orders exits, the game goes with it) will be built on.
+what the wrapper contract (voice-orders exits, the game goes with it) is built on.
+
+The child is therefore spawned with `CREATE_NEW_PROCESS_GROUP` and immediately assigned to a job
+object which is set to kill on close. Stopping it is one shared choreography (`ChildStopPlan`) with a
+per-platform tail: **ask, wait, and — only on Windows — kill**. The ask is
+`GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child_pid)`, and it is honestly best-effort:
+`CTRL_C_EVENT` is never sent, because for any non-zero group id it *succeeds and delivers nothing*,
+and even `CTRL_BREAK_EVENT` only reaches a console child — a game has no console control handler and
+receives neither. After the same `SIGTERM_GRACE` the Linux path uses, `TerminateJobObject` ends the
+whole tree.
+
+The new process group has one cost worth stating: a real Ctrl-C at a Windows console no longer
+reaches the child, because a process created with `CREATE_NEW_PROCESS_GROUP` starts with Ctrl-C
+handling disabled. `interrupts()` still reports `Shutdown::Quiet` there — the supervisor stays
+shared, platform-neutral code — so that path ends the same way every other one does: our handles
+close as we exit and the job takes the application with us.
+
+**So, plainly: on Windows, stopping voice-orders terminates the wrapped application rather than
+signalling it.** There is no polite alternative to offer a windowed process, and the alternative to
+the kill is an orphaned game with no wrapper left to stop it. The kill-on-close limit is what makes
+this survive the cases we are not present for — Steam's "Stop" button is an arbitrary kill of *us*,
+and `CTRL_CLOSE_EVENT` gives us about five seconds before Windows kills us mid-shutdown; in both, our
+handles close as we die and the kernel reaps the job. The handle therefore lives in a process-lifetime
+`static` rather than being threaded through `supervise`, which stays shared, platform-neutral code;
+the decision logic is a pure function over `(Signal, Containment)` and both platforms' plans are
+asserted by unit tests on either platform. The Linux plan has no kill step and its behaviour, its
+warning text and its timing are unchanged.
+
+**Paths, the clock and the integrity level.** The config file is `%APPDATA%\voice-orders\config.yaml`
+and the models directory `%LOCALAPPDATA%\voice-orders\models` — roaming for a few hundred bytes of
+settings, local for a 128MB model. Both derivations take the environment as a parameter and the
+platform as a *value* (`cfg!(windows)`, not `#[cfg]`), so each platform's answer is compiled and unit
+tested on the other, and neither test has to mutate the environment this process shares. The session
+log's clock is the same idea: `GetLocalTime` alone would be wrong, because it breaks down *now* while
+a log line has to render the moment its entry was recorded — so what Windows is asked for is the
+*zone* (`GetLocalTime` minus `GetSystemTime`, rounded to the minute, daylight saving included), which
+is then applied to each entry's own timestamp by the same pure formatter the UTC fallback uses. And
+`doctor`'s hook check ends with this process' integrity level (`TokenElevation`), because UIPI is
+symmetric: an ordinary process can neither type into an elevated window nor see the keys pressed at
+one. It is reported, never failed on — running unelevated is the right way to run voice-orders.
 
 **Audio: cpal's WASAPI host, and `!Send`.** cpal works unchanged, but a WASAPI `Stream` is `!Send`
 (COM apartment state is per-thread) where the ALSA one is `Send + Sync`. The pipeline future which
@@ -1274,16 +1313,18 @@ Windows it would be asserting something false.
 | W1 | Portability refactor | The only phase which touches Linux code. `keys.rs` gains a Windows column and literal key codes (with a Linux test pinning them against `evdev`); `libvosk.rs` migrates to `libloading` with the two optional endpointer symbols; every Linux-only module is `cfg`-gated behind a platform-neutral seam (`output::PlatformSink`, `hotkey::watch`, `doctor`'s platform checks, `run`'s signal handling); Windows CI job. | **done** |
 | W2 | Keyboard output | `output/sendinput.rs`: a real `SendInput` `KeySink` replacing the stub, driven by `keys::to_windows`. Every injected event carries an `INJECTED_MARKER` in `dwExtraInfo` so W3's hook can ignore our own typing; `wVk` is left at zero for scancode events (see below). `doctor` check 2 presses `f24` through the real sink. | **done** |
 | W3 | Hotkey | `hotkey/win.rs`: the `WH_KEYBOARD_LL` hook thread, feeding the same `transition`/`ListenMode` logic the Linux task uses. `hotkey.device` warns and proceeds; `doctor` check 3 installs and removes a real hook. | **done** |
-| W4 | Child processes | Job-object containment and a graceful stop for the wrapped application, replacing the `send_signal` no-op. | stub |
-| W5 | Polish | Local time in the session log (the UTC fallback stands in today), Windows paths and docs. | stub |
-| W6 | Release | Windows build matrix, the `voice-orders-windows-amd64.exe` asset, libvosk DLL packaging. | not started |
+| W4 | Child processes | Job-object containment and a graceful stop for the wrapped application, replacing the `send_signal` no-op. `CREATE_NEW_PROCESS_GROUP` at spawn, `CTRL_BREAK_EVENT` as the ask, `TerminateJobObject` as the guarantee, and a pure `ChildStopPlan` so both platforms' choreography is tested from either. | **done** |
+| W5 | Polish | Local time in the session log (`GetLocalTime`/`GetSystemTime` for the zone, applied to each entry's own timestamp), `%APPDATA%`/`%LOCALAPPDATA%` paths, the integrity level on `doctor`'s hook check, and docs. | **done** |
+| W6 | Release | Windows build matrix row, the `voice-orders-windows-amd64.exe` asset (pinned to `naming::go` by a test) and the `.zip` which carries it beside the four libvosk DLLs, plus a `windows-latest` test job. | **done** |
 | W7 | Verification | End-to-end on real Windows hardware, in a real game. | not started |
 
-Every stub reports the same shape of failure: an ordinary `human_errors` **user** error saying the
-feature "is not implemented in this Windows build yet", raised at the point the Linux code would
-have reported a missing device. Nothing panics, nothing silently does nothing, and
-`voice-orders doctor` reports each unfinished piece as its own `✗` line — a `doctor` which claimed a
-clean bill of health on a build that cannot press keys would be worse than no `doctor` at all.
+While the phases were landing, every stub reported the same shape of failure: an ordinary
+`human_errors` **user** error saying the feature "is not implemented in this Windows build yet",
+raised at the point the Linux code would have reported a missing device, and `voice-orders doctor`
+reported each unfinished piece as its own `✗` line — a `doctor` which claimed a clean bill of health
+on a build that cannot press keys would be worse than no `doctor` at all. No stubs remain: what W7
+has left to establish is not whether the pieces are implemented but whether they behave, on real
+hardware, in a real game. Until they have been, the documentation calls the Windows build a beta.
 
 ### Rejected compromises
 

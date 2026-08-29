@@ -33,9 +33,11 @@ uinput-tokio = "0.1.36"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",                    # GetTokenInformation (integrity-level doctor report)
     "Win32_System_Console",              # GenerateConsoleCtrlEvent
     "Win32_System_JobObjects",           # CreateJobObjectW, KILL_ON_JOB_CLOSE
-    "Win32_System_Threading",            # GetCurrentThreadId
+    "Win32_System_SystemInformation",    # GetLocalTime (TUI clock)
+    "Win32_System_Threading",            # GetCurrentThreadId, OpenProcessToken
     "Win32_UI_Input_KeyboardAndMouse",   # SendInput, KEYBDINPUT, KEYEVENTF_*, VK_*
     "Win32_UI_WindowsAndMessaging",      # SetWindowsHookExW, GetMessageW, KBDLLHOOKSTRUCT
 ] }

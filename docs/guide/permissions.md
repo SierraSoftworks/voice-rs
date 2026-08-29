@@ -13,6 +13,26 @@ for when you would rather do it yourself or need to understand what changed.
 
 The last section of this page is an honest account of what reading `/dev/input` does and does not mean.
 
+## On Windows
+
+**There is nothing on this page to do.** Keystrokes go out through `SendInput` and the listen hotkey comes from a
+low-level keyboard hook, both of which any ordinary program may use: no driver, no kernel module, no group, and no
+elevation. `voice-orders doctor` still runs — it installs a hook and presses a key for real, rather than inferring that
+it could — and its first three checks say so.
+
+Three things are worth knowing:
+
+- **Do not run it as administrator by default.** Windows only lets a program send keystrokes to windows at the same
+  integrity level or lower, and only shows a hook the keys pressed at them. The single case where elevating helps is a
+  game which itself runs as administrator: then voice-orders must be elevated too, or it can neither see your hotkey
+  over the game nor type into it. `doctor` reports which level you are running at.
+- **The hook is system-wide,** exactly as the evdev read is on Linux, and for the same reason — it has to work inside a
+  fullscreen game. It *observes* your hotkey and passes every key on to whatever you are typing into; the privacy note
+  at the end of this page applies word for word.
+- **[`hotkey.device`](../profiles/README.md#hotkey-device) has no meaning here.** Windows' keyboard hook cannot say
+  which keyboard a key came from, so the option is ignored with a warning and the hotkey is watched for on all of them.
+  `voice-orders devices` says the same when you ask it.
+
 ## The quick way
 
 ```sh

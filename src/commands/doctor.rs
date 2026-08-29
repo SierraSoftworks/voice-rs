@@ -367,15 +367,87 @@ async fn check_send_input() -> CheckResult {
 /// Like check 2, this is the real mechanism rather than an inference about it.
 /// The report says plainly that the hook is system-wide and that it observes
 /// rather than consumes, because both are things people reasonably worry about
-/// before letting a program watch their keyboard.
+/// before letting a program watch their keyboard — and it ends with this
+/// process' integrity level, which decides which windows the hook can see keys
+/// for at all.
 #[cfg(not(target_os = "linux"))]
 fn check_keyboard_hook() -> CheckResult {
     match crate::hotkey::probe_hook() {
-        Ok(()) => CheckResult::ok(
-            "The listen hotkey can be watched for: a low-level keyboard hook installs, which sees your hotkey system-wide (including inside fullscreen games) and passes every key on to whatever you are running.",
-        ),
+        Ok(()) => CheckResult::ok(format!(
+            "The listen hotkey can be watched for: a low-level keyboard hook installs, which sees your hotkey system-wide (including inside fullscreen games) and passes every key on to whatever you are running. {}",
+            integrity_note(elevated())
+        )),
         Err(e) => CheckResult::from_error(&e),
     }
+}
+
+/// What the report says about this process' integrity level.
+///
+/// Informational rather than a verdict, which is why the check passes either
+/// way: running unelevated is the *right* way to run voice-orders, and the
+/// caveat only bites for the minority of people whose game runs as
+/// administrator. UIPI is symmetric — an ordinary process can neither type into
+/// an elevated window (which check 2's advice covers) nor see keys pressed at
+/// one — so the hotkey stops working over exactly the windows keystrokes stop
+/// arriving at.
+#[cfg(not(target_os = "linux"))]
+fn integrity_note(elevated: Option<bool>) -> &'static str {
+    match elevated {
+        Some(true) => {
+            "voice-orders is running elevated, so the hook sees keys pressed at every window."
+        }
+        Some(false) => {
+            "voice-orders is running at the ordinary integrity level, which is how it should be run — but Windows will not show it keystrokes made to a window running as administrator, so if your game is elevated, start voice-orders as administrator too."
+        }
+        None => {
+            "We could not tell whether voice-orders is running elevated; if your game runs as administrator and the hotkey does nothing, start voice-orders as administrator too."
+        }
+    }
+}
+
+/// Whether this process is running elevated, or [`None`] if Windows would not
+/// tell us.
+///
+/// `TokenElevation` rather than a group check: it is the same question the
+/// shield icon asks, it is a single `u32`, and it is true for the built-in
+/// Administrator account (which has no split token) as well as for an elevated
+/// ordinary one.
+#[cfg(windows)]
+fn elevated() -> Option<bool> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+
+    // SAFETY: the pseudo-handle `GetCurrentProcess` returns needs no closing,
+    // and the token handle is written into storage we own (and closed below).
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return None;
+    }
+
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+
+    // SAFETY: `TokenElevation` answers with a `TOKEN_ELEVATION`, which is what
+    // we point it at and whose size is what we declare.
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &raw mut returned,
+        )
+    };
+
+    // SAFETY: the handle came from `OpenProcessToken`, is closed exactly once,
+    // and is not used afterwards.
+    unsafe { CloseHandle(token) };
+
+    (queried != 0).then_some(elevation.TokenIsElevated != 0)
 }
 
 // ── Check 1: the device node ────────────────────────────────────────────────
@@ -805,9 +877,8 @@ fn resolve_hotkey_device(device: &str, _key: KeyCode) -> Result<String, crate::E
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Every table-driven test here is one of the `/etc/group` ones, which only
-    // Linux has.
-    #[cfg(target_os = "linux")]
+    // The table-driven tests are the `/etc/group` ones (Linux) and the
+    // integrity-level one (Windows); each platform has some.
     use rstest::rstest;
 
     /// An `/etc/group` with the shape a real one has: other groups around the
@@ -1108,7 +1179,13 @@ mod tests {
         let summary = system_summary(&SystemConfig::default());
 
         assert!(summary.contains("none at"), "{summary}");
-        assert!(summary.contains("voice-orders/config.yaml"), "{summary}");
+        // The default path renders with the platform's separators.
+        assert!(
+            summary
+                .replace('\\', "/")
+                .contains("voice-orders/config.yaml"),
+            "{summary}"
+        );
         assert!(summary.contains("defaults apply"), "{summary}");
     }
 
@@ -1361,6 +1438,44 @@ mod tests {
         assert!(
             result.ok,
             "the model on this machine should be grammar-capable: {}",
+            result.headline
+        );
+    }
+
+    // --- Check 3 (Windows): the integrity level -----------------------------
+
+    #[cfg(not(target_os = "linux"))]
+    #[rstest]
+    // Elevated: nothing to warn about, so nothing is warned about.
+    #[case(Some(true), false)]
+    // The ordinary (and correct) case, which is also the one with the caveat.
+    #[case(Some(false), true)]
+    // Windows would not say; the caveat stands, because it might apply.
+    #[case(None, true)]
+    fn the_integrity_note_warns_only_when_elevated_windows_could_be_a_problem(
+        #[case] elevated: Option<bool>,
+        #[case] warns: bool,
+    ) {
+        let note = integrity_note(elevated);
+
+        assert_eq!(
+            note.contains("as administrator"),
+            warns,
+            "unexpected note: {note}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn the_integrity_level_never_fails_check_three() {
+        // The report is informational: a hook which installed is a hook which
+        // works, whatever this process' integrity level turns out to be.
+        let result = check_keyboard_hook();
+
+        assert!(result.ok, "unexpected failure: {}", result.headline);
+        assert!(
+            result.headline.ends_with(integrity_note(elevated())),
+            "the integrity level belongs on the headline: {}",
             result.headline
         );
     }
