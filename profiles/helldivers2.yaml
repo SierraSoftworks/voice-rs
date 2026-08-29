@@ -21,7 +21,7 @@ hotkey:
   key: leftctrl
   mode: push-to-talk
 
-completion_timeout: 200ms
+completion_timeout: 350ms
 
 defaults:
   duration: 30ms
