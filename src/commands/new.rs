@@ -75,10 +75,22 @@ model: ~/.local/share/vosk/vosk-model-small-en-us-0.15
 #   # released) and anything queued behind it is thrown away.
 #   interrupt: false
 
-# How long an ambiguous phrase waits in case you carry on with a longer one:
-# with both "reload" and "reload weapon" in the profile, saying "reload" waits
-# this long before firing, in case "weapon" is still coming.
-# completion_timeout: 500ms
+# The latency levers: how quickly what you say turns into key presses, and how
+# much certainty that costs.
+# recognition:
+#   # How much trailing silence ends an utterance.
+#   silence: 200ms
+#   # Whether commands may fire from a partial hypothesis, before the
+#   # recognizer has finalized what you said.
+#   eager: true
+#   # How long a partial has to stay unchanged before we act on it. A
+#   # hypothesis the recognizer rewrites inside this window is re-read rather
+#   # than pressed.
+#   debounce: 100ms
+#   # How long an ambiguous phrase waits in case you carry on with a longer
+#   # one: with both "reload" and "reload weapon" in the profile, saying
+#   # "reload" waits this long before firing, in case "weapon" is still coming.
+#   completion_timeout: 750ms
 
 # The pacing applied to every command's key presses.
 # defaults:
@@ -204,7 +216,10 @@ mod tests {
         );
         assert_eq!(profile.audio.device, None);
         assert_eq!(profile.hotkey, None);
-        assert_eq!(profile.completion_timeout, Duration::from_millis(500));
+        assert_eq!(
+            profile.recognition.completion_timeout,
+            Duration::from_millis(750)
+        );
 
         // The worked grammar demonstrates published rules, a private rule and
         // a capture — and all of it is proven to compile, lint-free.
@@ -241,6 +256,10 @@ mod tests {
             "key:",
             "mode:",
             "interrupt:",
+            "recognition:",
+            "silence:",
+            "eager:",
+            "debounce:",
             "completion_timeout:",
             "defaults:",
             "duration:",

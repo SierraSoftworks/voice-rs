@@ -127,6 +127,19 @@ struct EagerContext<'a> {
     /// ("Autocannon" from the timer, then "AutocannonSentry" from the
     /// continuation) structurally impossible rather than merely unreached.
     committed: usize,
+    /// Matches the greedy pass has resynced past on the current hypothesis
+    /// which have not fired yet: they are certain *within this revision*, but
+    /// a revision which withdraws them must be able to take them back, so
+    /// they wait out the settling window like everything else.
+    due: Vec<Match>,
+    /// When the current revision of this utterance's hypothesis has settled:
+    /// `debounce` after the partial which produced it. Every revision pushes
+    /// it out, and nothing eager fires before it.
+    settled_at: Instant,
+    /// How to re-check the deadline fire which committed this utterance,
+    /// once the recognizer says what the utterance actually was. `None`
+    /// until a deadline fire commits something.
+    committed_fire: Option<Committed<'a>>,
     /// The accept the latest partial's walk rests on, with its armed
     /// deadline. `None` when the walk rests mid-phrase or at the root.
     resting: Option<EagerResting>,
@@ -135,6 +148,26 @@ struct EagerContext<'a> {
     /// the same growing hypothesis, so without this the same overflow would
     /// reach the user once per revision instead of once per utterance.
     warned: Vec<String>,
+}
+
+/// Everything needed to ask a finalized utterance whether it still supports
+/// the deadline fire which committed it: the fire itself, and where its own
+/// pass over the words began.
+///
+/// A deadline fire is the one thing in the engine which presses keys before
+/// the recognizer has committed to the words it read them out of, so it is
+/// the one thing which can turn out to have been wrong.
+#[derive(Debug)]
+struct Committed<'a> {
+    /// The word index the fire's pass started at.
+    from: usize,
+    /// The walk it started from — a fresh root, or the resting walk of a
+    /// command pending from the previous utterance.
+    origin: Walk<'a>,
+    /// The pending accept that walk carried in, if any.
+    passed: Option<Accept>,
+    /// What fired.
+    fire: Match,
 }
 
 /// An accept a partial hypothesis is resting on, waiting out a deadline.
@@ -149,10 +182,29 @@ struct EagerResting {
     position: usize,
     /// Whether the resting walk is ambiguous. Ambiguous rests wait out the
     /// completion timeout (armed when the walk *first* rests here);
-    /// unambiguous rests wait out `eager_delay` (re-armed on every changed
-    /// partial).
+    /// unambiguous rests wait out nothing beyond the settling window itself.
     ambiguous: bool,
+    /// The earliest this accept may fire: never before the hypothesis has
+    /// settled, and — when ambiguous — never before the completion timeout
+    /// the first rest here armed.
     deadline: Instant,
+}
+
+impl EagerContext<'_> {
+    /// The next instant at which this context owes a fire: the settling
+    /// window when matches are queued behind it, the resting accept's own
+    /// deadline, or the earlier of the two.
+    ///
+    /// A resting deadline is never earlier than `settled_at`, so waking at
+    /// the settling window can only ever mean the queued matches.
+    fn deadline(&self) -> Option<Instant> {
+        let due = (!self.due.is_empty()).then_some(self.settled_at);
+        let resting = self.resting.as_ref().map(|rest| rest.deadline);
+        match (due, resting) {
+            (Some(due), Some(resting)) => Some(due.min(resting)),
+            (due, resting) => due.or(resting),
+        }
+    }
 }
 
 /// The engine's shared, immutable context: the automaton, the pacing applied
@@ -518,16 +570,11 @@ impl<'a> Engine<'a> {
             &mut warn,
         );
 
-        let (fired_from_partials, resting) = match context {
-            Some(ctx) => (ctx.fired, ctx.resting),
-            None => (Vec::new(), None),
+        let (fired_from_partials, resting, committed_fire) = match context {
+            Some(ctx) => (ctx.fired, ctx.resting, ctx.committed_fire),
+            None => (Vec::new(), None, None),
         };
-        // The name of the deadline fire which committed this utterance, for
-        // the overrun report below.
-        let committed_fire = fired_from_partials
-            .iter()
-            .rfind(|fire| fire.position == committed)
-            .map(|fire| fire.accept.display.clone());
+
         // Only fires past the committed boundary reconcile against the walk:
         // everything at or before it consumed words the walk above never
         // re-read, so it can neither be confirmed nor contradicted.
@@ -536,19 +583,36 @@ impl<'a> Engine<'a> {
             .filter(|fire| fire.position > committed)
             .collect();
 
-        // The speaker kept talking after a deadline fire had already spent
-        // their words, and the remainder added up to nothing: the choice
-        // cannot be un-pressed, so the trailing words were dropped — say so.
-        if committed > 0
-            && words.len() > committed
-            && matched.is_empty()
-            && matches!(end, WalkEnd::Complete)
-        {
-            let name = committed_fire.unwrap_or_else(|| "(nothing)".to_string());
-            self.warn_user(format!(
-                "eager overrun: {:?} had already fired when the utterance settled as {:?} — the keys were already pressed, and the words after it were dropped",
-                name, utterance.text
-            ));
+        // Everything at or before the committed boundary was spent by a
+        // deadline fire, so the walk above started past it and can neither
+        // confirm nor contradict it. Walking the *finalized* words from the
+        // root is what settles it — and it has to be settled, because a
+        // deadline fire is the one thing in the engine which presses keys
+        // before the recognizer has committed to the words it read them out
+        // of.
+        if let Some(committed_fire) = &committed_fire {
+            let name = &committed_fire.fire.accept.display;
+            if self.confirms(&words, committed_fire) {
+                // The speaker kept talking after the fire had already spent
+                // their words, and the remainder added up to nothing: the
+                // choice cannot be un-pressed, so the trailing words were
+                // dropped — say so.
+                if words.len() > committed && matched.is_empty() && matches!(end, WalkEnd::Complete)
+                {
+                    self.warn_user(format!(
+                        "eager overrun: {name:?} had already fired when the utterance settled as {:?} — the keys were already pressed, and the words after it were dropped",
+                        utterance.text
+                    ));
+                }
+            } else {
+                // The recognizer took back the hypothesis the keys were
+                // pressed for. Nothing can be un-pressed; all we can do is
+                // say what happened.
+                self.warn_user(format!(
+                    "eager retraction: {name:?} fired from a partial hypothesis which the recognizer then withdrew — it settled the utterance as {:?}, which does not contain that command, and the keys were already pressed",
+                    utterance.text
+                ));
+            }
         }
 
         if already.len() <= matched.len()
@@ -606,6 +670,36 @@ impl<'a> Engine<'a> {
         }
 
         true
+    }
+
+    /// Whether the finalized utterance still supports `fire` — a command an
+    /// eager deadline already pressed keys for, read out of a partial
+    /// hypothesis.
+    ///
+    /// The utterance is re-walked exactly the way the fire's own pass walked
+    /// it — same starting index, same origin, same pending seed — and the
+    /// fire has to turn up in it, at the same position and with the same
+    /// actions. A resting accept counts: it is a command the utterance
+    /// reached, whatever the engine then decides to do about the wait it
+    /// owes.
+    fn confirms(&self, words: &[String], committed: &Committed<'a>) -> bool {
+        let fire = &committed.fire;
+        // Re-resolving what was already decided must not warn at the user a
+        // second time: the walk this duplicates has already reported.
+        let mut warn = |_: String| {};
+        let (matched, end) = self.walk_final(
+            words,
+            committed.from,
+            &committed.origin,
+            committed.passed.is_none(),
+            committed.passed.as_ref(),
+            &mut warn,
+        );
+        if matched.iter().any(|found| same_match(found, fire)) {
+            return true;
+        }
+        matches!(end, WalkEnd::Pending { accept, .. }
+            if fire.position == words.len() && same_accept(&accept, &fire.accept))
     }
 
     /// The deadline for a command left pending by a `Final`:
@@ -701,19 +795,17 @@ impl<'a> Engine<'a> {
         sequence
     }
 
-    /// Handles a partial hypothesis with eager matching on. Returns whether
-    /// the command queue is still open.
-    ///
-    /// `closed` is the count of utterances closed so far (finals and mutes):
-    /// the utterance these partials belong to is `closed + 1` — its own
-    /// `Final` has not been counted yet — while a flushed pending command
-    /// (the position-0 seed) belongs to the previous one, `closed`.
+    /// Handles a partial hypothesis with eager matching on: it re-walks the
+    /// utterance, queues what the walk found, and restarts the settling
+    /// window. Nothing fires here — the window has to close first, which
+    /// [`engine_task`]'s deadline arm handles. Returns whether the command
+    /// queue is still open (nothing this can do closes it, but the caller's
+    /// contract is the same as every other handler's).
     async fn on_eager_partial(
         &self,
         state: &mut MatchState<'a>,
         eager: &mut Option<EagerContext<'a>>,
         text: &str,
-        closed: u64,
     ) -> bool {
         let words = words_of(text);
 
@@ -733,6 +825,9 @@ impl<'a> Engine<'a> {
                 passed,
                 fired: Vec::new(),
                 committed: 0,
+                due: Vec::new(),
+                settled_at: Instant::now(),
+                committed_fire: None,
                 resting: None,
                 warned: Vec::new(),
             });
@@ -783,30 +878,29 @@ impl<'a> Engine<'a> {
             ctx.warned.push(message);
         }
 
-        // Fire whatever the greedy walk has passed and resynced beyond.
-        // `fired` keeps a revision which repeats the walk from firing the
-        // same position twice.
-        for matched in certain {
-            if !ctx.fired.iter().any(|fired| same_match(fired, &matched)) {
-                let accept = matched.accept.clone();
-                // Position 0 is the flushed pending seed: a command the
-                // previous utterance spoke; everything else is this one's.
-                let of = if matched.position == 0 {
-                    closed
-                } else {
-                    closed + 1
-                };
-                ctx.fired.push(matched);
-                if !self.fire(&accept, of).await {
-                    return false;
-                }
-            }
-        }
+        // This revision restarts the settling window: nothing read out of it
+        // may fire until the recognizer has left it alone for `debounce`.
+        // A hypothesis the recognizer rewrites or withdraws inside the window
+        // is simply re-walked by the next partial, and whatever it used to
+        // say never reaches the keyboard.
+        let settled_at = Instant::now() + self.options.debounce;
+        ctx.settled_at = settled_at;
 
-        // Where the hypothesis rests decides what is armed:
-        // - an unambiguous accept arms `eager_delay`, re-armed by every
-        //   changed partial (the hypothesis must hold perfectly still to be
-        //   trusted);
+        // Queue whatever the greedy walk has passed and resynced beyond.
+        // These are certain *within this revision* — a later word already
+        // killed the walk that crossed them — but the revision itself is not,
+        // so they wait out the window with everything else. `fired` keeps a
+        // revision which repeats the walk from queueing the same position
+        // twice.
+        ctx.due = certain
+            .into_iter()
+            .filter(|matched| !ctx.fired.iter().any(|fired| same_match(fired, matched)))
+            .collect();
+
+        // Where the hypothesis rests decides what is armed, always floored at
+        // the settling window:
+        // - an unambiguous accept fires as soon as the window closes (the
+        //   hypothesis must hold perfectly still to be trusted);
         // - an ambiguous accept arms the completion timeout when the walk
         //   FIRST rests there — a later text change which does not move the
         //   resting point (a trailing "[unk]", say) keeps the armed deadline,
@@ -833,8 +927,9 @@ impl<'a> Engine<'a> {
                         let deadline = match &ctx.resting {
                             Some(prev) if ambiguous && unchanged => prev.deadline,
                             _ if ambiguous => Instant::now() + self.options.completion_timeout,
-                            _ => Instant::now() + self.options.eager_delay,
-                        };
+                            _ => settled_at,
+                        }
+                        .max(settled_at);
                         Some(EagerResting {
                             accept,
                             position,
@@ -883,7 +978,7 @@ pub async fn engine_task(
         // completion deadline.
         let deadline = eager
             .as_ref()
-            .and_then(|ctx| ctx.resting.as_ref().map(|rest| rest.deadline))
+            .and_then(EagerContext::deadline)
             .or(state.deadline());
 
         // `biased` so the arms are polled in a deliberate order: an event
@@ -924,10 +1019,7 @@ pub async fn engine_task(
                 }
                 Some(RecognitionEvent::Partial(text)) => {
                     if engine.options.eager {
-                        if !engine
-                            .on_eager_partial(&mut state, &mut eager, &text, closed)
-                            .await
-                        {
+                        if !engine.on_eager_partial(&mut state, &mut eager, &text).await {
                             return Ok(());
                         }
                     } else if let MatchState::Pending { walk, deadline, .. } = &mut state {
@@ -1008,15 +1100,44 @@ pub async fn engine_task(
             },
             _ = deadline_elapsed(deadline) => {
                 if let Some(ctx) = eager.as_mut() {
+                    let now = Instant::now();
+
+                    // The settling window closed on this revision: the
+                    // matches the greedy walk resynced past are now as
+                    // certain as a partial can make them, and fire in the
+                    // order they were spoken.
+                    if now >= ctx.settled_at {
+                        for matched in std::mem::take(&mut ctx.due) {
+                            let accept = matched.accept.clone();
+                            // Position 0 is the flushed pending seed: a
+                            // command the previous utterance spoke;
+                            // everything else is this one's.
+                            let of = if matched.position == 0 { closed } else { closed + 1 };
+                            ctx.fired.push(matched);
+                            if !engine.fire(&accept, of).await {
+                                return Ok(());
+                            }
+                        }
+                    }
+
                     // The partial hypothesis held still long enough: the
                     // resting command fires, and the utterance stays open —
                     // later partials may still fire further commands, and the
                     // eventual Final reconciles against `fired`.
-                    if let Some(rest) = ctx.resting.take() {
-                        ctx.fired.push(Match {
+                    if let Some(rest) = ctx.resting.take_if(|rest| now >= rest.deadline) {
+                        let fire = Match {
                             position: rest.position,
                             accept: rest.accept.clone(),
+                        };
+                        // Kept so this utterance's Final can re-walk its words
+                        // the same way and check the fire survived.
+                        ctx.committed_fire = Some(Committed {
+                            from: ctx.committed,
+                            origin: ctx.origin.clone(),
+                            passed: ctx.passed.clone(),
+                            fire: fire.clone(),
                         });
+                        ctx.fired.push(fire);
                         // The fire commits the hypothesis set to the words it
                         // consumed: every later walk of this utterance starts
                         // after them, from a fresh root, so no continuation
@@ -1091,13 +1212,13 @@ mod tests {
     use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_millis(300);
-    const EAGER_DELAY: Duration = Duration::from_millis(100);
+    const DEBOUNCE: Duration = Duration::from_millis(100);
 
     /// The eager configuration the eager suite runs under.
     fn eager_options() -> MatcherOptions {
         MatcherOptions {
             eager: true,
-            eager_delay: EAGER_DELAY,
+            debounce: DEBOUNCE,
             ..MatcherOptions::with_timeout(TIMEOUT)
         }
     }
@@ -1488,6 +1609,112 @@ mod tests {
         h.shutdown().await;
     }
 
+    /// The field report's shape: a literal spanning two words, with an
+    /// optional tail. "air" alone is not a command; "air burst" is, and can
+    /// still grow into "air burst strike".
+    fn airburst() -> Automaton {
+        compile(
+            r#"
+            AirburstStrike = "air burst" "strike"? { 1 }
+            "#,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_literal_is_never_a_match() {
+        // The matcher's own half of the report, and it holds: the first word
+        // of a two-word literal rests mid-phrase, so nothing accepts and
+        // nothing fires — with eager matching on or off.
+        let mut h = Harness::start_with(airburst(), eager_options());
+
+        h.hear_partial("air").await;
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+
+        h.hear_final("air").await;
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eager_withdrawn_hypothesis_inside_the_window_never_fires() {
+        // What the settling window is for. The recognizer's partial completes
+        // the grammar phrase the speaker only started — its phrase-list
+        // language model makes "burst" overwhelmingly likely after "air", and
+        // it decodes the rest out of the trailing silence — and then takes it
+        // back. Inside the window that costs nothing: the match is re-read
+        // from the revision, not pressed.
+        let mut h = Harness::start_with(airburst(), eager_options());
+
+        h.hear_partial("air").await;
+        h.hear_partial("air burst").await;
+        h.advance(DEBOUNCE - Duration::from_millis(1)).await;
+        h.nothing_fired();
+
+        // Withdrawn while it was still settling: the hypothesis is now "air",
+        // which is not a command, and nothing ever fires for it.
+        h.hear_partial("air").await;
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+
+        h.hear_final("air").await;
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+        h.no_warnings();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eager_final_which_beats_the_deadline_withdraws_the_match() {
+        // Past the window the engine is committed to acting on the partial,
+        // and only the `Final` can still take it back — which it does, as
+        // long as it lands before the ambiguous rest's completion timeout.
+        // That race is why `completion_timeout` has to clear the endpointer's
+        // finalization lag; see `recorded::probe` for the measurement.
+        let mut h = Harness::start_with(airburst(), eager_options());
+
+        h.hear_partial("air burst").await;
+        h.advance(TIMEOUT - Duration::from_millis(1)).await;
+        h.nothing_fired();
+
+        h.hear_final("air").await;
+        h.advance(TIMEOUT * 2).await;
+        h.nothing_fired();
+        h.no_warnings();
+        h.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eager_retraction_is_reported_when_it_happens() {
+        // And when the `Final` loses that race, the keys are already down.
+        // Nothing can un-press them, so the one thing the engine owes the
+        // user is to say so.
+        let mut h = Harness::start_with(airburst(), eager_options());
+
+        h.hear_partial("air burst").await;
+        h.advance(TIMEOUT).await;
+        assert_eq!(h.fired(), vec!["AirburstStrike"]);
+
+        h.hear_final("air").await;
+        h.nothing_fired();
+
+        let warnings = h.warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one retraction, one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("retraction")
+                && warnings[0].contains("AirburstStrike")
+                && warnings[0].contains("air"),
+            "the warning should name what fired and what was heard: {}",
+            warnings[0]
+        );
+        h.shutdown().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn ambiguity_is_per_resting_walk_across_different_rules() {
         // "autocannon" and "autocannon sentry" are different rules: the
@@ -1656,7 +1883,7 @@ mod tests {
         h.hear_partial("deploy sentry").await;
         h.nothing_fired();
 
-        h.advance(EAGER_DELAY - Duration::from_millis(1)).await;
+        h.advance(DEBOUNCE - Duration::from_millis(1)).await;
         h.nothing_fired();
 
         // The command fires without any Final ever arriving.
@@ -1674,17 +1901,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn eager_certain_prefix_fires_immediately_on_the_partial() {
+    async fn eager_certain_prefix_fires_once_the_hypothesis_settles() {
         let mut h = Harness::start_with(arsenal(), eager_options());
 
-        // "deploy sentry" was passed and resynced beyond by "reload": it is
-        // certain the moment the partial arrives, with no delay at all.
+        // "deploy sentry" was passed and resynced beyond by "reload", so it
+        // cannot grow into anything longer — but the partial it was read out
+        // of can still be rewritten, so it waits out the settling window like
+        // everything else.
         h.hear_partial("deploy sentry reload").await;
-        assert_eq!(h.fired(), vec!["DeploySentry"]);
+        h.nothing_fired();
 
-        // The resting "reload" needs its stability delay.
-        h.advance(EAGER_DELAY).await;
-        assert_eq!(h.fired(), vec!["Reload"]);
+        // The window closes: the resynced-past command fires, and the resting
+        // "reload" — unambiguous, so it owes nothing beyond the window — is
+        // right behind it.
+        h.advance(DEBOUNCE).await;
+        assert_eq!(h.fired(), vec!["DeploySentry", "Reload"]);
 
         h.hear_final("deploy sentry reload").await;
         h.nothing_fired();
@@ -1735,12 +1966,12 @@ mod tests {
         let mut h = Harness::start_with(arsenal(), eager_options());
 
         h.hear_partial("deploy sentry").await;
-        h.advance(EAGER_DELAY - Duration::from_millis(10)).await;
+        h.advance(DEBOUNCE - Duration::from_millis(10)).await;
 
         // The hypothesis changed (even though the matchable words did not:
         // "[unk]" is stripped) — it has to hold still all over again.
         h.hear_partial("deploy sentry [unk]").await;
-        h.advance(EAGER_DELAY - Duration::from_millis(10)).await;
+        h.advance(DEBOUNCE - Duration::from_millis(10)).await;
         h.nothing_fired();
 
         h.advance(Duration::from_millis(10)).await;
@@ -1788,9 +2019,10 @@ mod tests {
     async fn eager_mismatch_on_a_divergent_final_warns_and_drops() {
         let mut h = Harness::start_with(arsenal(), eager_options());
 
-        // "reload" is resynced past ("deploy" does not extend it): certain,
-        // fired immediately.
+        // "reload" is resynced past ("deploy" does not extend it): certain
+        // once the hypothesis settles.
         h.hear_partial("reload deploy").await;
+        h.advance(DEBOUNCE).await;
         assert_eq!(h.fired(), vec!["Reload"]);
 
         // The finalized utterance says something the fired prefix does not
@@ -1833,7 +2065,7 @@ mod tests {
         // are spent: no revision of this utterance may grow them into the
         // longer command on top of the keys already pressed.
         h.hear_partial("autocannon sentry").await;
-        h.advance(EAGER_DELAY + TIMEOUT).await;
+        h.advance(DEBOUNCE + TIMEOUT).await;
         h.nothing_fired();
 
         // The Final reports the overrun instead: the choice was already
@@ -1891,7 +2123,7 @@ mod tests {
         // ...and the words spoken after it start from a clean root: "sentry"
         // continues nothing.
         h.hear_partial("sentry").await;
-        h.advance(EAGER_DELAY + TIMEOUT).await;
+        h.advance(DEBOUNCE + TIMEOUT).await;
         h.hear_final("sentry").await;
         h.nothing_fired();
         h.no_warnings();
@@ -1916,7 +2148,7 @@ mod tests {
         h.nothing_fired();
 
         h.hear_partial("sentry").await;
-        h.advance(EAGER_DELAY + TIMEOUT).await;
+        h.advance(DEBOUNCE + TIMEOUT).await;
         h.hear_final("sentry").await;
         h.nothing_fired();
         h.no_warnings();
@@ -1934,7 +2166,7 @@ mod tests {
         h.hear_partial("sentry").await; // absorbed into the context
         h.mute().await;
 
-        h.advance(EAGER_DELAY + TIMEOUT * 2).await;
+        h.advance(DEBOUNCE + TIMEOUT * 2).await;
         h.nothing_fired();
 
         h.hear_final("sentry").await;
@@ -1947,16 +2179,17 @@ mod tests {
     async fn eager_multi_command_utterance_fires_in_order() {
         let mut h = Harness::start_with(arsenal(), eager_options());
 
-        // A growing hypothesis fires each command as it becomes certain.
+        // A growing hypothesis fires each command in turn, once the
+        // recognizer has stopped revising what it heard.
         h.hear_partial("deploy").await;
         h.nothing_fired();
         h.hear_partial("deploy sentry").await;
-        h.nothing_fired(); // resting, not yet stable
+        h.nothing_fired(); // resting, not yet settled
         h.hear_partial("deploy sentry reload").await;
-        assert_eq!(h.fired(), vec!["DeploySentry"]); // resynced past: certain
+        h.nothing_fired(); // resynced past, but this revision is fresh
 
-        h.advance(EAGER_DELAY).await;
-        assert_eq!(h.fired(), vec!["Reload"]);
+        h.advance(DEBOUNCE).await;
+        assert_eq!(h.fired(), vec!["DeploySentry", "Reload"]);
 
         h.hear_final("deploy sentry reload").await;
         h.nothing_fired();
@@ -1978,7 +2211,7 @@ mod tests {
         h.advance(Duration::from_millis(99)).await; // t0 + 349ms: past the old deadline
         h.nothing_fired();
 
-        h.advance(Duration::from_millis(1)).await; // partial + EAGER_DELAY
+        h.advance(Duration::from_millis(1)).await; // partial + DEBOUNCE
         assert_eq!(h.fired(), vec!["AutocannonSentry"]);
 
         // The superseded short command never fires, and the Final agrees.
@@ -1998,13 +2231,14 @@ mod tests {
         h.nothing_fired();
 
         // "reload" cannot extend the pending walk: the pending command was
-        // fully spoken, so it flushes immediately — the eager equivalent of
-        // the non-extending Final rule, minus the wait.
+        // fully spoken, so it flushes as soon as this hypothesis settles —
+        // the eager equivalent of the non-extending Final rule, without
+        // waiting for the endpointer.
         h.hear_partial("reload").await;
-        assert_eq!(h.fired(), vec!["Autocannon"]);
+        h.nothing_fired();
 
-        h.advance(EAGER_DELAY).await;
-        assert_eq!(h.fired(), vec!["Reload"]);
+        h.advance(DEBOUNCE).await;
+        assert_eq!(h.fired(), vec!["Autocannon", "Reload"]);
 
         h.hear_final("reload").await;
         h.nothing_fired();
@@ -2053,7 +2287,7 @@ mod tests {
         let mut h = Harness::start_with(arsenal(), eager_options());
         h.hear_final("autocannon").await;
         h.hear_partial("sentry").await;
-        h.advance(EAGER_DELAY).await;
+        h.advance(DEBOUNCE).await;
         assert_eq!(h.fired(), vec!["AutocannonSentry"]);
 
         let Harness {
@@ -2115,7 +2349,7 @@ mod tests {
 
         // Utterance 2: an eager stability fire, again ahead of its Final.
         h.hear_partial("deploy sentry").await;
-        h.advance(EAGER_DELAY).await;
+        h.advance(DEBOUNCE).await;
         let actions = h.fired_actions();
         assert_eq!(actions.len(), 1);
         assert_eq!(
@@ -2152,7 +2386,8 @@ mod tests {
         // the muted utterance's eagerly fired command).
         let mut h = Harness::start_with(arsenal(), eager_options());
 
-        h.hear_partial("deploy sentry reload").await; // certain fire mid-utterance
+        h.hear_partial("deploy sentry reload").await;
+        h.advance(DEBOUNCE).await; // the settled fire, mid-utterance
         let actions = h.fired_actions();
         assert_eq!(
             (actions[0].command.as_str(), actions[0].utterance),

@@ -439,7 +439,7 @@ recognition accuracy for feasibility.
 name: Arma 3
 model: ~/.local/share/vosk/vosk-model-en-us-0.22-lgraph
 hotkey: { device: auto, key: leftctrl, mode: push-to-talk }
-completion_timeout: 500ms
+recognition: { completion_timeout: 750ms }
 defaults: { duration: 30ms, interval: 30ms }   # press pacing, as before
 grammar: |
   Map = "map" | "toggle map" { m }
@@ -500,14 +500,14 @@ enum MatchState {
     Pending {
         accept: Accept,              // matched and ready to fire
         walk: Walk,                  // the resting walk, to continue from
-        deadline: tokio::time::Instant,   // now + profile.completion_timeout
+        deadline: tokio::time::Instant,   // now + recognition.completion_timeout
     },
 }
 ```
 
 The matcher runs under a `MatcherOptions` struct (completion timeout, the eager switch and its
-delay, the confidence margin, and a warning sink) threaded in from the profile by the `run`
-assembly. With **eager matching off** (`recognition.eager: false` — the compatibility escape
+settling window, the confidence margin, and a warning sink) threaded in from the profile's
+`recognition:` block by the `run` assembly. With **eager matching off** (`recognition.eager: false` — the compatibility escape
 hatch), commands fire on **Final** results only; partials are used solely to hold a pending timer
 open, never to fire. Transitions:
 
@@ -540,19 +540,30 @@ struct EagerContext {                       // Some(_) from an utterance's first
     passed: Option<Accept>,                 // pending command absorbed from the previous utterance
     fired: Vec<Match>,                      // (position, accept) already fired from partials
     committed: usize,                       // words spent by deadline fires; later walks start here
+    due: Vec<Match>,                        // resynced-past matches waiting out the settling window
+    settled_at: Instant,                    // now + debounce, restarted by every revision
+    committed_fire: Option<Committed>,      // how the Final re-checks the fire which committed us
     resting: Option<EagerResting>,          // the armed deadline, if the walk rests on an accept
 }
 ```
 
+- **The settling window.** Every partial revision restarts `settled_at = now + debounce`, and
+  nothing eager fires before it. A partial hypothesis is a guess: the recognizer rewrites and
+  *withdraws* words, and a grammar-constrained decoder will happily complete a phrase the speaker
+  only started (the phrase-list language model decodes the rest out of the trailing silence).
+  Inside the window that costs nothing — the next revision is simply re-walked and whatever the
+  old one said never reaches the keyboard.
 - **Certain fires.** A command the greedy walk has *passed and resynced beyond* ended strictly
-  before the partial's last word — no revision of the words still being spoken can take it back —
-  so it fires **immediately**, recorded in `fired`.
-- **Resting on an unambiguous accept** arms `now + eager_delay`, re-armed on every changed
-  partial: the hypothesis must hold still before it is trusted. The deadline firing fires the
-  command, records it, and keeps the context open.
+  before the partial's last word, so no *later* word can take it back — but the revision it was
+  read out of still can. It is queued in `due` and fires when the window closes, recorded in
+  `fired`.
+- **Resting on an unambiguous accept** fires when the window closes: the hypothesis has to hold
+  perfectly still to be trusted. The deadline firing fires the command, records it, and keeps the
+  context open.
 - **Resting on an ambiguous accept** arms the **completion timeout from the partial** — the wait
   no longer starts at finalization, which is the big win for prefix commands. A later partial which
-  does not move the resting point keeps the armed deadline.
+  does not move the resting point keeps the armed deadline. The deadline is floored at the
+  settling window, so a revision always buys at least `debounce` more.
 - **Resting mid-phrase** (including past an uncommitted crossed accept) arms nothing: the trailing
   words may still grow into the longer phrase.
 - **A deadline fire commits the hypothesis set.** When a resting deadline fires (either kind), the
@@ -561,8 +572,12 @@ struct EagerContext {                       // Some(_) from an utterance's first
   continuation or revision can grow the same words into a second, longer command on top of keys
   already pressed: the field-observed double fire ("Autocannon" from the timer, then
   "AutocannonSentry" from the continuation over the same words) is structurally impossible, not
-  merely unreached. A speaker who continues anyway is told at the Final (an **eager overrun**
-  warning naming the committed fire and the settled text) and the trailing words are dropped. The
+  merely unreached. At the Final, the committing fire is re-checked by walking the *finalized*
+  words the way its own pass walked them (`Committed` keeps the starting index, origin and pending
+  seed). If they still produce it, a speaker who continued anyway is told the trailing words were
+  dropped (an **eager overrun** warning naming the committed fire and the settled text); if they
+  do not, the recognizer withdrew the hypothesis the keys were pressed for and an **eager
+  retraction** warning says exactly that. The
   warning is deliberately *not* emitted when the overrunning partial is first seen: at that moment
   the trailing words may still be revised, or grow into a genuine second command that fires from
   the fresh root — an overrun only exists once the utterance settles having added up to nothing,
@@ -641,13 +656,14 @@ all under the profile's `recognition:` block:
    still-conservative 200 ms (Vosk's own default is ~500 ms). The other two parameters keep the
    values vosk-api's header suggests — `t_start_max` 5.0 s (initial-silence timeout) and `t_max`
    30 s (hard utterance cap) — see the constants in `recognition/vosk.rs`.
-2. **Eager (partial-driven) firing** (`recognition.eager`, default on; `recognition.eager_delay`,
-   default 100ms). The matcher fires from *stable partials* instead of waiting for finalization at
-   all: certain (resynced-past) commands fire instantly, unambiguous resting matches fire after
-   `eager_delay` of hypothesis stability, and ambiguous resting matches start their
-   `completion_timeout` at the partial rather than at the Final. The eventual Final is reconciled
-   against what already fired, and a mismatch is warned about (keys cannot be un-pressed) — see
-   §"Eager matching" above. `eager: false` restores the original Final-only machine exactly.
+2. **Eager (partial-driven) firing** (`recognition.eager`, default on; `recognition.debounce`,
+   default 100ms). The matcher fires from *settled partials* instead of waiting for finalization at
+   all: nothing fires until the hypothesis has stayed unchanged for `debounce`, after which
+   certain (resynced-past) commands and unambiguous resting matches fire, while ambiguous resting
+   matches start their `completion_timeout` at the partial rather than at the Final. The eventual
+   Final is reconciled against what already fired, and a mismatch is warned about (keys cannot be
+   un-pressed) — see §"Eager matching" above. `eager: false` restores the original Final-only
+   machine exactly.
 3. **Confidence gating** (`recognition.alternatives` + `recognition.confidence_margin`), the
    opposite trade: spend the finalization wait buying *certainty*, suppressing utterances whose
    close n-best competitors would run different commands — see §"Confidence gating" above.
@@ -657,29 +673,48 @@ all under the profile's `recognition:` block:
 
 Three honest consequences remain:
 
-1. "autocannon sentry" spoken in one breath is one hypothesis: with eager on it fires
-   `eager_delay` after the last word stabilizes; with eager off it fires when the endpointer does
-   (`silence` after the last word, plus decode).
+1. "autocannon sentry" spoken in one breath is one hypothesis: with eager on it fires `debounce`
+   after the last word stabilizes; with eager off it fires when the endpointer does (`silence`
+   after the last word, plus decode).
 2. The completion timeout still only costs you when you *pause* inside an ambiguous phrase — but
    with eager on the short command's perceived latency is now just `completion_timeout` from the
    pause, instead of `endpoint silence + completion_timeout` from the eventual Final.
-3. **`completion_timeout` has a practical floor of ~500ms** (the schema default). The wait is
-   armed when a partial *rests* on the ambiguous accept, but the evidence that the speaker carried
-   on trails the speech itself: audio reaches the recognizer in ~100ms frames, and a continuation
-   word only appears in a partial once it has been (mostly) spoken *and* decoded — inter-word gap
-   + word duration + framing + decode adds up to several hundred milliseconds even in fluent
-   speech. Field testing at 350ms produced exactly that failure: "auto cannon sentry" in one
-   breath fired "Autocannon" from the timer before any partial contained "sentry". This is not a
-   deadline-arithmetic bug — the arming and re-arming rules behaved as specified — it is the
-   emission latency of the evidence. Two mitigations are in place: the matcher's `select!` is
-   biased to drain already-queued events (a continuation partial, a mute) before trusting any
-   elapsed timer, and a deadline fire commits the hypothesis set (see §"Eager matching") so the
-   mistimed case degrades to one wrong-but-reported command rather than two.
+3. **`completion_timeout` has two floors, and the schema default (750ms) clears both.**
 
-The remaining risk is inherent: an eager fire acts on a hypothesis, and a speaker who pauses past
-`completion_timeout` mid-phrase (or a partial the recognizer later revises) produces keys that
-cannot be taken back. The matcher never attempts compensation; it reports the mismatch through the
-session's event path so the user sees exactly what fired.
+   The first is the evidence that the speaker carried on. The wait is armed when a partial *rests*
+   on the ambiguous accept, but a continuation word only appears in a partial once it has been
+   (mostly) spoken *and* decoded — inter-word gap + word duration + ~100ms framing + decode adds
+   up to several hundred milliseconds even in fluent speech. Field testing at 350ms produced
+   exactly that failure: "auto cannon sentry" in one breath fired "Autocannon" from the timer
+   before any partial contained "sentry". This is not a deadline-arithmetic bug — the arming rules
+   behaved as specified — it is the emission latency of the evidence.
+
+   The second is the endpointer, and it is the harder one. A partial can complete a grammar phrase
+   the speaker only started, hold that hypothesis perfectly still (so the settling window never
+   catches it), and be contradicted only by the `Final`. Clipping `auto cannon.wav` after "auto"
+   reproduces it exactly: the partial reads `"auto cannon"`, and the `Final` reads `"auto"` — see
+   `matcher::recorded`. Measured across `silence` values, that `Final` lands **400–700ms after the
+   partial it contradicts** (~400ms for a confident decode at short `t_end`, ~700ms at the shipped
+   200ms), and shortening `silence` does not reliably pull it in: `set_endpointer_delays` sets
+   several rules keyed on decode confidence, and a half-spoken phrase decodes with low confidence
+   by construction. So the number which actually decides whether a phrase you abandoned presses
+   keys is `completion_timeout` versus that lag — 500ms sat inside the range and lost about half
+   the time, 750ms clears it, at the cost of 250ms on genuinely ambiguous prefixes. The practical
+   effect is that an ambiguous eager fire is now *Final-confirmed*: `recorded_ambiguous_prefix_
+   waits_out_the_completion_timeout` pins the ordering.
+
+   Two further mitigations are in place: the matcher's `select!` is biased to drain already-queued
+   events (a continuation partial, a mute) before trusting any elapsed timer, and a deadline fire
+   commits the hypothesis set (see §"Eager matching") so the mistimed case degrades to one
+   wrong-but-reported command rather than two.
+
+The remaining risk is inherent, and it is a margin rather than a guarantee: an eager fire acts on
+a hypothesis, and a speaker who pauses past `completion_timeout` mid-phrase — or a recognizer
+which holds a wrong hypothesis still for longer than the wait — produces keys that cannot be taken
+back. The matcher never attempts compensation; it reports the overrun or the retraction through
+the session's event path so the user sees exactly what fired. Making it a guarantee would mean
+never firing an ambiguous match before its `Final`, which costs push-to-talk users the command
+entirely when they release the key before the endpointer runs.
 
 ## Profile schema
 
@@ -702,14 +737,13 @@ hotkey:
   mode: toggle             # toggle | push-to-talk | push-to-mute
   interrupt: false         # true: stopping listening also cancels the command being typed
 
-completion_timeout: 500ms  # ambiguous-prefix settle time (default: 500ms)
-
-recognition:               # the latency levers (all optional; block absent = these defaults)
-  silence: 200ms           # endpointer trailing silence (t_end); Vosk's own default is ~500ms
-  eager: true              # fire from stable partials (default true; false = Final-only firing)
-  eager_delay: 100ms       # how long a partial must hold still before an unambiguous match fires
-  alternatives: 0          # >0 requests an n-best list and enables confidence gating
-  confidence_margin: 3.0   # suppress when a different-command alternative is this close to the winner
+recognition:                 # the latency levers (all optional; block absent = these defaults)
+  silence: 200ms             # endpointer trailing silence (t_end); Vosk's own default is ~500ms
+  eager: true                # fire from settled partials (default true; false = Final-only firing)
+  debounce: 100ms            # how long a partial must hold still before we act on it
+  completion_timeout: 750ms  # ambiguous-prefix settle time
+  alternatives: 0            # >0 requests an n-best list and enables confidence gating
+  confidence_margin: 3.0     # suppress when a different-command alternative is this close to the winner
 
 defaults:                  # pacing for assembled key plans
   duration: 30ms           # how long each press is held down

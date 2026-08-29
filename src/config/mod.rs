@@ -46,18 +46,6 @@ mod default {
         "auto".to_string()
     }
 
-    /// `completion_timeout`: how long an ambiguous prefix waits for more words.
-    ///
-    /// 500ms because the continuation's first *evidencing* partial trails the
-    /// speech itself: the recognizer only sees ~100ms audio frames, and a
-    /// word only shows up in a partial once it has been (mostly) spoken and
-    /// decoded. Field testing showed sub-500ms waits firing the short
-    /// command while the longer phrase's words were still in flight — see
-    /// DESIGN.md §"Endpointing and latency".
-    pub fn completion_timeout() -> Duration {
-        Duration::from_millis(500)
-    }
-
     /// `defaults.duration`: how long each chord is held down.
     pub fn key_duration() -> Duration {
         Duration::from_millis(30)
@@ -99,17 +87,15 @@ pub struct Profile {
     #[serde(default)]
     pub hotkey: Option<HotkeyConfig>,
 
-    /// How long an ambiguous phrase waits in case you continue with a longer
-    /// one. See DESIGN.md §"The completion-timeout state machine".
-    #[serde(
-        default = "default::completion_timeout",
-        deserialize_with = "duration::deserialize"
-    )]
-    pub completion_timeout: Duration,
+    /// Accepted only to say where it went: `completion_timeout` moved into the
+    /// `recognition:` block, alongside the other latency levers it trades
+    /// against. Rejected by [`Self::validate_structure`].
+    #[serde(default, deserialize_with = "duration::deserialize_optional")]
+    completion_timeout: Option<Duration>,
 
     /// The latency levers: endpointer silence, eager (partial-driven) firing,
-    /// and confidence gating. Absent means every default — see DESIGN.md
-    /// §"Endpointing and latency".
+    /// the ambiguous-prefix wait, and confidence gating. Absent means every
+    /// default — see DESIGN.md §"Endpointing and latency".
     #[serde(default)]
     pub recognition: RecognitionConfig,
 
@@ -176,6 +162,19 @@ impl Profile {
 
     /// The cross-field invariants which serde cannot express.
     pub fn validate_structure(&self) -> Result<(), crate::Error> {
+        if let Some(timeout) = self.completion_timeout {
+            return Err(human_errors::user(
+                format!(
+                    "This profile sets 'completion_timeout: {}' at the top level, where it no longer lives: it moved into the 'recognition:' block alongside the other latency levers it trades against.",
+                    duration::render(timeout)
+                ),
+                &[
+                    "Indent it under 'recognition:', next to 'silence' and 'debounce'.",
+                    "The option reference in the documentation lists every field the 'recognition:' block takes.",
+                ],
+            ));
+        }
+
         if self.grammar.published().next().is_none() {
             return Err(human_errors::user(
                 "This profile's grammar does not publish any commands, so there would be nothing to listen for.",
@@ -369,7 +368,10 @@ mod tests {
         );
 
         assert_eq!(profile.audio.device.as_deref(), Some("default"));
-        assert_eq!(profile.completion_timeout, Duration::from_millis(350));
+        assert_eq!(
+            profile.recognition.completion_timeout,
+            Duration::from_millis(350)
+        );
         assert_eq!(
             profile.defaults,
             OutputDefaults {
@@ -503,7 +505,10 @@ mod tests {
             "an unset device defers to the machine's configuration"
         );
         assert_eq!(profile.hotkey, None, "no hotkey means always listening");
-        assert_eq!(profile.completion_timeout, Duration::from_millis(500));
+        assert_eq!(
+            profile.recognition.completion_timeout,
+            Duration::from_millis(750)
+        );
         assert_eq!(profile.recognition, RecognitionConfig::default());
         assert_eq!(profile.defaults, OutputDefaults::default());
     }

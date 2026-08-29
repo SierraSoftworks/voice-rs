@@ -22,7 +22,8 @@ hotkey:
   key: rightctrl
   mode: toggle
 
-completion_timeout: 500ms
+recognition:
+  completion_timeout: 750ms
 
 defaults:
   duration: 30ms
@@ -278,47 +279,21 @@ would take to type it, and stopping listening part-way through prints `interrupt
 `discarded: "…"` line for each command which was waiting behind it.
 :::
 
-### completion_timeout <Badge text="default: 500ms"/>
-How long a command which is a **prefix** of a longer one waits, in case you are still talking.
-
-With both `Reload = "reload"` and `ReloadWeapon = "reload weapon"` in a profile, saying "reload" and stopping fires the
-short command after this long; carrying on with "weapon" fires the longer one instead and cancels the short one.
-Durations are written the way you would say them: `300ms`, `1s`, `1s 500ms`. A bare number is a load error —
-voice-orders will not guess whether you meant seconds or milliseconds.
-
-```yaml
-completion_timeout: 500ms
-```
-
-`voice-orders validate` prints a note for every prefix relation it finds in your profile, quoting this value, so you can
-see exactly which of your commands pay the wait. The [grammar reference](../grammar/README.md#ambiguity-and-the-completion-timeout)
-explains what makes a point in a grammar ambiguous and what the timeout costs you — including the case where a rule
-publishes a shared subject, which makes every command built on it ambiguous.
-
-With [eager matching](#recognition-eager) on (the default), this wait starts the moment the recognizer's in-progress
-hypothesis comes to rest on the ambiguous phrase — not hundreds of milliseconds later when the utterance finalizes.
-
-::: warning Going below ~500ms is a gamble
-The evidence that you carried on arrives well after the words leave your mouth: the recognizer listens in ~100ms
-chunks, and a word only shows up in its hypothesis once it has been (mostly) spoken and decoded. Set this much below
-500ms and the short command can fire while the longer phrase's words are still on their way — you say "auto cannon
-sentry" in one breath and get the autocannon anyway.
-:::
-
 ### recognition
 How quickly — and how cautiously — speech turns into keys. The whole block is optional, and so is every field in it;
 leaving it out gives you the defaults shown here:
 
 ```yaml
 recognition:
-  silence: 200ms          # trailing silence before an utterance is finalized
-  eager: true             # fire commands from stable in-progress hypotheses
-  eager_delay: 100ms      # how long a hypothesis must hold still before it fires
-  alternatives: 0         # >0 asks for an n-best list and enables confidence gating
-  confidence_margin: 3.0  # how close a competing reading may score before we refuse to guess
+  silence: 200ms            # trailing silence before an utterance is finalized
+  eager: true               # fire commands from settled in-progress hypotheses
+  debounce: 100ms           # how long a hypothesis must hold still before we act on it
+  completion_timeout: 750ms # how long an ambiguous phrase waits for you to carry on
+  alternatives: 0           # >0 asks for an n-best list and enables confidence gating
+  confidence_margin: 3.0    # how close a competing reading may score before we refuse to guess
 ```
 
-The [grammar reference](../grammar/README.md#a-note-on-latency) explains how the three mechanisms fit together.
+The [grammar reference](../grammar/README.md#a-note-on-latency) explains how the mechanisms fit together.
 
 #### recognition.silence <Badge text="default: 200ms"/>
 How much silence after you stop speaking makes the recognizer finalize the utterance. This is the floor under every
@@ -332,16 +307,19 @@ Whether commands may fire from **stable in-progress hypotheses**, before the rec
 The recognizer's hypothesis usually settles on your exact final words hundreds of milliseconds before the
 [silence](#recognition-silence) endpointer fires — eager matching claims that time back:
 
-- a command the hypothesis has moved *past* (you kept talking and the walk re-synced beyond it) fires immediately;
-- a command the hypothesis is resting on fires once it holds still for [`eager_delay`](#recognition-eager-delay);
-- an [ambiguous](#completion-timeout) command starts its completion wait at the hypothesis, not at finalization.
+- nothing fires until the hypothesis has stayed unchanged for [`debounce`](#recognition-debounce) — a reading the
+  recognizer rewrites or withdraws inside that window is re-read rather than pressed;
+- once it settles, a command the hypothesis has moved *past* (you kept talking and the walk re-synced beyond it) fires
+  straight away, and so does a command it is resting on;
+- an [ambiguous](#recognition-completion-timeout) command starts its completion wait at the hypothesis, not at
+  finalization.
 
 The finalized utterance is always checked against what already fired. If they disagree — you were cut off, or the
 recognizer revised itself after a command fired — nothing can un-press a key: the session reports a
 `warning:` line naming what fired and what was actually said, and drops the rest of the utterance.
 
 A fire is also a commitment: the words it consumed are spent. If you pause past the
-[completion timeout](#completion-timeout) mid-phrase and then carry on, the continuation cannot grow those words into
+[completion timeout](#recognition-completion-timeout) mid-phrase and then carry on, the continuation cannot grow those words into
 the longer command on top of the keys already pressed — you get the command the pause chose, and a `warning:` line
 telling you the trailing words were dropped.
 
@@ -351,10 +329,55 @@ telling you the trailing words were dropped.
 finalized results, so an eagerly fired command could never be confidence-checked. Setting `alternatives` without
 mentioning `eager` simply turns eager firing off.
 
-#### recognition.eager_delay <Badge text="default: 100ms"/>
-How long an unambiguous in-progress hypothesis must stay unchanged before it is trusted enough to fire. Shorter is
-faster and twitchier; longer gives the recognizer more room to revise itself before keys go down. Only meaningful with
-[`eager`](#recognition-eager) on.
+#### recognition.debounce <Badge text="default: 100ms"/>
+The settling window: how long the recognizer's in-progress hypothesis must stay unchanged before voice-orders acts on
+anything it says. Every revision restarts it, so a reading which is rewritten or withdrawn while it is settling never
+reaches the keyboard — it is simply re-read from whatever the recognizer says next.
+
+Shorter is faster and twitchier; longer gives the recognizer more room to revise itself before keys go down. Only
+meaningful with [`eager`](#recognition-eager) on.
+
+::: tip
+This is the field formerly called `eager_delay`. It used to gate only an unambiguous resting match; it now gates every
+eager match, which is why it was renamed. A profile still setting `eager_delay` is a load error naming the new name.
+:::
+
+#### recognition.completion_timeout <Badge text="default: 750ms"/>
+How long a command which is a **prefix** of a longer one waits, in case you are still talking.
+
+With both `Reload = "reload"` and `ReloadWeapon = "reload weapon"` in a profile, saying "reload" and stopping fires the
+short command after this long; carrying on with "weapon" fires the longer one instead and cancels the short one.
+Durations are written the way you would say them: `300ms`, `1s`, `1s 500ms`. A bare number is a load error —
+voice-orders will not guess whether you meant seconds or milliseconds.
+
+```yaml
+recognition:
+  completion_timeout: 750ms
+```
+
+`voice-orders validate` prints a note for every prefix relation it finds in your profile, quoting this value, so you can
+see exactly which of your commands pay the wait. The [grammar reference](../grammar/README.md#ambiguity-and-the-completion-timeout)
+explains what makes a point in a grammar ambiguous and what the timeout costs you — including the case where a rule
+publishes a shared subject, which makes every command built on it ambiguous.
+
+With [eager matching](#recognition-eager) on (the default), this wait starts the moment the recognizer's in-progress
+hypothesis comes to rest on the ambiguous phrase — not hundreds of milliseconds later when the utterance finalizes.
+
+::: warning
+It also has a floor you should not go under. An in-progress hypothesis can *complete* a phrase you only started —
+say "air" into a profile with `"air burst" "strike"?` and the recognizer will happily decode "burst" out of the silence
+after you — and the only thing which ever takes that back is the finalized utterance. Measured on real recordings, the
+finalized result lands 400–700ms after the hypothesis it contradicts, so a `completion_timeout` shorter than that
+presses keys for words you never said. The `750ms` default clears it at the shipped
+[`silence`](#recognition-silence); if you shorten this, shorten `silence` with it and check with `voice-orders test`.
+:::
+
+::: warning Going below ~500ms is a gamble
+The evidence that you carried on arrives well after the words leave your mouth: the recognizer listens in ~100ms
+chunks, and a word only shows up in its hypothesis once it has been (mostly) spoken and decoded. Set this much below
+500ms and the short command can fire while the longer phrase's words are still on their way — you say "auto cannon
+sentry" in one breath and get the autocannon anyway.
+:::
 
 #### recognition.alternatives <Badge text="default: 0 (disabled)"/>
 How many alternative transcripts to request for each finalized utterance. Anything above `0` enables **confidence

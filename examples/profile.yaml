@@ -11,7 +11,8 @@ hotkey:
   key: rightctrl           # friendly key name (see key reference)
   mode: toggle             # toggle | push-to-talk | push-to-mute
 
-completion_timeout: 350ms  # ambiguous-prefix settle time (default: 300ms)
+recognition:                 # latency levers (see the option reference)
+  completion_timeout: 350ms  # ambiguous-prefix settle time (default: 750ms)
 
 defaults:                  # pacing for assembled key plans
   duration: 30ms           # how long each press is held down

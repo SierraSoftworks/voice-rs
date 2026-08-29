@@ -1,12 +1,14 @@
 //! The `recognition:` block: the profile's latency levers.
 //!
-//! Three independent mechanisms trade recognition latency against certainty
+//! Four independent mechanisms trade recognition latency against certainty
 //! (see DESIGN.md §"Endpointing and latency"):
 //!
 //! - `silence` tunes the recognizer's endpointer, which decides how much
 //!   trailing silence turns speech into a finalized utterance;
-//! - `eager` + `eager_delay` let the matcher fire commands from *stable
-//!   partial* hypotheses instead of waiting for that finalization at all;
+//! - `eager` + `debounce` let the matcher fire commands from *settled partial*
+//!   hypotheses instead of waiting for that finalization at all;
+//! - `completion_timeout` is how long a phrase which is already a command, but
+//!   could still grow into a longer one, waits for the speaker to continue;
 //! - `alternatives` + `confidence_margin` ask the recognizer for its n-best
 //!   list and suppress an utterance whose close runners-up would have run
 //!   different commands.
@@ -26,10 +28,32 @@ fn default_silence() -> Duration {
     Duration::from_millis(200)
 }
 
-/// `recognition.eager_delay`: how long a partial hypothesis must hold still
-/// before an unambiguous match fires from it.
-fn default_eager_delay() -> Duration {
+/// `recognition.debounce`: how long a partial hypothesis must stay unchanged
+/// before the matcher will act on it.
+fn default_debounce() -> Duration {
     Duration::from_millis(100)
+}
+
+/// `recognition.completion_timeout`: how long an ambiguous prefix waits for
+/// more words.
+///
+/// It has to clear two separate floors. The first is the continuation's own
+/// evidence: the recognizer only sees ~100ms audio frames, and a word only
+/// shows up in a partial once it has been (mostly) spoken and decoded, so
+/// field testing showed sub-500ms waits firing the short command while the
+/// longer phrase's words were still in flight.
+///
+/// The second is the endpointer. A partial hypothesis can complete a grammar
+/// phrase the speaker only started — the phrase-list language model decodes
+/// the rest out of the trailing silence — and the *only* thing which ever
+/// takes that back is the `Final`. Measured on the field recordings
+/// (`recorded::probe`), the `Final` lands 400–700ms after the partial it
+/// contradicts, the upper end at the default `silence`. A wait shorter than
+/// that presses keys for words nobody said; 750ms clears it, at the cost of
+/// 250ms on genuinely ambiguous prefixes. See DESIGN.md §"Endpointing and
+/// latency".
+fn default_completion_timeout() -> Duration {
+    Duration::from_millis(750)
 }
 
 /// `recognition.confidence_margin`: how close a competing alternative's
@@ -58,13 +82,31 @@ pub struct RecognitionConfig {
     #[serde(default)]
     eager: Option<bool>,
 
-    /// How long an unambiguous partial must stay unchanged before it fires
-    /// (only meaningful with `eager` on).
+    /// How long a partial hypothesis must stay unchanged before the matcher
+    /// acts on it — the settling window (only meaningful with `eager` on).
+    ///
+    /// Every revision of a partial restarts it: a match the recognizer
+    /// rewrites or withdraws inside the window is re-parsed rather than
+    /// fired.
     #[serde(
-        default = "default_eager_delay",
+        default = "default_debounce",
         deserialize_with = "duration::deserialize"
     )]
-    pub eager_delay: Duration,
+    pub debounce: Duration,
+
+    /// How long a phrase which is already a command waits, in case the speaker
+    /// is part-way through a longer one which starts with it.
+    #[serde(
+        default = "default_completion_timeout",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub completion_timeout: Duration,
+
+    /// Accepted only to say where it went: `eager_delay` was renamed to
+    /// `debounce` when it became the settling window for every eager match,
+    /// not just an unambiguous one. Rejected by [`Self::validate`].
+    #[serde(default, deserialize_with = "duration::deserialize_optional")]
+    eager_delay: Option<Duration>,
 
     /// How many alternative transcripts to request on finalized results;
     /// `0` disables confidence gating entirely.
@@ -85,7 +127,9 @@ impl Default for RecognitionConfig {
         Self {
             silence: default_silence(),
             eager: None,
-            eager_delay: default_eager_delay(),
+            debounce: default_debounce(),
+            completion_timeout: default_completion_timeout(),
+            eager_delay: None,
             alternatives: 0,
             confidence_margin: default_confidence_margin(),
         }
@@ -113,6 +157,19 @@ impl RecognitionConfig {
 
     /// The cross-field invariants serde cannot express.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        if let Some(delay) = self.eager_delay {
+            return Err(human_errors::user(
+                format!(
+                    "Your 'recognition:' block sets 'eager_delay: {}', which no longer exists: it is now called 'debounce'.",
+                    duration::render(delay)
+                ),
+                &[
+                    "Rename the field to 'debounce' and keep the same value.",
+                    "It also does more than it used to: every eager match now has to hold still for it, not just an unambiguous one.",
+                ],
+            ));
+        }
+
         if self.eager == Some(true) && self.alternatives > 0 {
             return Err(human_errors::user(
                 format!(
@@ -158,7 +215,8 @@ mod tests {
         assert_eq!(config, RecognitionConfig::default());
         assert_eq!(config.silence, Duration::from_millis(200));
         assert!(config.eager(), "eager defaults on");
-        assert_eq!(config.eager_delay, Duration::from_millis(100));
+        assert_eq!(config.debounce, Duration::from_millis(100));
+        assert_eq!(config.completion_timeout, Duration::from_millis(750));
         assert_eq!(config.alternatives, 0);
         assert_eq!(config.confidence_margin, 3.0);
         config.validate().expect("the defaults should validate");
@@ -177,13 +235,14 @@ mod tests {
     #[test]
     fn test_every_field_parses() {
         let config = parse(
-            "silence: 150ms\neager: false\neager_delay: 250ms\nalternatives: 5\nconfidence_margin: 1.5\n",
+            "silence: 150ms\neager: false\ndebounce: 250ms\ncompletion_timeout: 900ms\nalternatives: 5\nconfidence_margin: 1.5\n",
         )
         .expect("the block should load");
 
         assert_eq!(config.silence, Duration::from_millis(150));
         assert!(!config.eager());
-        assert_eq!(config.eager_delay, Duration::from_millis(250));
+        assert_eq!(config.debounce, Duration::from_millis(250));
+        assert_eq!(config.completion_timeout, Duration::from_millis(900));
         assert_eq!(config.alternatives, 5);
         assert_eq!(config.confidence_margin, 1.5);
         config.validate().expect("the block should validate");

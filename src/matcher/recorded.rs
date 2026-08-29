@@ -204,11 +204,35 @@ fn field_grammar() -> Automaton {
 }
 
 /// Runs one recording through the real recognizer and the real engine under
-/// the shipped defaults (silence 200ms, completion_timeout 500ms, eager on
-/// with a 100ms delay), pacing frames at the capture cadence, and returns the
-/// timeline of partials, finals, fires and warnings.
+/// the shipped defaults (silence 200ms, completion_timeout 750ms, eager on
+/// with a 100ms settling window), pacing frames at the capture cadence, and
+/// returns the timeline of partials, finals, fires and warnings.
 async fn run_recording(name: &str) -> Vec<(Duration, Observed)> {
-    let samples = fixture(name);
+    run_clipped(name, None).await
+}
+
+/// [`run_recording`], optionally keeping only the first `clip` seconds of the
+/// recording — how a phrase the speaker never finished reaches the pipeline.
+async fn run_clipped(name: &str, clip: Option<f64>) -> Vec<(Duration, Observed)> {
+    run_full(
+        name,
+        clip,
+        RecognizerOptions::default().silence,
+        crate::config::RecognitionConfig::default().completion_timeout,
+    )
+    .await
+}
+
+async fn run_full(
+    name: &str,
+    clip: Option<f64>,
+    t_end: Duration,
+    completion: Duration,
+) -> Vec<(Duration, Observed)> {
+    let mut samples = fixture(name);
+    if let Some(seconds) = clip {
+        samples.truncate(((seconds * f64::from(SAMPLE_RATE)) as usize).min(samples.len()));
+    }
     let timeline: Timeline = Arc::new(Mutex::new(Vec::new()));
     let started = Instant::now();
     let observe = {
@@ -224,7 +248,10 @@ async fn run_recording(name: &str) -> Vec<(Duration, Observed)> {
         &model_path(),
         SAMPLE_RATE,
         &["auto cannon".to_string(), "auto cannon sentry".to_string()],
-        RecognizerOptions::default(),
+        RecognizerOptions {
+            silence: t_end,
+            ..RecognizerOptions::default()
+        },
         rec_events_tx,
     )
     .expect("the recognizer should start");
@@ -254,11 +281,12 @@ async fn run_recording(name: &str) -> Vec<(Duration, Observed)> {
     // its command queue timestamped the same way.
     let options = MatcherOptions {
         eager: true,
+        debounce: crate::config::RecognitionConfig::default().debounce,
         warn: {
             let observe = observe.clone();
             Arc::new(move |message| observe(Observed::Warning(message)))
         },
-        ..MatcherOptions::with_timeout(Duration::from_millis(500))
+        ..MatcherOptions::with_timeout(completion)
     };
     let (queue_tx, mut queue_rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
@@ -317,7 +345,10 @@ async fn run_recording(name: &str) -> Vec<(Duration, Observed)> {
     drain.await.expect("the drain should not panic");
 
     let timeline = timeline.lock().unwrap().clone();
-    eprintln!("--- {name} ---");
+    match clip {
+        Some(seconds) => eprintln!("--- {name} (first {seconds}s), silence {t_end:?} ---"),
+        None => eprintln!("--- {name}, silence {t_end:?} ---"),
+    }
     for (at, observed) in &timeline {
         eprintln!("{:>7.3}s {observed:?}", at.as_secs_f64());
     }
@@ -345,9 +376,93 @@ fn fired(timeline: &[(Duration, Observed)]) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(feature = "pure_tests", ignore)]
+async fn recorded_half_spoken_phrase_must_not_fire_the_whole_command() {
+    // The second field report: a phrase abandoned after its first word.
+    // "auto cannon.wav" says "auto" from 0.45s to 0.85s and "cannon" from
+    // 0.88s to 1.28s, so clipping at 0.85s is a speaker who said "auto" and
+    // stopped — exactly `"air burst"` heard as only "air".
+    //
+    // Nothing was spoken which completes a command, and the recognizer agrees:
+    // its `Final` reads "auto". But its *partial* hypothesis completes the
+    // grammar phrase from the trailing silence — the phrase-list language
+    // model makes "cannon" overwhelmingly likely after "auto" — and holds it
+    // perfectly still until the `Final`, so no amount of settling catches it.
+    // What keeps the keys up is that the `Final` gets there first: see
+    // `recorded_completion_timeout_clears_the_finalization_lag`.
+    let timeline = run_clipped("auto cannon.wav", Some(0.85)).await;
+
+    assert_eq!(
+        fired(&timeline),
+        Vec::<String>::new(),
+        "a phrase the speaker never completed must not press keys: {timeline:?}"
+    );
+
+    // And the recognizer's own account of it is the one thing that had to
+    // arrive in time.
+    assert_eq!(
+        timeline
+            .iter()
+            .filter_map(|(_, observed)| match observed {
+                Observed::Final(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["auto"],
+        "the recognizer should settle on what was actually said: {timeline:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(feature = "pure_tests", ignore)]
+async fn recorded_completion_timeout_clears_the_finalization_lag() {
+    // The invariant the whole eager path now rests on, measured rather than
+    // assumed.
+    //
+    // An ambiguous resting match fires `completion_timeout` after the partial
+    // it rests on. That partial may be a phrase the speaker never finished —
+    // the decoder completes grammar phrases out of trailing silence — and the
+    // only thing which ever contradicts it is the `Final`. So the wait has to
+    // outlast the endpointer, or the keys go down first.
+    //
+    // Shortening `recognition.silence` does *not* reliably buy that margin:
+    // `set_endpointer_delays` drives several rules keyed on decode
+    // confidence, and a half-spoken phrase decodes with low confidence by
+    // construction. Measured here across the shipped value and a much shorter
+    // one, on both a completed phrase and an abandoned one.
+    let completion = crate::config::RecognitionConfig::default().completion_timeout;
+
+    for silence in [
+        Duration::from_millis(50),
+        RecognizerOptions::default().silence,
+    ] {
+        for (label, clip) in [("abandoned", Some(0.85)), ("completed", None)] {
+            let timeline = run_full("auto cannon.wav", clip, silence, completion).await;
+
+            let final_at = first(&timeline, |o| matches!(o, Observed::Final(_)))
+                .expect("the utterance should finalize");
+            let partial_at = timeline
+                .iter()
+                .rfind(|(at, o)| matches!(o, Observed::Partial(_)) && *at < final_at)
+                .map(|(at, _)| *at)
+                .expect("a partial should precede the Final");
+            let lag = final_at - partial_at;
+
+            assert!(
+                lag < completion,
+                "the {label} phrase finalized {lag:?} after its last partial, which the \
+                 {completion:?} completion timeout does not clear (silence {silence:?}) — an \
+                 abandoned phrase would press keys before the recognizer could take it back: \
+                 {timeline:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(feature = "pure_tests", ignore)]
 async fn recorded_unambiguous_phrase_fires_before_its_final() {
     // The field question itself: "auto cannon sentry" rests on an accept
-    // nothing can extend, so the eager path owes a fire `eager_delay` after
+    // nothing can extend, so the eager path owes a fire `debounce` after
     // the hypothesis stabilizes — *before* the endpointer's Final — and any
     // ~500ms the user perceives after that is presentation, not matching.
     let timeline = run_recording("auto cannon sentry.wav").await;
@@ -377,12 +492,17 @@ async fn recorded_unambiguous_phrase_fires_before_its_final() {
 #[cfg_attr(feature = "pure_tests", ignore)]
 async fn recorded_ambiguous_prefix_waits_out_the_completion_timeout() {
     // The control: "auto cannon" rests on the ambiguous accept, so the short
-    // command may only fire once the completion timeout elapses. Measured on
-    // this recording, the timeout — armed the moment the partial rests on
-    // "auto cannon", which is the eager path's whole latency win — elapses
-    // *before* the endpointer's Final even lands (the fire at the resting
-    // partial + 500ms, the Final ~700ms after that same partial), so the
-    // assertion is against the arming partial, not the Final.
+    // command may only fire once the completion timeout elapses. The timeout
+    // is armed the moment the partial rests on "auto cannon" — starting it at
+    // the partial rather than at finalization is the eager path's latency win
+    // here — so the wait is measured from that partial, not from the Final.
+    //
+    // Under the shipped `completion_timeout` the wait deliberately outlasts
+    // the endpointer: the `Final` lands first and *confirms* the hypothesis
+    // before the keys go down. That ordering is not incidental — it is the
+    // whole reason a half-spoken phrase (see
+    // `recorded_half_spoken_phrase_must_not_fire_the_whole_command`) gets
+    // retracted instead of pressed — so it is pinned here.
     let timeline = run_recording("auto cannon.wav").await;
 
     assert_eq!(
@@ -391,9 +511,7 @@ async fn recorded_ambiguous_prefix_waits_out_the_completion_timeout() {
         "exactly the short command fires: {timeline:?}"
     );
 
-    // The wait really is the completion timeout from the resting hypothesis:
-    // no shortcut under it, and no stall much past it (the slack covers
-    // scheduling and the 100ms frame cadence).
+    let completion = crate::config::RecognitionConfig::default().completion_timeout;
     let fire = first(&timeline, |o| matches!(o, Observed::Fired(..))).unwrap();
     let armed = timeline
         .iter()
@@ -404,25 +522,20 @@ async fn recorded_ambiguous_prefix_waits_out_the_completion_timeout() {
         .expect("a partial should have armed the timeout");
     let wait = fire - armed;
     assert!(
-        wait >= Duration::from_millis(500),
+        wait >= completion,
         "the ambiguous accept must wait out the completion timeout: waited only {wait:?}: {timeline:?}"
     );
     assert!(
-        wait < Duration::from_millis(1000),
+        wait < completion + Duration::from_millis(500),
         "the fire should come from the armed timeout, not a stall: waited {wait:?}: {timeline:?}"
     );
 
-    // The Final then merely confirms the choice already made: nothing else
-    // fires after it.
+    // The endpointer gets there first, and the fire is the confirmed one.
     let final_at = first(&timeline, |o| matches!(o, Observed::Final(_)))
         .expect("the utterance should finalize");
-    assert_eq!(
-        timeline
-            .iter()
-            .filter(|(at, o)| matches!(o, Observed::Fired(..)) && *at > final_at)
-            .count(),
-        0,
-        "the Final must not fire anything further: {timeline:?}"
+    assert!(
+        final_at < fire,
+        "the Final must land before the ambiguous fire, so the hypothesis is confirmed before any key goes down ({final_at:?} vs {fire:?}): {timeline:?}"
     );
 
     let warnings: Vec<_> = timeline

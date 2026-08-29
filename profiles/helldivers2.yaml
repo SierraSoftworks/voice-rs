@@ -26,15 +26,14 @@ hotkey:
   key: leftctrl
   mode: push-to-talk
 
-completion_timeout: 500ms
-
 defaults:
   duration: 30ms
   interval: 30ms
 
 recognition:
   eager: true
-  eager_delay: 50ms
+  debounce: 50ms
+  completion_timeout: 750ms
 
 grammar: |
   // ── Mission stratagems: ship ──────────────────────────────────────────

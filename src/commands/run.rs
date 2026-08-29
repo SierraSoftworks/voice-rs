@@ -2384,7 +2384,7 @@ mod tests {
         let matcher = tokio::spawn(engine_task(
             automaton,
             profile.defaults,
-            MatcherOptions::with_timeout(profile.completion_timeout),
+            MatcherOptions::with_timeout(profile.recognition.completion_timeout),
             events_rx,
             queue_tx,
             cancel.clone(),
@@ -2490,7 +2490,7 @@ mod tests {
         let matcher = tokio::spawn(engine_task(
             automaton,
             profile.defaults,
-            MatcherOptions::with_timeout(profile.completion_timeout),
+            MatcherOptions::with_timeout(profile.recognition.completion_timeout),
             events_rx,
             queue_tx,
             cancel.clone(),
@@ -2549,7 +2549,7 @@ mod tests {
     /// The eager-latency claim, end to end against the real recognizer: with
     /// eager on and **no trailing silence ever fed**, commands fire from
     /// stable partials alone — no `Final` is ever produced — and the last
-    /// command lands within `eager_delay` (plus generous scheduling slack) of
+    /// command lands within `debounce` (plus generous scheduling slack) of
     /// the last partial hypothesis.
     ///
     /// Real time rather than paused time: the recognizer decodes on its own
@@ -2619,7 +2619,7 @@ mod tests {
             }
         });
 
-        const EAGER_DELAY: Duration = Duration::from_millis(150);
+        const DEBOUNCE: Duration = Duration::from_millis(150);
         let cancel = CancellationToken::new();
         let (queue_tx, mut queue_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let matcher = tokio::spawn(engine_task(
@@ -2627,7 +2627,7 @@ mod tests {
             crate::config::OutputDefaults::default(),
             crate::matcher::MatcherOptions {
                 eager: true,
-                eager_delay: EAGER_DELAY,
+                debounce: DEBOUNCE,
                 ..MatcherOptions::with_timeout(Duration::from_millis(300))
             },
             matcher_rx,
@@ -2684,7 +2684,7 @@ mod tests {
             "no Final may be involved in an eager fire: {events:?}"
         );
 
-        // The latency claim: the last command fired within eager_delay (plus
+        // The latency claim: the last command fired within debounce (plus
         // generous real-time slack for CI) of the partial which armed it —
         // i.e. of the last partial at or before the fire.
         let (last_fire_at, _) = fired.last().expect("checked non-empty above");
@@ -2696,8 +2696,8 @@ mod tests {
             .expect("a partial must precede an eager fire");
         let elapsed = last_fire_at.saturating_duration_since(armed_at);
         assert!(
-            elapsed <= EAGER_DELAY + Duration::from_millis(1_500),
-            "the eager fire should land within eager_delay of the stable partial, took {elapsed:?}"
+            elapsed <= DEBOUNCE + Duration::from_millis(1_500),
+            "the eager fire should land within debounce of the settled partial, took {elapsed:?}"
         );
 
         // Shutdown in the pipeline's order.
