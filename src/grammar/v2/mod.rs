@@ -17,6 +17,7 @@ mod analysis;
 mod ast;
 mod automaton;
 mod diagnostic;
+mod feed;
 mod lexer;
 mod parser;
 mod token;
@@ -32,6 +33,8 @@ pub use ast::{
 pub use automaton::{Accept, Automaton, MAX_AUTOMATON_STATES, MAX_HYPOTHESES, Walk};
 #[allow(unused_imports)] // consumed as the profile wiring (G6) lands
 pub use diagnostic::{Diagnostic, DiagnosticKind, user_error};
+#[allow(unused_imports)] // consumed as the profile wiring (G6) lands
+pub use feed::{Decomposition, Feed, MAX_EXPANSIONS_PER_RULE, feed};
 
 /// A parsed and analyzed grammar: the spanned rule list plus everything the
 /// automaton compiler and `validate` need to know about it.
