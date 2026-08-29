@@ -5,6 +5,7 @@
 // that lands nothing in the binary reaches them.
 #![allow(dead_code)]
 
+pub mod assembly;
 pub mod keys;
 
 // The virtual keyboard is `/dev/uinput` on Linux and `SendInput` on Windows.

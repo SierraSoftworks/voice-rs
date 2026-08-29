@@ -435,7 +435,7 @@ discards it.
 > table below, and the `commands:` profile schema — each superseded section is updated or removed
 > as the implementation lands (the work plan is at the end of this section). Grammar v2 is a
 > **breaking profile change**: the phrase DSL, `keys:`/`events:` forms and the `commands:` list are
-> removed rather than maintained alongside it. `profiles/arma.yaml` is the canonical example and
+> removed rather than maintained alongside it. `profiles/arma3.yaml` is the canonical example and
 > must load once the engine lands.
 
 The phrase DSL describes single phrases; it cannot share structure between commands. Articulate-
@@ -600,7 +600,7 @@ grammar; `validate` runs the static analysis above plus vocabulary checks.
 
 | # | Branch | Contents | Depends on |
 |---|---|---|---|
-| G1 | `grammar-v2-design` | This design section; `profiles/arma.yaml`. | — |
+| G1 | `grammar-v2-design` | This design section; `profiles/arma3.yaml`. | — |
 | G2 | `grammar-v2-core` | `src/grammar/v2/`: token/lexer/parser/AST/diagnostics (chumsky + ariadne), static analysis, rule-graph word set. | — |
 | G3 | `grammar-v2-output` | `KeyEvent::ReleaseAll` + executor handling; assembly pacing helper (flatten + duration/interval/wait rules). | — |
 | G4 | `grammar-v2-automaton` | NFA transducer compiler, accepting-state action programs, expansion/decomposition for the Vosk feed, automaton-level duplicate detection. | G2 |

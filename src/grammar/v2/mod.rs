@@ -15,20 +15,26 @@
 
 mod analysis;
 mod ast;
+mod automaton;
 mod diagnostic;
+mod feed;
 mod lexer;
 mod parser;
 mod token;
 
 use std::collections::BTreeSet;
 
-#[allow(unused_imports)] // consumed as the automaton compiler (G4) lands
+#[allow(unused_imports)] // the remainder is consumed as the profile wiring (G6) lands
 pub use ast::{
     Action, ActionBlock, ActionKind, Alternation, Atom, Branch, Capture, Chord, ChordSegment,
     MAX_REPETITION, Repeat, Rule, Span, Term,
 };
+#[allow(unused_imports)] // consumed as the matcher (G5) lands
+pub use automaton::{Accept, Automaton, MAX_AUTOMATON_STATES, MAX_HYPOTHESES, Walk};
 #[allow(unused_imports)] // consumed as the profile wiring (G6) lands
 pub use diagnostic::{Diagnostic, DiagnosticKind, user_error};
+#[allow(unused_imports)] // consumed as the profile wiring (G6) lands
+pub use feed::{Decomposition, Feed, MAX_EXPANSIONS_PER_RULE, feed};
 
 /// A parsed and analyzed grammar: the spanned rule list plus everything the
 /// automaton compiler and `validate` need to know about it.
@@ -131,21 +137,27 @@ impl Grammar {
     }
 }
 
+/// Shared test fixtures: the canonical Arma profile's grammar, used by the
+/// parser, automaton and feed test suites alike.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
+pub(crate) mod fixtures {
     /// The `grammar:` block of the canonical Arma profile.
-    fn arma_grammar() -> String {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma.yaml");
-        let raw = std::fs::read_to_string(path).expect("profiles/arma.yaml should be readable");
+    pub fn arma_source() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma3.yaml");
+        let raw = std::fs::read_to_string(path).expect("profiles/arma3.yaml should be readable");
         let profile: serde_yaml::Value =
-            serde_yaml::from_str(&raw).expect("profiles/arma.yaml should be valid YAML");
+            serde_yaml::from_str(&raw).expect("profiles/arma3.yaml should be valid YAML");
         profile["grammar"]
             .as_str()
-            .expect("profiles/arma.yaml should carry an inline grammar block")
+            .expect("profiles/arma3.yaml should carry an inline grammar block")
             .to_owned()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::arma_source as arma_grammar;
+    use super::*;
 
     /// The canonical profile must stay honest: it parses and analyzes with no
     /// errors and no lint warnings.
@@ -154,7 +166,7 @@ mod tests {
         let source = arma_grammar();
         let grammar = Grammar::parse(&source).unwrap_or_else(|diagnostics| {
             panic!(
-                "profiles/arma.yaml should parse cleanly:\n{}",
+                "profiles/arma3.yaml should parse cleanly:\n{}",
                 diagnostics
                     .iter()
                     .map(|diagnostic| diagnostic.render(&source))
@@ -165,7 +177,7 @@ mod tests {
 
         assert!(
             grammar.lints().is_empty(),
-            "profiles/arma.yaml should be lint-free:\n{}",
+            "profiles/arma3.yaml should be lint-free:\n{}",
             grammar
                 .lints()
                 .iter()
