@@ -10,7 +10,12 @@ pub mod keys;
 // The virtual keyboard is `/dev/uinput` on Linux and `SendInput` on Windows.
 // Both are the same shape — a [`KeySink`] with an async `new()` — so the `run`
 // assembly names [`PlatformSink`] and never learns which one it got.
-#[cfg(not(target_os = "linux"))]
+//
+// `sendinput` is compiled everywhere on purpose. The half of it which turns a
+// key into a `SendInput` record is pure arithmetic over the key table, and a
+// table only Windows could see would be a table only Windows could test
+// (`keys::to_windows` is compiled everywhere for the same reason); only the sink
+// itself and the syscall it wraps are `cfg(windows)`.
 pub mod sendinput;
 #[cfg(target_os = "linux")]
 pub mod uinput;
