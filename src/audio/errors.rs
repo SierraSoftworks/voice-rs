@@ -69,6 +69,14 @@ impl HumanizableError for cpal::Error {
                 "We could not reach your system's sound server.",
                 BACKEND_ADVICE,
             ),
+            ErrorKind::Xrun => human_errors::wrap_user(
+                self,
+                "Your system could not keep up with the audio coming from your microphone, so some of it was lost.",
+                &[
+                    "Close other applications which are using a lot of CPU and try again.",
+                    "If this happens often, ask your sound server for a larger buffer (on PipeWire, raise its quantum).",
+                ],
+            ),
             _ => human_errors::wrap_system(
                 self,
                 "Your microphone's audio backend reported an unexpected error.",
@@ -91,6 +99,7 @@ mod tests {
     #[case::permission_denied(ErrorKind::PermissionDenied, Kind::User)]
     #[case::unsupported_config(ErrorKind::UnsupportedConfig, Kind::User)]
     #[case::host_unavailable(ErrorKind::HostUnavailable, Kind::User)]
+    #[case::xrun(ErrorKind::Xrun, Kind::User)]
     #[case::backend_error(ErrorKind::BackendError, Kind::System)]
     #[case::other(ErrorKind::Other, Kind::System)]
     #[case::invalid_input(ErrorKind::InvalidInput, Kind::System)]
