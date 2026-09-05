@@ -1,14 +1,19 @@
-//! `HumanizableError` implementations for cpal's error types.
+//! `HumanizableError` implementation for cpal's error type.
 //!
-//! These live here rather than in `src/errors.rs` because the audio module is
+//! This lives here rather than in `src/errors.rs` because the audio module is
 //! the only thing in the crate which ever sees a cpal error — see the note at
 //! the top of that file.
 //!
-//! The split between `User` and `System` follows the github-backup convention:
-//! anything the person running the tool can fix (an unplugged microphone, a
-//! device another application has grabbed exclusively, a profile pointing at a
-//! device that cannot do what we need) is a user error; anything that means
-//! cpal or the sound server is behaving unexpectedly is a system error.
+//! cpal reports every failure through a single [`cpal::Error`] whose
+//! [`kind()`](cpal::Error::kind) says what went wrong, so classification is
+//! by kind rather than by which operation was attempted. The split between
+//! `User` and `System` follows the github-backup convention: anything the
+//! person running the tool can fix (an unplugged microphone, a device another
+//! application has grabbed exclusively, a profile pointing at a device that
+//! cannot do what we need) is a user error; anything that means cpal or the
+//! sound server is behaving unexpectedly is a system error.
+
+use cpal::ErrorKind;
 
 use crate::errors::HumanizableError;
 
@@ -24,138 +29,57 @@ const BACKEND_ADVICE: &[&str] = &[
     "Please report this issue on GitHub if your microphone works in other applications.",
 ];
 
-impl HumanizableError for cpal::DevicesError {
+impl HumanizableError for cpal::Error {
     fn to_human_error(self) -> crate::Error {
-        human_errors::wrap_system(
-            self,
-            "We could not ask your system which audio devices are available.",
-            BACKEND_ADVICE,
-        )
-    }
-}
-
-impl HumanizableError for cpal::DeviceNameError {
-    fn to_human_error(self) -> crate::Error {
-        human_errors::wrap_system(
-            self,
-            "We could not read the name of one of your audio devices.",
-            BACKEND_ADVICE,
-        )
-    }
-}
-
-impl HumanizableError for cpal::SupportedStreamConfigsError {
-    fn to_human_error(self) -> crate::Error {
-        match self {
-            cpal::SupportedStreamConfigsError::DeviceNotAvailable => human_errors::wrap_user(
+        match self.kind() {
+            ErrorKind::DeviceNotAvailable | ErrorKind::StreamInvalidated => {
+                human_errors::wrap_user(
+                    self,
+                    "The microphone we selected is no longer available.",
+                    DEVICE_UNAVAILABLE_ADVICE,
+                )
+            }
+            ErrorKind::DeviceBusy => human_errors::wrap_user(
                 self,
-                "The microphone we selected is no longer available.",
-                DEVICE_UNAVAILABLE_ADVICE,
+                "Another application is using the microphone we selected.",
+                &[
+                    "Close the application which is using the microphone and try again.",
+                    "Set audio.device in your profile to a different microphone.",
+                ],
             ),
-            _ => human_errors::wrap_system(
+            ErrorKind::PermissionDenied => human_errors::wrap_user(
                 self,
-                "We could not work out which audio formats your microphone supports.",
-                BACKEND_ADVICE,
+                "Your system refused to let us use the microphone we selected.",
+                &[
+                    "Make sure your user is allowed to use audio devices (on Linux this usually means membership of the 'audio' group).",
+                    "Check your desktop's privacy settings to make sure microphone access is allowed.",
+                ],
             ),
-        }
-    }
-}
-
-impl HumanizableError for cpal::DefaultStreamConfigError {
-    fn to_human_error(self) -> crate::Error {
-        match self {
-            cpal::DefaultStreamConfigError::DeviceNotAvailable => human_errors::wrap_user(
+            ErrorKind::UnsupportedConfig => human_errors::wrap_user(
                 self,
-                "The microphone we selected is no longer available.",
-                DEVICE_UNAVAILABLE_ADVICE,
-            ),
-            cpal::DefaultStreamConfigError::StreamTypeNotSupported => human_errors::wrap_user(
-                self,
-                "The device we selected does not support recording audio.",
+                "The device we selected cannot record audio in the format we asked it for.",
                 &[
                     "Set audio.device in your profile to part of the name of a microphone rather than a speaker.",
                     "Set audio.device to 'default' to use your system's default microphone.",
-                ],
-            ),
-            _ => human_errors::wrap_system(
-                self,
-                "We could not work out the default audio format for your microphone.",
-                BACKEND_ADVICE,
-            ),
-        }
-    }
-}
-
-impl HumanizableError for cpal::BuildStreamError {
-    fn to_human_error(self) -> crate::Error {
-        match self {
-            cpal::BuildStreamError::DeviceNotAvailable => human_errors::wrap_user(
-                self,
-                "The microphone we selected disappeared before we could start listening to it.",
-                DEVICE_UNAVAILABLE_ADVICE,
-            ),
-            cpal::BuildStreamError::StreamConfigNotSupported => human_errors::wrap_user(
-                self,
-                "Your microphone rejected the recording format we asked it for.",
-                &[
-                    "Set audio.device in your profile to a different microphone.",
                     "If the device is used exclusively by another application, close that application and try again.",
                 ],
             ),
-            _ => human_errors::wrap_system(
+            ErrorKind::HostUnavailable => human_errors::wrap_user(
                 self,
-                "We could not open an audio input stream on your microphone.",
+                "We could not reach your system's sound server.",
                 BACKEND_ADVICE,
             ),
-        }
-    }
-}
-
-impl HumanizableError for cpal::PlayStreamError {
-    fn to_human_error(self) -> crate::Error {
-        match self {
-            cpal::PlayStreamError::DeviceNotAvailable => human_errors::wrap_user(
+            ErrorKind::Xrun => human_errors::wrap_user(
                 self,
-                "The microphone we selected disappeared before we could start listening to it.",
-                DEVICE_UNAVAILABLE_ADVICE,
+                "Your system could not keep up with the audio coming from your microphone, so some of it was lost.",
+                &[
+                    "Close other applications which are using a lot of CPU and try again.",
+                    "If this happens often, ask your sound server for a larger buffer (on PipeWire, raise its quantum).",
+                ],
             ),
             _ => human_errors::wrap_system(
                 self,
-                "We could not start recording from your microphone.",
-                BACKEND_ADVICE,
-            ),
-        }
-    }
-}
-
-impl HumanizableError for cpal::PauseStreamError {
-    fn to_human_error(self) -> crate::Error {
-        match self {
-            cpal::PauseStreamError::DeviceNotAvailable => human_errors::wrap_user(
-                self,
-                "The microphone we were recording from is no longer available.",
-                DEVICE_UNAVAILABLE_ADVICE,
-            ),
-            _ => human_errors::wrap_system(
-                self,
-                "We could not pause the recording from your microphone.",
-                BACKEND_ADVICE,
-            ),
-        }
-    }
-}
-
-impl HumanizableError for cpal::StreamError {
-    fn to_human_error(self) -> crate::Error {
-        match self {
-            cpal::StreamError::DeviceNotAvailable => human_errors::wrap_user(
-                self,
-                "The microphone we were recording from was disconnected.",
-                DEVICE_UNAVAILABLE_ADVICE,
-            ),
-            _ => human_errors::wrap_system(
-                self,
-                "The audio input stream failed while we were recording.",
+                "Your microphone's audio backend reported an unexpected error.",
                 BACKEND_ADVICE,
             ),
         }
@@ -166,96 +90,40 @@ impl HumanizableError for cpal::StreamError {
 mod tests {
     use super::*;
     use human_errors::Kind;
+    use rstest::rstest;
 
-    fn backend_error() -> cpal::BackendSpecificError {
-        cpal::BackendSpecificError {
-            description: "the sound server exploded".to_string(),
-        }
+    #[rstest]
+    #[case::device_not_available(ErrorKind::DeviceNotAvailable, Kind::User)]
+    #[case::stream_invalidated(ErrorKind::StreamInvalidated, Kind::User)]
+    #[case::device_busy(ErrorKind::DeviceBusy, Kind::User)]
+    #[case::permission_denied(ErrorKind::PermissionDenied, Kind::User)]
+    #[case::unsupported_config(ErrorKind::UnsupportedConfig, Kind::User)]
+    #[case::host_unavailable(ErrorKind::HostUnavailable, Kind::User)]
+    #[case::xrun(ErrorKind::Xrun, Kind::User)]
+    #[case::backend_error(ErrorKind::BackendError, Kind::System)]
+    #[case::other(ErrorKind::Other, Kind::System)]
+    #[case::invalid_input(ErrorKind::InvalidInput, Kind::System)]
+    fn errors_are_classified_by_kind(#[case] kind: ErrorKind, #[case] expected: Kind) {
+        let err = cpal::Error::new(kind).to_human_error();
+        let message = format!("{kind:?} should be a {expected:?} error");
+        assert!(err.is(expected), "{message}");
+        assert!(!err.advice().is_empty());
     }
 
     #[test]
-    fn a_missing_device_is_a_user_error() {
-        let err = cpal::BuildStreamError::DeviceNotAvailable.to_human_error();
-        assert!(err.is(Kind::User));
+    fn a_missing_device_talks_about_the_microphone() {
+        let err = cpal::Error::new(ErrorKind::DeviceNotAvailable).to_human_error();
         assert!(err.description().contains("microphone"));
-        assert!(!err.advice().is_empty());
     }
 
     #[test]
-    fn an_unsupported_config_is_a_user_error() {
-        let err = cpal::BuildStreamError::StreamConfigNotSupported.to_human_error();
-        assert!(err.is(Kind::User));
-        assert!(!err.advice().is_empty());
-    }
-
-    #[test]
-    fn a_backend_failure_is_a_system_error() {
-        let err = cpal::BuildStreamError::BackendSpecific {
-            err: backend_error(),
-        }
-        .to_human_error();
-        assert!(err.is(Kind::System));
+    fn the_backend_detail_survives_into_the_rendered_message() {
+        let err = cpal::Error::with_message(ErrorKind::BackendError, "the sound server exploded")
+            .to_human_error();
         assert!(
             err.message().contains("the sound server exploded"),
             "the underlying cpal detail must survive into the rendered message: {}",
             err.message()
-        );
-    }
-
-    #[test]
-    fn enumeration_failures_are_system_errors() {
-        let err = cpal::DevicesError::BackendSpecific {
-            err: backend_error(),
-        }
-        .to_human_error();
-        assert!(err.is(Kind::System));
-    }
-
-    #[test]
-    fn a_disconnected_stream_is_a_user_error() {
-        let err = cpal::StreamError::DeviceNotAvailable.to_human_error();
-        assert!(err.is(Kind::User));
-    }
-
-    #[test]
-    fn a_playback_device_cannot_be_recorded_from() {
-        let err = cpal::DefaultStreamConfigError::StreamTypeNotSupported.to_human_error();
-        assert!(err.is(Kind::User));
-        assert!(err.description().contains("recording"));
-    }
-
-    #[test]
-    fn config_enumeration_failures_are_classified_by_variant() {
-        assert!(
-            cpal::SupportedStreamConfigsError::DeviceNotAvailable
-                .to_human_error()
-                .is(Kind::User)
-        );
-        assert!(
-            cpal::SupportedStreamConfigsError::InvalidArgument
-                .to_human_error()
-                .is(Kind::System)
-        );
-    }
-
-    #[test]
-    fn stream_control_failures_are_classified_by_variant() {
-        assert!(
-            cpal::PlayStreamError::DeviceNotAvailable
-                .to_human_error()
-                .is(Kind::User)
-        );
-        assert!(
-            cpal::PauseStreamError::DeviceNotAvailable
-                .to_human_error()
-                .is(Kind::User)
-        );
-        assert!(
-            cpal::DeviceNameError::BackendSpecific {
-                err: backend_error(),
-            }
-            .to_human_error()
-            .is(Kind::System)
         );
     }
 }

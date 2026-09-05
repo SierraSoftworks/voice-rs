@@ -114,7 +114,8 @@ pub fn list_input_devices(host: &cpal::Host) -> Result<Vec<InputDevice>, crate::
 /// worth aborting capture over.
 pub fn device_name(device: &cpal::Device) -> String {
     device
-        .name()
+        .description()
+        .map(|description| description.name().to_string())
         .unwrap_or_else(|_| "<unnamed device>".to_string())
 }
 
@@ -148,7 +149,7 @@ pub fn choose_input_config(
         .iter()
         .find(|range| is_exact_match(range, target_rate))
     {
-        return Ok(exact.with_sample_rate(cpal::SampleRate(target_rate)));
+        return Ok(exact.with_sample_rate(target_rate));
     }
 
     let nearest = ranges
@@ -157,7 +158,7 @@ pub fn choose_input_config(
         .min_by_key(|range| rank(range, target_rate));
 
     if let Some(range) = nearest {
-        let rate = cpal::SampleRate(achievable_rate(range, target_rate));
+        let rate = achievable_rate(range, target_rate);
 
         if let Some(config) = range.try_with_sample_rate(rate) {
             return Ok(config);
@@ -194,14 +195,14 @@ pub fn choose_input_config(
 fn is_exact_match(range: &cpal::SupportedStreamConfigRange, target_rate: u32) -> bool {
     range.channels() == 1
         && range.sample_format() == cpal::SampleFormat::I16
-        && range.min_sample_rate().0 <= target_rate
-        && range.max_sample_rate().0 >= target_rate
+        && range.min_sample_rate() <= target_rate
+        && range.max_sample_rate() >= target_rate
 }
 
 /// The rate this range can run at which is closest to the target.
 fn achievable_rate(range: &cpal::SupportedStreamConfigRange, target_rate: u32) -> u32 {
-    let min = range.min_sample_rate().0;
-    let max = range.max_sample_rate().0;
+    let min = range.min_sample_rate();
+    let max = range.max_sample_rate();
 
     if target_rate < min {
         min
@@ -247,7 +248,7 @@ fn format_rank(format: cpal::SampleFormat) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cpal::{SampleFormat, SampleRate, SupportedBufferSize, SupportedStreamConfigRange};
+    use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
     use rstest::rstest;
 
     fn range(
@@ -256,13 +257,7 @@ mod tests {
         max: u32,
         format: SampleFormat,
     ) -> SupportedStreamConfigRange {
-        SupportedStreamConfigRange::new(
-            channels,
-            SampleRate(min),
-            SampleRate(max),
-            SupportedBufferSize::Unknown,
-            format,
-        )
+        SupportedStreamConfigRange::new(channels, min, max, SupportedBufferSize::Unknown, format)
     }
 
     #[test]
@@ -382,7 +377,7 @@ mod tests {
 
             assert!(format_rank(config.sample_format()).is_some());
             assert!(config.channels() >= 1);
-            assert!(config.sample_rate().0 > 0);
+            assert!(config.sample_rate() > 0);
         }
     }
 }

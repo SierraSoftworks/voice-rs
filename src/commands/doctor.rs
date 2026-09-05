@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::HostTrait;
 use tracing_batteries::prelude::*;
 
 use crate::audio;
@@ -738,7 +738,7 @@ fn check_audio_input(hint: &str) -> CheckResult {
     match audio::select_input_device(&host, hint) {
         Ok(device) => CheckResult::ok(format!(
             "The microphone we would listen on is '{}' (from audio.device: {hint}; {total}).",
-            device.name().unwrap_or_else(|_| "<unnamed device>".into())
+            audio::device_name(&device)
         )),
         Err(e) => {
             let mut result = CheckResult::from_error(&e);
