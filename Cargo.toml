@@ -10,7 +10,7 @@ repository = "https://github.com/SierraSoftworks/voice-rs"
 ariadne = "0.6"
 chumsky = "0.13"
 clap = { version = "4.6", features = ["derive"] }
-cpal = "0.16"
+cpal = "0.18"
 human-errors = { version = "0.2.3", features = ["pretty"] }
 humantime = "2.1"
 libloading = "0.9"

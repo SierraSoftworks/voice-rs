@@ -34,7 +34,7 @@ use std::sync::{
 // The device layer is otherwise an implementation detail of capture, but
 // `voice-orders devices` lists exactly what it selects from, and `doctor`
 // checks the selection itself.
-pub use device::{InputDevice, list_input_devices, select_input_device};
+pub use device::{InputDevice, device_name, list_input_devices, select_input_device};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use tracing_batteries::prelude::*;
@@ -168,7 +168,7 @@ pub fn start_capture(
 
     let supported = device::choose_input_config(&device, target_rate)?;
     let input_format = supported.sample_format();
-    let input_rate = supported.sample_rate().0;
+    let input_rate = supported.sample_rate();
     let input_channels = supported.channels();
     let config = supported.config();
 
@@ -200,9 +200,9 @@ pub fn start_capture(
     );
 
     let stream = match input_format {
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, pipeline, listening),
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, pipeline, listening),
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, pipeline, listening),
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, config, pipeline, listening),
+        cpal::SampleFormat::F32 => build_stream::<f32>(&device, config, pipeline, listening),
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, config, pipeline, listening),
         other => Err(human_errors::system(
             format!(
                 "We selected an audio format ({other}) which we do not know how to convert to the 16-bit mono audio the speech model needs."
@@ -226,7 +226,7 @@ pub fn start_capture(
 /// Builds the input stream for a concrete sample type.
 fn build_stream<T>(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: cpal::StreamConfig,
     mut pipeline: CapturePipeline,
     listening: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, crate::Error>
