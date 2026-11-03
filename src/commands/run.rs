@@ -1788,7 +1788,7 @@ mod tests {
         // The hotkey a shared profile never mentions still decides what
         // happens to the command in flight, because the merged settings are
         // the only thing the pipeline ever looks at.
-        let system: crate::config::SystemConfig = serde_yaml::from_str(
+        let system: crate::config::SystemConfig = serde_norway::from_str(
             "hotkey:\n  key: rightctrl\n  mode: push-to-talk\n  interrupt: true\n",
         )
         .expect("the system configuration should load");

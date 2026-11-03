@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_unknown_key_fails_deserialization_with_the_hint() {
-        let error = serde_yaml::from_str::<KeyName>("leftctlr")
+        let error = serde_norway::from_str::<KeyName>("leftctlr")
             .expect_err("an unknown key name should be rejected");
         assert!(
             error.to_string().contains("Did you mean 'leftctrl'?"),
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_key_name_round_trips() {
-        let name: KeyName = serde_yaml::from_str("rightctrl").expect("the key should resolve");
+        let name: KeyName = serde_norway::from_str("rightctrl").expect("the key should resolve");
         assert_eq!(name.code(), key("rightctrl"));
         assert_eq!(name.to_string(), "rightctrl");
     }
@@ -159,7 +159,7 @@ mod tests {
 
         // A partial block keeps the defaults for whatever it omits.
         let defaults: OutputDefaults =
-            serde_yaml::from_str("duration: 50ms\n").expect("the defaults should load");
+            serde_norway::from_str("duration: 50ms\n").expect("the defaults should load");
         assert_eq!(
             defaults,
             OutputDefaults {
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_output_defaults_rejects_unknown_fields() {
-        let error = serde_yaml::from_str::<OutputDefaults>("durration: 50ms\n")
+        let error = serde_norway::from_str::<OutputDefaults>("durration: 50ms\n")
             .expect_err("a typo should be caught");
         let message = error.to_string();
         assert!(

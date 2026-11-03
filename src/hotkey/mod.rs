@@ -223,13 +223,13 @@ mod tests {
     #[case("push-to-mute", ListenMode::PushToMute)]
     fn test_deserialize_mode(#[case] yaml: &str, #[case] expected: ListenMode) {
         let mode: ListenMode =
-            serde_yaml::from_str(yaml).expect("the mode should have deserialized");
+            serde_norway::from_str(yaml).expect("the mode should have deserialized");
         assert_eq!(mode, expected);
     }
 
     #[test]
     fn test_deserialize_unknown_mode() {
-        let err = serde_yaml::from_str::<ListenMode>("hold-to-yell")
+        let err = serde_norway::from_str::<ListenMode>("hold-to-yell")
             .expect_err("an unknown mode should not deserialize");
         let message = err.to_string();
         assert!(

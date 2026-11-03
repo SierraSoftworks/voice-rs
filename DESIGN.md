@@ -143,7 +143,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal", "fs"] }
 tokio-util = "0.7"                    # CancellationToken
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_norway = "0.9"                  # maintained serde_yaml fork (RUSTSEC-2024-0449)
 human-errors = { version = "0.2", features = ["pretty"] }
 humantime = "2"
 serde_json = "1"                      # libvosk's result envelopes

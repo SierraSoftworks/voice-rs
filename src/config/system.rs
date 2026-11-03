@@ -220,7 +220,7 @@ impl SystemConfig {
             }
         };
 
-        let mut config: Self = serde_yaml::from_str(&content).map_err(|e| {
+        let mut config: Self = serde_norway::from_str(&content).map_err(|e| {
             human_errors::wrap_user(
                 e,
                 format!(

@@ -129,7 +129,7 @@ mod tests {
     use crate::output::keys;
 
     fn config(yaml: &str) -> HotkeyConfig {
-        serde_yaml::from_str(yaml).expect("the hotkey should load")
+        serde_norway::from_str(yaml).expect("the hotkey should load")
     }
 
     #[test]
@@ -164,8 +164,9 @@ mod tests {
 
     #[test]
     fn test_interrupt_must_be_a_boolean() {
-        let error = serde_yaml::from_str::<HotkeyConfig>("key: rightctrl\ninterrupt: yes please\n")
-            .expect_err("only a boolean makes sense here");
+        let error =
+            serde_norway::from_str::<HotkeyConfig>("key: rightctrl\ninterrupt: yes please\n")
+                .expect_err("only a boolean makes sense here");
         assert!(
             error.to_string().contains("interrupt"),
             "the error should name the field, got: {error}"
@@ -208,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_unknown_key_names_are_load_errors() {
-        let error = serde_yaml::from_str::<HotkeyConfig>("key: rightctlr\n")
+        let error = serde_norway::from_str::<HotkeyConfig>("key: rightctlr\n")
             .expect_err("an unknown key name should be rejected");
         assert!(
             error.to_string().contains("Did you mean 'rightctrl'?"),
@@ -218,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_unknown_modes_name_the_alternatives() {
-        let error = serde_yaml::from_str::<HotkeyConfig>("key: rightctrl\nmode: push_to_talk\n")
+        let error = serde_norway::from_str::<HotkeyConfig>("key: rightctrl\nmode: push_to_talk\n")
             .expect_err("modes are kebab-case");
         let message = error.to_string();
         assert!(
@@ -229,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_unknown_fields_are_rejected() {
-        let error = serde_yaml::from_str::<HotkeyConfig>("key: rightctrl\nmodee: toggle\n")
+        let error = serde_norway::from_str::<HotkeyConfig>("key: rightctrl\nmodee: toggle\n")
             .expect_err("a typo should be caught");
         let message = error.to_string();
         assert!(
