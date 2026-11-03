@@ -52,12 +52,13 @@ jobs:
           toolchain: stable
           components: clippy
 
-      # cpal's ALSA host needs the ALSA headers, and uinput-tokio pulls in
-      # libudev-sys, whose build script shells out to pkg-config for libudev.
+      # cpal's ALSA host needs the ALSA headers, which alsa-sys finds through
+      # pkg-config. The virtual keyboard talks to /dev/uinput through evdev's
+      # ioctls directly, so libudev is no longer needed.
       # libvosk is deliberately absent: it is dlopen'd at runtime rather than
       # linked, so nothing here needs it to compile.
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
       - name: cargo fmt
         run: cargo fmt --all --check
@@ -124,7 +125,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
       - name: Cache libvosk
         uses: actions/cache@v6
@@ -266,7 +267,7 @@ jobs:
 
       - name: Install build dependencies
         if: matrix.os == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
 
       - name: Cache libvosk
         uses: actions/cache@v6
