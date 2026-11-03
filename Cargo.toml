@@ -21,7 +21,7 @@ serde_json = "1.0"
 serde_yaml = "0.9.34"
 shellexpand = "3.1"
 strsim = "0.11"
-tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal", "fs"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal", "fs", "io-std", "io-util"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", features = ["opentelemetry"] }
@@ -30,7 +30,6 @@ update-rs = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = { version = "0.13", features = ["tokio"] }
 libc = "0.2"
-uinput-tokio = "0.1.36"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

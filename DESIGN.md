@@ -130,8 +130,8 @@ voice-orders/
     │   └── win.rs                 # WH_KEYBOARD_LL hook thread                  [windows]
     └── output/
         ├── mod.rs                 # executor task consuming the command queue
-        ├── keys.rs                # KeyCode + name/uinput/Windows table (macro-generated)
-        ├── uinput.rs              # uinput-tokio device wrapper                 [linux]
+        ├── keys.rs                # KeyCode + name/evdev/Windows table (macro-generated)
+        ├── uinput.rs              # evdev VirtualDevice wrapper                 [linux]
         └── sendinput.rs           # SendInput KeySink                           [windows]
 ```
 
@@ -148,8 +148,7 @@ human-errors = { version = "0.2", features = ["pretty"] }
 humantime = "2"
 serde_json = "1"                      # libvosk's result envelopes
 cpal = "0.16"
-evdev = { version = "0.13", features = ["tokio"] }
-uinput-tokio = "0.1"
+evdev = { version = "0.13", features = ["tokio"] }   # hotkey input *and* the uinput virtual keyboard
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs", features = ["opentelemetry"] }
 strsim = "0.11"                       # did-you-mean suggestions
@@ -174,8 +173,8 @@ Verified API facts this design relies on (`vosk` 0.3.1):
   mono; on `DecodingState::Finalized` read `result()`, otherwise `partial_result()`.
 - `Model::find_word(&mut self, word) -> Option<u32>` — vocabulary membership, the backbone of
   `validate`.
-- `evdev` 0.13 ships a Tokio `EventStream` behind the `tokio` feature; `uinput-tokio` 0.1.x provides
-  the async virtual-device builder and key events.
+- `evdev` 0.13 ships a Tokio `EventStream` behind the `tokio` feature, and its
+  `uinput::VirtualDevice` builder creates the virtual keyboard from an `AttributeSet<KeyCode>`.
 
 ## Runtime pipeline
 
@@ -847,12 +846,11 @@ Friendly key names are the lowercase evdev constant names with the `KEY_` prefix
 `kp1`, … One macro-generated table in `output/keys.rs` is the single source of truth:
 
 ```rust
-macro_rules! keys { ($($name:literal => $evdev:ident / $uinput:ident),* $(,)?) => { /* ... */ } }
+macro_rules! keys { ($($name:literal => $evdev:ident = $code:literal / $win:ident($scan:literal)),* $(,)?) => { /* ... */ } }
 
 pub struct KeyCode(u16);                            // raw evdev code
 pub fn from_name(name: &str) -> Option<KeyCode>;    // used by Deserialize
-pub fn to_uinput(code: KeyCode) -> uinput_tokio::event::keyboard::Key;
-pub fn to_evdev(code: KeyCode) -> evdev::KeyCode;   // hotkey matching
+pub fn to_evdev(code: KeyCode) -> evdev::KeyCode;   // hotkey matching + virtual keyboard
 pub fn all_names() -> &'static [&'static str];      // docs generation + suggestions
 ```
 
@@ -1519,8 +1517,8 @@ hardware, in a real game. Until they have been, the documentation calls the Wind
    recognition accuracy disappoints; the change is isolated to `audio/`.
 6. **Grammar scale** is bounded by the per-command cap; thousands-of-phrases profiles are out of
    scope for v1, as is runtime grammar switching.
-7. **`uinput-tokio` coverage** — verify its keyboard event enum covers the whole `keys.rs` table;
-   the wrapper isolates a raw-`EV_KEY` fallback if any name is missing.
+7. **Virtual keyboard coverage** — every `keys.rs` code is registered as an `EV_KEY` capability
+   on the `evdev` `VirtualDevice`; a unit test asserts the capability set covers the whole table.
 
 ## Implementation milestones
 

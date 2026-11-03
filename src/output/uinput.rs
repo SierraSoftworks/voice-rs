@@ -9,17 +9,19 @@
 //! which udev rule to write.
 
 use crate::Error;
-use crate::errors::HumanizableError;
 use crate::output::{KeyCode, KeySink, keys};
+use evdev::uinput::VirtualDevice;
+use evdev::{AttributeSet, BusType, EventType, InputEvent, InputId};
 use tracing_batteries::prelude::*;
-use uinput_tokio::event::keyboard::Keyboard as UKeyboard;
 
 /// The name the virtual keyboard reports to the kernel, and therefore the name
 /// SDL, libinput and games will see.
 pub const DEVICE_NAME: &str = "voice-orders";
 
-/// `EV_KEY`, borrowed from evdev so we do not hard-code the constant.
-const EV_KEY: libc::c_int = evdev::EventType::KEY.0 as libc::c_int;
+/// The longest device name the kernel accepts (`UINPUT_MAX_NAME_SIZE` is 80,
+/// including the terminating NUL). `evdev` asserts on longer names, so we turn
+/// that into an error before it gets the chance.
+const MAX_NAME_LEN: usize = 78;
 
 /// Advice attached to every failure to create the virtual keyboard.
 const CREATION_ADVICE: &[&str] = &[
@@ -47,30 +49,46 @@ fn creation_error(detail: impl std::fmt::Display) -> Error {
     )
 }
 
-impl HumanizableError for uinput_tokio::Error {
-    fn to_human_error(self) -> Error {
-        match self {
-            // `NotFound` means udev could not find the uinput device at all,
-            // which almost always means the kernel module is not loaded.
-            uinput_tokio::Error::NotFound => creation_error("the uinput device does not exist"),
-            other => creation_error(other),
-        }
+/// Humanizes a failure to open `/dev/uinput` itself.
+///
+/// A missing node almost always means the kernel module is not loaded; every
+/// other failure (most often `EACCES`) is carried through verbatim.
+fn open_error(error: std::io::Error) -> Error {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => creation_error("the uinput device does not exist"),
+        _ => creation_error(error),
     }
+}
+
+/// The capability set the virtual keyboard advertises: every key in [`keys`].
+///
+/// Registering every key we can ever emit (rather than only the ones a profile
+/// happens to use) is deliberate: SDL and several anti-cheat systems filter
+/// devices which do not look like real keyboards (DESIGN.md §Risks 4).
+fn key_capabilities() -> AttributeSet<evdev::KeyCode> {
+    keys::all_codes()
+        .iter()
+        .copied()
+        .map(keys::to_evdev)
+        .collect()
 }
 
 /// A [`KeySink`] backed by a `/dev/uinput` virtual keyboard.
 pub struct UinputSink {
-    device: uinput_tokio::Device,
+    device: VirtualDevice,
+    /// Key events written since the last [`KeySink::synchronize`].
+    ///
+    /// `evdev` only exposes a write which terminates its batch with a
+    /// `SYN_REPORT`, so events are held here and written as one batch when the
+    /// executor synchronizes. That keeps the event stream the kernel sees
+    /// identical to writing each event and then a separate `SYN_REPORT`: a
+    /// chord pressed before a synchronize still lands in a single report.
+    pending: Vec<InputEvent>,
 }
 
 impl UinputSink {
     /// Creates the virtual keyboard, registering the full key capability set
     /// from [`keys`].
-    ///
-    /// Registering every key we can ever emit (rather than only the ones a
-    /// profile happens to use) is deliberate: SDL and several anti-cheat
-    /// systems filter devices which do not look like real keyboards
-    /// (DESIGN.md §Risks 4).
     pub async fn new() -> Result<Self, Error> {
         Self::with_name(DEVICE_NAME).await
     }
@@ -78,42 +96,22 @@ impl UinputSink {
     /// Creates the virtual keyboard under a specific name. Tests use this to
     /// avoid colliding with a running instance.
     pub async fn with_name(name: &str) -> Result<Self, Error> {
-        let mut builder = open_builder()?
+        if name.len() > MAX_NAME_LEN {
+            return Err(creation_error(format!(
+                "the device name '{name}' is longer than the kernel's {MAX_NAME_LEN} byte limit"
+            )));
+        }
+
+        let capabilities = key_capabilities();
+
+        let device = VirtualDevice::builder()
+            .map_err(open_error)?
             .name(name)
-            .map_err(|e| e.to_human_error())?
             // Present as a USB keyboard; SDL is happier with a plausible bus.
-            .bus(0x03)
-            .vendor(0x1d6b)
-            .product(0x0001)
-            .version(1);
-
-        let mut unsupported = Vec::new();
-        for &code in keys::all_codes() {
-            match keys::to_uinput(code) {
-                Some(event) => {
-                    builder = builder.event(event).map_err(|e| {
-                        creation_error(format!("we could not register the '{code}' key: {e}"))
-                    })?;
-                }
-                // `uinput-tokio` does not model this key. We can still write
-                // its raw EV_KEY code, but we cannot advertise the capability,
-                // so the kernel will drop the events — worth a warning.
-                None => unsupported.push(code),
-            }
-        }
-
-        if !unsupported.is_empty() {
-            let names: Vec<String> = unsupported.iter().map(|c| c.to_string()).collect();
-            warn!(
-                keys = %names.join(", "),
-                "uinput-tokio has no event for {} key(s); they cannot be registered as capabilities.",
-                unsupported.len()
-            );
-        }
-
-        let device = builder
-            .create()
-            .await
+            .input_id(InputId::new(BusType::BUS_USB, 0x1d6b, 0x0001, 1))
+            .with_keys(&capabilities)
+            .map_err(|e| creation_error(format!("we could not register the keyboard's keys: {e}")))?
+            .build()
             .map_err(|e| creation_error(format!("the kernel rejected the device: {e}")))?;
 
         info!(
@@ -123,52 +121,26 @@ impl UinputSink {
             keys::all_codes().len()
         );
 
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            pending: Vec::new(),
+        })
     }
 
-    /// Writes a single `EV_KEY` event, preferring the typed `uinput-tokio`
-    /// event and falling back to the raw code for keys the crate does not
-    /// model. This is the one place in the crate which knows that fallback
-    /// exists (DESIGN.md §Risks 7).
-    async fn emit(&mut self, key: KeyCode, value: libc::c_int) -> Result<(), Error> {
-        let result = match keys::to_uinput(key) {
-            Some(event) => self.send_typed(event, value).await,
-            None => {
-                self.device
-                    .write(EV_KEY, key.code() as libc::c_int, value)
-                    .await
-            }
-        };
-
-        result.map_err(|e| write_error(format_args!("key '{key}'"), e))
-    }
-
-    async fn send_typed(
-        &mut self,
-        event: UKeyboard,
-        value: libc::c_int,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use uinput_tokio::event::Code;
-        self.device.write(EV_KEY, event.code(), value).await
-    }
-}
-
-/// Opens the uinput builder, preferring udev's view of where the device lives
-/// and falling back to the conventional path (udev enumeration is unavailable
-/// in some containers).
-fn open_builder() -> Result<uinput_tokio::device::Builder, Error> {
-    match uinput_tokio::default() {
-        Ok(builder) => Ok(builder),
-        Err(udev_error) => {
-            debug!("udev could not locate the uinput device ({udev_error}), trying /dev/uinput.");
-            uinput_tokio::open("/dev/uinput").map_err(|e| e.to_human_error())
-        }
+    /// Queues a single `EV_KEY` event for the next synchronize.
+    ///
+    /// Every key in the table is registered as a capability (see
+    /// [`key_capabilities`]), so there is no need for a raw-code fallback for
+    /// keys a typed event enum fails to model (DESIGN.md §Risks 7).
+    fn queue(&mut self, key: KeyCode, value: i32) {
+        self.pending
+            .push(InputEvent::new(EventType::KEY.0, key.code(), value));
     }
 }
 
 /// Failures once the device exists are not the user's fault — the device
 /// vanished, or the kernel buffer misbehaved.
-fn write_error(what: std::fmt::Arguments<'_>, detail: Box<dyn std::error::Error>) -> Error {
+fn write_error(what: std::fmt::Arguments<'_>, detail: std::io::Error) -> Error {
     human_errors::system(
         format!("We were unable to send {what} to the virtual keyboard ({detail})."),
         &[
@@ -180,18 +152,29 @@ fn write_error(what: std::fmt::Arguments<'_>, detail: Box<dyn std::error::Error>
 
 impl KeySink for UinputSink {
     async fn press(&mut self, key: KeyCode) -> Result<(), Error> {
-        self.emit(key, 1).await
+        self.queue(key, 1);
+        Ok(())
     }
 
     async fn release(&mut self, key: KeyCode) -> Result<(), Error> {
-        self.emit(key, 0).await
+        self.queue(key, 0);
+        Ok(())
     }
 
     async fn synchronize(&mut self) -> Result<(), Error> {
-        self.device
-            .synchronize()
-            .await
-            .map_err(|e| write_error(format_args!("a synchronization event"), e))
+        // `emit` writes the queued events followed by a `SYN_REPORT`. The
+        // write is a single non-blocking `write(2)` to the uinput node, so it
+        // is done inline rather than on a blocking thread.
+        let result = self.device.emit(&self.pending);
+        let count = self.pending.len();
+        self.pending.clear();
+
+        result.map_err(|e| {
+            write_error(
+                format_args!("{count} key event(s) and a synchronization event"),
+                e,
+            )
+        })
     }
 }
 
@@ -224,9 +207,30 @@ mod tests {
 
     #[test]
     fn not_found_is_humanized() {
-        let message = uinput_tokio::Error::NotFound.to_human_error().to_string();
+        let message = open_error(std::io::ErrorKind::NotFound.into()).to_string();
         assert!(message.contains("does not exist"), "got: {message}");
         assert!(message.contains(r#"KERNEL=="uinput""#), "got: {message}");
+    }
+
+    #[test]
+    fn every_key_is_registered_as_a_capability() {
+        // DESIGN.md §Risks 7: every key in the table must be advertised, or the
+        // kernel would silently drop its events.
+        let capabilities = key_capabilities();
+        let missing: Vec<_> = keys::all_codes()
+            .iter()
+            .filter(|&&code| !capabilities.contains(keys::to_evdev(code)))
+            .map(|code| code.to_string())
+            .collect();
+        assert!(missing.is_empty(), "not registered: {missing:?}");
+        assert_eq!(capabilities.iter().count(), keys::all_codes().len());
+    }
+
+    #[test]
+    fn permission_errors_are_humanized() {
+        let error = open_error(std::io::ErrorKind::PermissionDenied.into());
+        assert!(error.is(human_errors::Kind::User));
+        assert!(error.description().contains(r#"KERNEL=="uinput""#));
     }
 
     /// Exercises the real device. `/dev/uinput` is frequently unavailable (no
