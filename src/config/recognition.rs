@@ -204,8 +204,8 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    fn parse(yaml: &str) -> Result<RecognitionConfig, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    fn parse(yaml: &str) -> Result<RecognitionConfig, serde_norway::Error> {
+        serde_norway::from_str(yaml)
     }
 
     #[test]

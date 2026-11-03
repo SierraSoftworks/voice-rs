@@ -142,8 +142,8 @@ pub(crate) mod fixtures {
     pub fn arma_source() -> String {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/arma3.yaml");
         let raw = std::fs::read_to_string(path).expect("profiles/arma3.yaml should be readable");
-        let profile: serde_yaml::Value =
-            serde_yaml::from_str(&raw).expect("profiles/arma3.yaml should be valid YAML");
+        let profile: serde_norway::Value =
+            serde_norway::from_str(&raw).expect("profiles/arma3.yaml should be valid YAML");
         profile["grammar"]
             .as_str()
             .expect("profiles/arma3.yaml should carry an inline grammar block")
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_parses_during_load() {
-        let doc: Doc = serde_yaml::from_str("name: Arma\ngrammar: |\n  Map = \"map\" { m }\n")
+        let doc: Doc = serde_norway::from_str("name: Arma\ngrammar: |\n  Map = \"map\" { m }\n")
             .expect("the document should load");
 
         assert_eq!(doc.name, "Arma");
@@ -270,9 +270,10 @@ mod tests {
 
     #[test]
     fn test_deserialize_surfaces_rendered_diagnostics_at_load_time() {
-        let error =
-            serde_yaml::from_str::<Doc>("name: broken\ngrammar: |\n  Map = \"map\" { notakey }\n")
-                .expect_err("the document should fail to load");
+        let error = serde_norway::from_str::<Doc>(
+            "name: broken\ngrammar: |\n  Map = \"map\" { notakey }\n",
+        )
+        .expect_err("the document should fail to load");
         let message = error.to_string();
         assert!(message.contains("notakey"), "got: {message}");
         assert!(

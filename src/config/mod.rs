@@ -130,7 +130,7 @@ impl Profile {
     pub fn parse(loaded: &LoadedProfile) -> Result<Self, crate::Error> {
         let source = loaded.source.clone();
 
-        let profile: Profile = serde_yaml::from_str(&loaded.content).map_err(|e| {
+        let profile: Profile = serde_norway::from_str(&loaded.content).map_err(|e| {
             human_errors::wrap_user(
                 e,
                 format!("We could not read the profile at '{source}'."),

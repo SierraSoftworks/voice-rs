@@ -1191,7 +1191,7 @@ mod tests {
 
     #[test]
     fn test_the_microphone_reported_is_the_merged_one() {
-        let system: SystemConfig = serde_yaml::from_str("audio:\n  device: USB Microphone\n")
+        let system: SystemConfig = serde_norway::from_str("audio:\n  device: USB Microphone\n")
             .expect("the system configuration should load");
 
         // No profile: the machine's own default is what a run would use.

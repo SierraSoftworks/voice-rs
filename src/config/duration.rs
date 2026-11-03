@@ -101,16 +101,16 @@ mod tests {
 
     #[test]
     fn test_deserialize_helpers() {
-        let doc: Doc = serde_yaml::from_str("timeout: 350ms\n").unwrap();
+        let doc: Doc = serde_norway::from_str("timeout: 350ms\n").unwrap();
         assert_eq!(doc.timeout, Duration::from_millis(350));
 
-        let doc: Doc = serde_yaml::from_str("timeout: 1s 500ms\n").unwrap();
+        let doc: Doc = serde_norway::from_str("timeout: 1s 500ms\n").unwrap();
         assert_eq!(doc.timeout, Duration::from_millis(1500));
     }
 
     #[test]
     fn test_deserialize_surfaces_the_parse_error_at_load_time() {
-        let error = serde_yaml::from_str::<Doc>("timeout: 300\n")
+        let error = serde_norway::from_str::<Doc>("timeout: 300\n")
             .expect_err("a unit-less duration should be rejected");
         assert!(
             error
