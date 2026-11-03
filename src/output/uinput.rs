@@ -73,17 +73,66 @@ fn key_capabilities() -> AttributeSet<evdev::KeyCode> {
         .collect()
 }
 
+/// The identity the virtual keyboard presents: a USB keyboard, because SDL is
+/// happier with a plausible bus.
+fn input_id() -> InputId {
+    InputId::new(BusType::BUS_USB, 0x1d6b, 0x0001, 1)
+}
+
+/// Rejects device names the kernel cannot hold. `evdev` asserts on these, so
+/// checking first turns a panic into an error that names the problem.
+fn check_name(name: &str) -> Result<(), Error> {
+    if name.len() > MAX_NAME_LEN {
+        return Err(creation_error(format!(
+            "the device name '{name}' is longer than the kernel's {MAX_NAME_LEN} byte limit"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Key events written since the last [`KeySink::synchronize`].
+///
+/// `evdev` only exposes a write which terminates its batch with a
+/// `SYN_REPORT`, so events are held here and written as one batch when the
+/// executor synchronizes. That keeps the event stream the kernel sees
+/// identical to writing each event and then a separate `SYN_REPORT`: a chord
+/// pressed before a synchronize still lands in a single report.
+///
+/// Every key in the table is registered as a capability (see
+/// [`key_capabilities`]), so there is no need for a raw-code fallback for keys
+/// a typed event enum fails to model (DESIGN.md §Risks 7).
+#[derive(Debug, Default)]
+struct Batch {
+    events: Vec<InputEvent>,
+}
+
+impl Batch {
+    /// Queues a key-down (`EV_KEY` value 1).
+    fn press(&mut self, key: KeyCode) {
+        self.push(key, 1);
+    }
+
+    /// Queues a key-up (`EV_KEY` value 0).
+    fn release(&mut self, key: KeyCode) {
+        self.push(key, 0);
+    }
+
+    fn push(&mut self, key: KeyCode, value: i32) {
+        self.events
+            .push(InputEvent::new(EventType::KEY.0, key.code(), value));
+    }
+
+    /// Hands back everything queued so far and starts a new, empty batch.
+    fn take(&mut self) -> Vec<InputEvent> {
+        std::mem::take(&mut self.events)
+    }
+}
+
 /// A [`KeySink`] backed by a `/dev/uinput` virtual keyboard.
 pub struct UinputSink {
     device: VirtualDevice,
-    /// Key events written since the last [`KeySink::synchronize`].
-    ///
-    /// `evdev` only exposes a write which terminates its batch with a
-    /// `SYN_REPORT`, so events are held here and written as one batch when the
-    /// executor synchronizes. That keeps the event stream the kernel sees
-    /// identical to writing each event and then a separate `SYN_REPORT`: a
-    /// chord pressed before a synchronize still lands in a single report.
-    pending: Vec<InputEvent>,
+    pending: Batch,
 }
 
 impl UinputSink {
@@ -96,19 +145,14 @@ impl UinputSink {
     /// Creates the virtual keyboard under a specific name. Tests use this to
     /// avoid colliding with a running instance.
     pub async fn with_name(name: &str) -> Result<Self, Error> {
-        if name.len() > MAX_NAME_LEN {
-            return Err(creation_error(format!(
-                "the device name '{name}' is longer than the kernel's {MAX_NAME_LEN} byte limit"
-            )));
-        }
+        check_name(name)?;
 
         let capabilities = key_capabilities();
 
         let device = VirtualDevice::builder()
             .map_err(open_error)?
             .name(name)
-            // Present as a USB keyboard; SDL is happier with a plausible bus.
-            .input_id(InputId::new(BusType::BUS_USB, 0x1d6b, 0x0001, 1))
+            .input_id(input_id())
             .with_keys(&capabilities)
             .map_err(|e| creation_error(format!("we could not register the keyboard's keys: {e}")))?
             .build()
@@ -123,26 +167,19 @@ impl UinputSink {
 
         Ok(Self {
             device,
-            pending: Vec::new(),
+            pending: Batch::default(),
         })
-    }
-
-    /// Queues a single `EV_KEY` event for the next synchronize.
-    ///
-    /// Every key in the table is registered as a capability (see
-    /// [`key_capabilities`]), so there is no need for a raw-code fallback for
-    /// keys a typed event enum fails to model (DESIGN.md §Risks 7).
-    fn queue(&mut self, key: KeyCode, value: i32) {
-        self.pending
-            .push(InputEvent::new(EventType::KEY.0, key.code(), value));
     }
 }
 
 /// Failures once the device exists are not the user's fault — the device
 /// vanished, or the kernel buffer misbehaved.
-fn write_error(what: std::fmt::Arguments<'_>, detail: std::io::Error) -> Error {
+fn write_error(event_count: usize, detail: std::io::Error) -> Error {
     human_errors::system(
-        format!("We were unable to send {what} to the virtual keyboard ({detail})."),
+        format!(
+            "We were unable to send {event_count} key event(s) and a synchronization event \
+             to the virtual keyboard ({detail})."
+        ),
         &[
             "This usually means the virtual keyboard was removed while voice-orders was running.",
             "Please report this issue on GitHub so that we can investigate.",
@@ -152,12 +189,12 @@ fn write_error(what: std::fmt::Arguments<'_>, detail: std::io::Error) -> Error {
 
 impl KeySink for UinputSink {
     async fn press(&mut self, key: KeyCode) -> Result<(), Error> {
-        self.queue(key, 1);
+        self.pending.press(key);
         Ok(())
     }
 
     async fn release(&mut self, key: KeyCode) -> Result<(), Error> {
-        self.queue(key, 0);
+        self.pending.release(key);
         Ok(())
     }
 
@@ -165,16 +202,10 @@ impl KeySink for UinputSink {
         // `emit` writes the queued events followed by a `SYN_REPORT`. The
         // write is a single non-blocking `write(2)` to the uinput node, so it
         // is done inline rather than on a blocking thread.
-        let result = self.device.emit(&self.pending);
-        let count = self.pending.len();
-        self.pending.clear();
-
-        result.map_err(|e| {
-            write_error(
-                format_args!("{count} key event(s) and a synchronization event"),
-                e,
-            )
-        })
+        let events = self.pending.take();
+        self.device
+            .emit(&events)
+            .map_err(|e| write_error(events.len(), e))
     }
 }
 
@@ -231,6 +262,88 @@ mod tests {
         let error = open_error(std::io::ErrorKind::PermissionDenied.into());
         assert!(error.is(human_errors::Kind::User));
         assert!(error.description().contains(r#"KERNEL=="uinput""#));
+    }
+
+    #[test]
+    fn the_device_presents_as_a_usb_keyboard() {
+        let id = input_id();
+        assert_eq!(id.bus_type(), BusType::BUS_USB);
+        assert_eq!(id.vendor(), 0x1d6b);
+        assert_eq!(id.product(), 0x0001);
+        assert_eq!(id.version(), 1);
+    }
+
+    #[test]
+    fn names_within_the_kernel_limit_are_accepted() {
+        assert!(check_name(DEVICE_NAME).is_ok());
+        assert!(check_name(&"x".repeat(MAX_NAME_LEN)).is_ok());
+    }
+
+    #[test]
+    fn overlong_names_are_rejected_before_evdev_can_panic() {
+        let error = check_name(&"x".repeat(MAX_NAME_LEN + 1)).expect_err("too long");
+        assert!(error.is(human_errors::Kind::User));
+        assert!(
+            error.description().contains("byte limit"),
+            "got: {}",
+            error.description()
+        );
+    }
+
+    /// The name check runs before `/dev/uinput` is opened, so this needs no
+    /// device and runs everywhere.
+    #[tokio::test]
+    async fn creating_a_device_with_an_overlong_name_fails_cleanly() {
+        let result = UinputSink::with_name(&"x".repeat(MAX_NAME_LEN + 1)).await;
+        let error = result.err().expect("an overlong name must be rejected");
+        assert!(error.description().contains("byte limit"));
+    }
+
+    #[test]
+    fn presses_and_releases_become_ev_key_events_in_order() {
+        let ctrl = keys::from_name("leftctrl").expect("known key");
+        let c = keys::from_name("c").expect("known key");
+
+        let mut batch = Batch::default();
+        batch.press(ctrl);
+        batch.press(c);
+        batch.release(c);
+        batch.release(ctrl);
+
+        let events: Vec<_> = batch
+            .take()
+            .iter()
+            .map(|e| (e.event_type(), e.code(), e.value()))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                (EventType::KEY, ctrl.code(), 1),
+                (EventType::KEY, c.code(), 1),
+                (EventType::KEY, c.code(), 0),
+                (EventType::KEY, ctrl.code(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn taking_a_batch_empties_it() {
+        let mut batch = Batch::default();
+        batch.press(keys::from_name("f24").expect("known key"));
+        assert_eq!(batch.take().len(), 1);
+        assert!(
+            batch.take().is_empty(),
+            "a synchronize must not replay events"
+        );
+    }
+
+    #[test]
+    fn write_errors_are_system_errors_naming_the_batch() {
+        let error = write_error(3, std::io::ErrorKind::BrokenPipe.into());
+        assert!(error.is(human_errors::Kind::System));
+        let message = error.description();
+        assert!(message.contains("3 key event(s)"), "got: {message}");
+        assert!(message.contains("virtual keyboard"), "got: {message}");
     }
 
     /// Exercises the real device. `/dev/uinput` is frequently unavailable (no
