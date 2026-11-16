@@ -203,13 +203,13 @@ jobs:
       # trustworthy and the hardware ones have somewhere real to run.
       - name: Run model-gated tests
         continue-on-error: true
-        run: cargo test --features pure_tests -- --ignored --no-fail-fast
+        run: cargo test --features pure_tests --no-fail-fast -- --ignored
         env:
             RUSTFLAGS: -Cinstrument-coverage
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: grcov
-        run: grcov . --binary-path target/debug/deps/ -s . -t lcov --ignore-not-existing --ignore '../**' --ignore '/*' --ignore 'C:/' -o ./lcov.info
+        run: grcov . --binary-path target/debug/ -s . -t lcov --ignore-not-existing --ignore '../**' --ignore '/*' --ignore 'C:/' -o ./lcov.info
 
       - name: codecov upload
         uses: codecov/codecov-action@v7.1.1
