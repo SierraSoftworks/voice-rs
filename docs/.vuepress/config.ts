@@ -1,6 +1,6 @@
 import { defineUserConfig, PageHeader } from 'vuepress'
 import { viteBundler } from "@vuepress/bundler-vite";
-import { defaultTheme } from "@vuepress/theme-default";
+import { themeClassic } from "@vuepress/theme-classic";
 
 function htmlDecode(input: string): string {
   return input.replace("&#39;", "'").replace("&amp;", "&").replace("&quot;", '"')
@@ -27,7 +27,7 @@ export default defineUserConfig({
 
   bundler: viteBundler(),
 
-  theme: defaultTheme({
+  theme: themeClassic({
     logo: 'https://cdn.sierrasoftworks.com/logos/icon.png',
     logoDark: 'https://cdn.sierrasoftworks.com/logos/icon_light.png',
 
